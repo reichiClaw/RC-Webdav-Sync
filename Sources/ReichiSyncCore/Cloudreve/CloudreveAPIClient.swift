@@ -850,7 +850,8 @@ public final class CloudreveAPIClient: @unchecked Sendable {
             try check(response, context: "Freigaben")
             guard let data = response.data as? [String: Any],
                   let rawShares = data["shares"] as? [[String: Any]],
-                  let pagination = data["pagination"] as? [String: Any] else {
+                  let pagination = data["pagination"] as? [String: Any],
+                  let isCursor = pagination["is_cursor"] as? Bool else {
                 throw CloudreveError.invalidResponse("Freigaben: Seite unvollständig")
             }
             let token: String
@@ -869,8 +870,8 @@ public final class CloudreveAPIClient: @unchecked Sendable {
                 shares.append(share)
             }
             if !token.isEmpty {
-                guard seenTokens.insert(token).inserted else {
-                    throw CloudreveError.invalidResponse("Freigaben: zyklische Seitennavigation")
+                guard isCursor, seenTokens.insert(token).inserted else {
+                    throw CloudreveError.invalidResponse("Freigaben: zyklische oder ungültige Seitennavigation")
                 }
                 nextToken = token
             } else {

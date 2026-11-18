@@ -222,6 +222,55 @@ final class SyncEngineIntegrationTests: XCTestCase {
         await harness.assertConflictCount(0)
     }
 
+    func testLocalFileVersusRemoteDirectoryFreezesDescendantsUntilResolution() async throws {
+        harness = try await EngineHarness()
+        try harness.write("Typ", "lokale-datei")
+        await harness.server.mkdir("Typ")
+        await harness.server.putFile("Typ/server.txt", "server-kind")
+
+        let status = await harness.sync()
+
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: harness.root.appendingPathComponent("Typ").path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        )
+        XCTAssertFalse(harness.exists("Typ/server.txt"), "Nachkommen bleiben bis zur Konfliktentscheidung eingefroren")
+        let conflicts = await harness.engine.conflicts()
+        let conflict = try XCTUnwrap(conflicts.first)
+        let copyPath = try XCTUnwrap(conflict.conflictCopyPath)
+        XCTAssertEqual(harness.read(copyPath), "lokale-datei")
+        XCTAssertEqual(conflict.reason, .kindMismatch)
+        XCTAssertEqual(status.health, .conflicts, status.headline)
+
+        try await harness.engine.resolveConflict(id: conflict.id, resolution: .keepBoth)
+        await harness.sync()
+        XCTAssertEqual(harness.read("Typ/server.txt"), "server-kind")
+    }
+
+    func testLocalDirectoryVersusRemoteFileMovesWholeSubtreeToConflictCopy() async throws {
+        harness = try await EngineHarness()
+        try harness.write("Typ/lokal.txt", "lokaler-kind")
+        await harness.server.putFile("Typ", "server-datei")
+        await harness.server.clearLog()
+
+        let status = await harness.sync()
+
+        XCTAssertEqual(harness.read("Typ"), "server-datei")
+        let conflicts = await harness.engine.conflicts()
+        let conflict = try XCTUnwrap(conflicts.first)
+        let copyPath = try XCTUnwrap(conflict.conflictCopyPath)
+        XCTAssertEqual(harness.read("\(copyPath)/lokal.txt"), "lokaler-kind")
+        await harness.assertServerContent("\(copyPath)/lokal.txt", "lokaler-kind")
+        let log = await harness.server.log()
+        XCTAssertFalse(
+            log.contains { $0.hasPrefix("PUT Typ/lokal.txt") },
+            "Nachkommen des Typkonflikts dürfen nicht parallel unter das Server-Dateiziel hochgeladen werden: \(log)"
+        )
+        XCTAssertEqual(conflict.reason, .kindMismatch)
+        XCTAssertEqual(status.health, .conflicts, status.headline)
+    }
+
     // 5. Löschen auf einer Seite, Ändern auf der anderen: Konflikt statt Datenverlust.
     func testDeleteVersusModifyPreservesData() async throws {
         harness = try await EngineHarness()
@@ -433,6 +482,28 @@ final class SyncEngineIntegrationTests: XCTestCase {
         XCTAssertTrue(log.contains("LIST \(rawDirectory)"), "\(log)")
     }
 
+    func testRemoteDeletionCheckUsesRawParentPath() async throws {
+        let server = FakeWebDAVServer()
+        let rawDirectory = "U\u{0308}bersicht"
+        let canonicalFile = "Übersicht/Datei.txt"
+        await server.mkdirWithRawPath(rawDirectory)
+        await server.putFileWithRawPath("\(rawDirectory)/Datei.txt", "unicode")
+        harness = try await EngineHarness(server: server)
+        await harness.sync()
+        await server.remove(canonicalFile)
+        await server.clearLog()
+
+        await harness.sync()
+
+        let expected = "STAT \(rawDirectory)/Datei.txt"
+        let log = await server.log()
+        XCTAssertTrue(
+            log.contains { $0.utf8.elementsEqual(expected.utf8) },
+            "Die Sicherheitsprüfung muss die exakte Server-Schreibweise des Elternpfads verwenden: \(log)"
+        )
+        XCTAssertFalse(harness.exists(canonicalFile))
+    }
+
     // 12. Geänderte Serverversion zwischen Bestandsaufnahme und Upload wird erkannt.
     func testRemoteChangedBetweenListingAndUploadIsDetected() async throws {
         harness = try await EngineHarness()
@@ -638,6 +709,62 @@ final class SyncEngineIntegrationTests: XCTestCase {
         XCTAssertEqual(after.health, .synced, after.headline)
     }
 
+    func testConfirmedDeletionsSurviveOfflineRunAndRestart() async throws {
+        let guardRule = DeletionGuard(threshold: 2, fraction: 0.5)
+        harness = try await EngineHarness(deletionGuard: guardRule)
+        for i in 0..<4 { try harness.write("persist\(i).txt", "\(i)") }
+        await harness.sync()
+        for i in 0..<3 { try harness.remove("persist\(i).txt") }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 3)
+
+        await harness.server.setOffline(true)
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        let persisted = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertEqual(persisted.count, 3)
+        let visible = await harness.engine.pendingDeletions()
+        XCTAssertTrue(visible.isEmpty, "Eine bereits erteilte Freigabe darf nicht erneut abgefragt werden")
+
+        await harness.engine.shutdown()
+        await harness.server.setOffline(false)
+        let previous = harness!
+        harness = try await EngineHarness(restarting: previous, deletionGuard: guardRule)
+        let status = await harness.sync()
+
+        for i in 0..<3 { await harness.assertServerExists("persist\(i).txt", false) }
+        XCTAssertEqual(status.pendingDeletions, 0)
+        let remaining = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testConfirmedDeletionsRemainAuthorizedAcrossDeferredUpload() async throws {
+        harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
+        for i in 0..<4 { try harness.write("hold\(i).txt", "\(i)") }
+        await harness.sync()
+        for i in 0..<3 { try harness.remove("hold\(i).txt") }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 3)
+        try harness.write("race.txt", "erste-fassung")
+
+        let counter = InvocationCounter()
+        let changedFile = harness.root.appendingPathComponent("race.txt")
+        await harness.server.setBeforeUpload { path in
+            guard path == "race.txt", await counter.next(path) == 1 else { return }
+            try? Data("zweite-fassung".utf8).write(to: changedFile)
+        }
+
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+
+        for i in 0..<3 { await harness.assertServerExists("hold\(i).txt", false) }
+        await harness.assertServerContent("race.txt", "zweite-fassung")
+        let finalStatus = await harness.engine.currentStatus
+        XCTAssertEqual(finalStatus.pendingDeletions, 0)
+        let remaining = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     func testDiscardingHeldDeletionsRestoresFiles() async throws {
         harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
         for i in 0..<4 { try harness.write("g\(i).txt", "\(i)") }
@@ -683,6 +810,33 @@ final class SyncEngineIntegrationTests: XCTestCase {
         let queue = await harness.engine.queue()
         XCTAssertTrue(queue.isEmpty)
         XCTAssertEqual(status.health, .synced, status.headline)
+    }
+
+    func testUnsupportedMoveFallbackPreservesBothVersionsWhenSourceDeleteRaces() async throws {
+        let server = FakeWebDAVServer()
+        harness = try await EngineHarness(server: server)
+        try harness.write("Alt.txt", "lokale-fassung")
+        await harness.sync()
+        try FileManager.default.moveItem(
+            at: harness.root.appendingPathComponent("Alt.txt"),
+            to: harness.root.appendingPathComponent("Neu.txt")
+        )
+        await server.setMoveUnsupported(true)
+        let counter = InvocationCounter()
+        await server.setBeforeDelete { path in
+            guard path == "Alt.txt", await counter.next(path) == 1 else { return }
+            await server.putFile("Alt.txt", "server-aenderung")
+        }
+
+        let status = await harness.sync()
+
+        await harness.assertServerContent("Neu.txt", "lokale-fassung")
+        await harness.assertServerContent("Alt.txt", "server-aenderung")
+        XCTAssertEqual(harness.read("Neu.txt"), "lokale-fassung")
+        XCTAssertEqual(harness.read("Alt.txt"), "server-aenderung")
+        let conflicts = await harness.engine.conflicts()
+        XCTAssertEqual(conflicts.first { $0.path == "Alt.txt" }?.reason, .deletedLocallyModifiedRemotely)
+        XCTAssertEqual(status.health, .conflicts, status.headline)
     }
 
     func testEmptyDirectoriesAndEmptyFiles() async throws {

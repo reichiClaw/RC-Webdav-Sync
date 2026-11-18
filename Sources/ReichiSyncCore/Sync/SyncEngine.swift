@@ -132,6 +132,8 @@ public actor SyncEngine {
                 status.pauseReason = .user
                 status.health = .paused
             }
+            let confirmed = try await store.confirmedPendingDeletions(mappingID: mapping.id)
+            allowedDeletions = confirmed.isEmpty ? nil : Set(confirmed.map(DeletionAuthorization.init))
         } catch {
             reportPersistenceIssue(error)
             return
@@ -239,16 +241,15 @@ public actor SyncEngine {
     }
 
     public func pendingDeletions() async -> [PendingDeletion] {
-        do { return try await store.pendingDeletions(mappingID: mapping.id) }
+        do { return try await store.pendingDeletionsAwaitingConfirmation(mappingID: mapping.id) }
         catch { reportPersistenceIssue(error); return [] }
     }
 
     /// Gibt die zurückgehaltenen Löschungen frei (Löschschutz).
     public func confirmPendingDeletions() async {
         do {
-            let pending = try await store.pendingDeletions(mappingID: mapping.id)
-            try await store.clearPendingDeletions(mappingID: mapping.id)
-            allowedDeletions = Set(pending.map(DeletionAuthorization.init))
+            let pending = try await store.confirmPendingDeletions(mappingID: mapping.id)
+            allowedDeletions = pending.isEmpty ? nil : Set(pending.map(DeletionAuthorization.init))
         } catch {
             reportPersistenceIssue(error)
             return
@@ -499,7 +500,6 @@ public actor SyncEngine {
         // Actor-Reentrancy: Eine Bestätigung, die während eines `await` dieses
         // Durchgangs eintrifft, darf erst für den nächsten Plan gelten.
         let runAllowedDeletions = allowedDeletions
-        allowedDeletions = nil
         let wasOffline = status.health == .offline || status.nextRetry != nil
         downloadsPausedForDiskSpace = false
         status.isRunning = true
@@ -579,6 +579,17 @@ public actor SyncEngine {
             }
         } catch {
             if error is CancellationError { return summary }
+            if let local = error as? LocalFileError, local == .rootMissing {
+                logger.warning("engine", "Lokaler Stammordner wurde während der Bestandsaufnahme ausgetauscht oder getrennt")
+                status.isPaused = true
+                status.pauseReason = .localRootMissing
+                status.lastIssue = SyncIssue(
+                    message: "Der lokale Ordner ist nicht mehr derselbe wie zu Beginn des Abgleichs. Bitte den Sync-Ordner erneut auswählen.",
+                    action: .checkServer
+                )
+                summary.failed = 1
+                return summary
+            }
             logger.error("engine", "Lokale Bestandsaufnahme fehlgeschlagen: \(error)")
             status.lastIssue = SyncIssue(message: "Der lokale Ordner konnte nicht gelesen werden.", detail: "\(error)", action: .retry)
             summary.failed = 1
@@ -747,17 +758,41 @@ public actor SyncEngine {
         if failures > 0 || summary.needsFollowUp || summary.skipped > plan.skipped.count {
             haltRemainingActions = true
         }
+        if runAllowedDeletions != nil, allowedDeletions != runAllowedDeletions {
+            // Eine während dieses Durchgangs verworfene oder ersetzte
+            // Benutzerentscheidung darf nicht aus einem alten Plan wirken.
+            haltRemainingActions = true
+        }
         if Task.isCancelled { return summary }
+        var authorizedDeletionPhaseCompleted = false
         if !haltRemainingActions {
+            var everyDeletionCompleted = true
             for action in plan.deletions {
                 if Task.isCancelled { return summary }
                 let result = await execute(action, snapshot: remoteSnapshot)
                 tally(result, &transferred, &failures, &summary)
+                switch result {
+                case .succeeded, .noop:
+                    break
+                default:
+                    everyDeletionCompleted = false
+                }
                 status.completedCount += 1
                 if Self.isTerminalFailure(result) {
                     haltRemainingActions = true
                     break
                 }
+            }
+            authorizedDeletionPhaseCompleted = everyDeletionCompleted && !haltRemainingActions
+        }
+        if runAllowedDeletions != nil, authorizedDeletionPhaseCompleted {
+            do {
+                try await store.clearPendingDeletions(mappingID: mapping.id)
+                if allowedDeletions == runAllowedDeletions {
+                    allowedDeletions = nil
+                }
+            } catch {
+                return handlePersistenceFailure(error, summary: summary)
             }
         }
         if !haltRemainingActions {
@@ -1083,7 +1118,7 @@ public actor SyncEngine {
             case .deleteRemote(let path, let remote):
                 return try await performDeleteRemote(path: path, remote: remote)
             case .deleteLocal(let path, let local):
-                return try await performDeleteLocal(path: path, local: local)
+                return try await performDeleteLocal(path: path, local: local, snapshot: snapshot)
             case .moveRemote(let from, let to, let remote, let local):
                 return try await performMoveRemote(from: from, to: to, remote: remote, local: local, snapshot: snapshot)
             case .updateBaseline(let path, let local, let remote):
@@ -1509,6 +1544,8 @@ public actor SyncEngine {
     }
 
     private func reserveTemporarySpace(for size: Int64) throws {
+        // Absichtlich synchron actor-isoliert: Zwischen Prüfung und Erhöhung
+        // darf kein paralleler Transfer auf dem Actor fortgesetzt werden.
         try checkDiskSpace(for: size)
         reservedTemporaryBytes += size
     }
@@ -1697,12 +1734,40 @@ public actor SyncEngine {
             throw error
         }
         let installed = try fileSystem.attributes(path)
-        try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: remoteHash, localSize: installed?.size ?? result.contentLength,
-                                                     localModified: installed?.modified ?? 0, remoteValidator: validator, remoteValidatorIsStrong: strong,
-                                                     remoteSize: result.contentLength, remoteModified: remoteModified), mappingID: mapping.id)
+        let baseline = BaselineEntry(
+            path: path,
+            kind: .file,
+            localHash: remoteHash,
+            localSize: installed?.size ?? result.contentLength,
+            localModified: installed?.modified ?? 0,
+            remoteValidator: validator,
+            remoteValidatorIsStrong: strong,
+            remoteSize: result.contentLength,
+            remoteModified: remoteModified
+        )
         let conflict = ConflictRecord(path: path, kind: .file, reason: reason, localHash: localHash, localSize: attrs.size, localModified: attrs.modified,
                                       remoteValidator: validator, remoteSize: result.contentLength, remoteModified: remoteModified, conflictCopyPath: copyPath)
-        try await store.saveConflict(conflict, mappingID: mapping.id)
+        do {
+            try await store.saveConflict(conflict, baseline: baseline, mappingID: mapping.id)
+        } catch {
+            // Der Datenbankzustand wurde transaktional nicht verändert. Stelle
+            // den lokalen Ausgangszustand best-effort wieder her; beide
+            // Fassungen bleiben selbst bei einem Rollback-Fehler erhalten.
+            do {
+                _ = try fileSystem.trashVerifiedFile(
+                    path,
+                    expectedHash: remoteHash,
+                    recoveryDirectory: config.recoveryDirectory
+                )
+                try fileSystem.move(copyPath, to: localPath)
+            } catch let rollbackError {
+                logger.error(
+                    "engine",
+                    "Konflikt-Persistenz für \(path) fehlgeschlagen; beide Fassungen bleiben am Ziel, als Konfliktkopie oder im Wiederherstellungsbereich erhalten: \(rollbackError)"
+                )
+            }
+            throw error
+        }
         await finishTransfer(record, state: .succeeded, note: "Konflikt: lokale Version als „\(actualCopyName)“ gesichert")
         eventHandler?(.conflictDetected(path: path))
         logger.notice("engine", "Konflikt: \(path) – Konfliktkopie \(copyPath)")
@@ -1743,24 +1808,39 @@ public actor SyncEngine {
         }
 
         try fileSystem.move(local.rawPath, to: copyPath)
+        let replacementBaseline: BaselineEntry
         do {
             if remote.kind == .directory {
                 try fileSystem.createDirectory(path)
-                try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
-                try await store.upsertBaseline(BaselineEntry(path: path, kind: .directory, localHash: nil, localSize: 0, localModified: 0,
-                                                             remoteValidator: remote.validator, remoteValidatorIsStrong: remote.validatorIsStrong,
-                                                             remoteSize: 0, remoteModified: remote.modified), mappingID: mapping.id)
-            } else if let downloaded {
+                replacementBaseline = BaselineEntry(
+                    path: path,
+                    kind: .directory,
+                    localHash: nil,
+                    localSize: 0,
+                    localModified: 0,
+                    remoteValidator: remote.validator,
+                    remoteValidatorIsStrong: remote.validatorIsStrong,
+                    remoteSize: 0,
+                    remoteModified: remote.modified
+                )
+            } else {
+                guard let downloaded else {
+                    throw LocalFileError.io("Heruntergeladene Serverdatei fehlt")
+                }
                 try fileSystem.installDownloadedFile(from: downloaded.temp, to: path, expectedHash: nil, expectedSize: nil, expectedModified: nil,
                                                      modifiedDate: downloaded.modified.map { Date(timeIntervalSince1970: $0) })
                 let installed = try fileSystem.attributes(path)
-                try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
-                try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: downloaded.hash,
-                                                             localSize: installed?.size ?? downloaded.result.contentLength,
-                                                             localModified: installed?.modified ?? 0, remoteValidator: downloaded.validator,
-                                                             remoteValidatorIsStrong: downloaded.strong,
-                                                             remoteSize: downloaded.result.contentLength, remoteModified: downloaded.modified),
-                                                 mappingID: mapping.id)
+                replacementBaseline = BaselineEntry(
+                    path: path,
+                    kind: .file,
+                    localHash: downloaded.hash,
+                    localSize: installed?.size ?? downloaded.result.contentLength,
+                    localModified: installed?.modified ?? 0,
+                    remoteValidator: downloaded.validator,
+                    remoteValidatorIsStrong: downloaded.strong,
+                    remoteSize: downloaded.result.contentLength,
+                    remoteModified: downloaded.modified
+                )
             }
         } catch {
             if let temp = downloaded?.temp { try? FileManager.default.removeItem(at: temp) }
@@ -1777,7 +1857,35 @@ public actor SyncEngine {
         let conflict = ConflictRecord(path: path, kind: local.kind, reason: .kindMismatch, localHash: local.hash, localSize: local.size,
                                       localModified: local.modified, remoteValidator: remote.validator, remoteSize: remote.size,
                                       remoteModified: remote.modified, conflictCopyPath: copyPath)
-        try await store.saveConflict(conflict, mappingID: mapping.id)
+        do {
+            try await store.saveConflict(
+                conflict,
+                baseline: replacementBaseline,
+                replacingBaselineSubtree: true,
+                mappingID: mapping.id
+            )
+        } catch {
+            do {
+                if replacementBaseline.kind == .file, let hash = replacementBaseline.localHash {
+                    _ = try fileSystem.trashVerifiedFile(
+                        path,
+                        expectedHash: hash,
+                        recoveryDirectory: config.recoveryDirectory
+                    )
+                } else {
+                    guard try fileSystem.removeDirectoryIfEmpty(path, rules: rules) else {
+                        throw LocalFileError.changedSinceScan(path)
+                    }
+                }
+                try fileSystem.move(copyPath, to: local.rawPath)
+            } catch let rollbackError {
+                logger.error(
+                    "engine",
+                    "Datei/Ordner-Konflikt für \(path) konnte nicht persistiert oder vollständig zurückgerollt werden; beide Fassungen bleiben erhalten: \(rollbackError)"
+                )
+            }
+            throw error
+        }
         await finishTransfer(record, state: .succeeded, note: "Datei/Ordner-Konflikt: lokale Version als „\(RelativePath.name(of: copyPath))“ gesichert")
         eventHandler?(.conflictDetected(path: path))
         return .conflict
@@ -1847,13 +1955,14 @@ public actor SyncEngine {
         return .succeeded
     }
 
-    private func performDeleteLocal(path: String, local: LocalItem) async throws -> ActionResult {
+    private func performDeleteLocal(path: String, local: LocalItem, snapshot: RemoteSnapshot) async throws -> ActionResult {
         let record = await beginTransfer(.deleteLocal(path: path, local: local))
         let localPath = local.rawPath
         // Ein einzelnes still ausgelassenes PROPFIND-Kind darf niemals als
         // bestätigte Serverlöschung gelten. Auch ein nach dem Listing neu
         // angelegter Eintrag wird so vor der lokalen Mutation erkannt.
-        if try await client.stat(path) != nil {
+        let rawPath = Self.rawRemotePath(for: path, snapshot: snapshot)
+        if try await client.stat(rawPath) != nil {
             await finishTransfer(record, state: .skipped, note: "Servereintrag ist wieder vorhanden – wird neu abgeglichen")
             return .deferred
         }
@@ -1966,7 +2075,7 @@ public actor SyncEngine {
     private func refreshCounters() async {
         do {
             status.openConflicts = try await store.openConflictCount(mappingID: mapping.id)
-            status.pendingDeletions = try await store.pendingDeletions(mappingID: mapping.id).count
+            status.pendingDeletions = try await store.pendingDeletionsAwaitingConfirmation(mappingID: mapping.id).count
             if !status.isRunning {
                 status.pendingCount = try await store.queue(mappingID: mapping.id).count
             }

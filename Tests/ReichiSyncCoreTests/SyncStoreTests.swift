@@ -30,6 +30,28 @@ final class SyncStoreTests: XCTestCase {
         XCTAssertTrue(b2.isEmpty)
     }
 
+    func testMappingKeyDoesNotChangeWhenPreviouslyMissingRootAppears() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("Sync")
+        let account = AccountConfiguration(
+            id: "stable",
+            name: "Stable",
+            serverURL: URL(string: "https://example.org/dav/")!,
+            username: "u",
+            localRootPath: root.path
+        )
+        XCTAssertNil(account.localRootIdentity)
+        let keyWhileMissing = account.mappingKey
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        XCTAssertEqual(account.mappingKey, keyWhileMissing)
+        var rebound = account
+        rebound.setLocalRootPath(root.path)
+        XCTAssertNotEqual(rebound.mappingKey, keyWhileMissing)
+    }
+
     func testBaselineRoundTripAndSubtreeRemoval() async throws {
         let store = try SyncStore.inMemory()
         let m = try await store.mapping(for: account())
@@ -64,6 +86,8 @@ final class SyncStoreTests: XCTestCase {
             try await store.replaceQueue([QueuedItem(path: "q.txt", direction: .upload, size: 5)], mappingID: m.id)
             try await store.saveTransfer(TransferRecord(path: "t.txt", direction: .download, state: .running, bytesTotal: 10), mappingID: m.id)
             try await store.replacePendingDeletions([PendingDeletion(path: "del.txt", kind: .file, side: .local)], mappingID: m.id)
+            let confirmed = try await store.confirmPendingDeletions(mappingID: m.id)
+            XCTAssertEqual(confirmed.map(\.path), ["del.txt"])
             try await store.setSyncToken("tok", remoteIndexComplete: true, mappingID: m.id)
         }
         // „Neustart“
@@ -79,9 +103,63 @@ final class SyncStoreTests: XCTestCase {
         XCTAssertEqual(queue.map(\.path), ["q.txt"])
         let pending = try await store.pendingDeletions(mappingID: m.id)
         XCTAssertEqual(pending.map(\.path), ["del.txt"])
+        let awaitingConfirmation = try await store.pendingDeletionsAwaitingConfirmation(mappingID: m.id)
+        let confirmedAfterRestart = try await store.confirmedPendingDeletions(mappingID: m.id)
+        XCTAssertTrue(awaitingConfirmation.isEmpty)
+        XCTAssertEqual(confirmedAfterRestart.map(\.path), ["del.txt"])
         try await store.markRunningTransfersInterrupted(mappingID: m.id)
         let transfers = try await store.transfers(mappingID: m.id)
         XCTAssertEqual(transfers.first?.state, .cancelled)
+    }
+
+    func testConflictAndBaselinePersistAtomically() async throws {
+        let store = try SyncStore.inMemory()
+        let mapping = try await store.mapping(for: account())
+        let baseline = BaselineEntry(
+            path: "k.txt",
+            kind: .file,
+            localHash: "remote-hash",
+            localSize: 6,
+            localModified: 1,
+            remoteValidator: "\"etag\"",
+            remoteValidatorIsStrong: true,
+            remoteSize: 6,
+            remoteModified: 2
+        )
+        let conflict = ConflictRecord(
+            path: "k.txt",
+            kind: .file,
+            reason: .bothModified,
+            localHash: "local-hash",
+            conflictCopyPath: "k (Konfliktkopie).txt"
+        )
+        try await store.upsertBaseline(
+            BaselineEntry(
+                path: "k.txt/alt",
+                kind: .file,
+                localHash: "alt",
+                localSize: 3,
+                localModified: 0,
+                remoteValidator: "\"alt\"",
+                remoteValidatorIsStrong: true,
+                remoteSize: 3,
+                remoteModified: nil
+            ),
+            mappingID: mapping.id
+        )
+
+        try await store.saveConflict(
+            conflict,
+            baseline: baseline,
+            replacingBaselineSubtree: true,
+            mappingID: mapping.id
+        )
+
+        let savedBaseline = try await store.baseline(mappingID: mapping.id)
+        let savedConflicts = try await store.conflicts(mappingID: mapping.id)
+        XCTAssertEqual(savedBaseline["k.txt"]?.localHash, "remote-hash")
+        XCTAssertNil(savedBaseline["k.txt/alt"])
+        XCTAssertEqual(savedConflicts.first?.id, conflict.id)
     }
 
     func testAccountPersistence() async throws {

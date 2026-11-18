@@ -69,7 +69,8 @@ Weitere Regeln:
   Case-Kollisionen und Pfade unter unvollständigen Server-Teilbäumen werden
   im Durchgang nicht angefasst.
 - **Bestätigte Löschungen** (`allowedDeletions`) begrenzen Löschaktionen nach
-  einer Nachfrage auf exakt die bestätigte Menge.
+  einer Nachfrage auf exakt die bestätigte Menge. Die Freigabe wird persistent
+  markiert und erst nach einer vollständig erfolgreichen Löschphase entfernt.
 
 ### Ausführungsreihenfolge
 
@@ -104,10 +105,12 @@ Bestätigung erforderlich, wenn eine der Bedingungen gilt:
   umbenannt/ausgehängt)
 
 Zurückgehaltene Löschungen landen in `pending_deletions`, überleben Neustarts
-und werden in der Übersicht mit Vorschau gezeigt. „Ausführen“ erlaubt sie für
-genau einen Durchgang; „Verwerfen“ entfernt die Baseline der betroffenen Pfade,
-sodass die noch vorhandene Seite beim nächsten Durchgang als neu übertragen
-wird.
+und werden in der Übersicht mit Vorschau gezeigt. „Ausführen“ markiert die
+exakte Menge persistent als freigegeben; Verbindungsfehler, ein App-Neustart
+oder eine vorher zurückgestellte Übertragung verbrauchen diese Entscheidung
+nicht. Erst die vollständig erfolgreiche Löschphase entfernt Plan und
+Freigabe. „Verwerfen“ entfernt die Baseline der betroffenen Pfade, sodass die
+noch vorhandene Seite beim nächsten Durchgang als neu übertragen wird.
 
 Zusätzlich gilt unabhängig vom Guard: fehlender lokaler Stammordner → Pause;
 verlorene Datenbank → leere Baseline → keine Löschungen (alles wird als neu
@@ -132,7 +135,7 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 
 | Tabelle | Inhalt |
 |---|---|
-| `meta` | Schlüssel/Wert (z. B. Geräte-ID) |
+| `meta` | Schlüssel/Wert (z. B. Benutzerpause und persistente Löschfreigabe) |
 | `accounts` | Verbindungen (JSON-kodierte `AccountConfiguration`, ohne Passwort) |
 | `mappings` | Zuordnung Server-URL + lokaler Pfad → Baseline-Satz; `sync_token`, `last_successful_sync`, `remote_index_complete` |
 | `entries` | Baseline pro Mapping und Pfad |

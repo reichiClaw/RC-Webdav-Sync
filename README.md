@@ -94,7 +94,9 @@ Oberste Regeln der Implementierung:
    `docs/ARCHITECTURE.md`).
 6. Löschschutz: ≥ 25 Einträge oder > 20 % des Bestands oder „lokal komplett
    leer, Server nicht“ → Löschungen werden als `pending_deletions` gespeichert,
-   der Rest wird ausgeführt, die UI fragt nach.
+   der Rest wird ausgeführt, die UI fragt nach. Eine erteilte Freigabe bleibt
+   über Verbindungsfehler und Neustarts hinweg bestehen, bis genau diese
+   Löschungen vollständig abgeschlossen sind.
 7. Ausführung in Phasen: Ordner anlegen → Umbenennungen (MOVE) → Transfers
    (begrenzt parallel) → Löschungen (tiefste zuerst) → Buchführung. Jede
    Aktion prüft unmittelbar vorher erneut die Vorbedingungen (Hash lokal,
@@ -110,7 +112,7 @@ Deshalb gilt:
 
 | Bereich | Status |
 |---|---|
-| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner, Cloudreve-Client, Chunk-Upload) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **134 Tests, 0 Fehler** |
+| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner, Cloudreve-Client, Chunk-Upload) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **143 Tests, 0 Fehler** |
 | Integrationstests gegen WebDAV-Testumgebung | **Ausgeführt**: Fake-Server-Actor (alle 13 Sync-Szenarien aus der Anforderung) **und** echter HTTP-Server (`Scripts/dev-webdav-server.py`) inkl. 401-Behandlung, If-Match/If-None-Match, kompletter Engine-Lauf über HTTP |
 | Cloudreve-Integration | **Gegen Emulation getestet** (`dev-webdav-server.py --cloudreve`, gebaut nach Cloudreve-v4-Quellcode und API-Dokumentation): Login/2FA/Token-Refresh, WebDAV-Konten, Chunk-Upload, **Wiederaufnahme ohne erneutes Senden bestätigter Chunks**, abgelaufene Sitzung, lokale Änderung während des Uploads, Versionsprüfung (`previous`), Freigaben, Engine-Schwelle. **Eine echte Cloudreve-Instanz existiert noch nicht** – der erste Lauf gegen reichi.cloud muss die Annahmen in `docs/WEBDAV.md` (Abschnitt Cloudreve) bestätigen. |
 | `ReichiSync` (SwiftUI/AppKit-App, Menüleiste, Services) | **Geschrieben, auf Linux nur syntaktisch geprüft (`swiftc -parse`)**. Typprüfung, Build und manueller Test müssen auf einem Mac erfolgen (Schritte unten). |

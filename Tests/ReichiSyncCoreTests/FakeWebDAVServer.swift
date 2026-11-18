@@ -27,6 +27,7 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     var dropConnectionOnUploadButStore = false
     var dropConnectionOnDownload = false
     var beforeUpload: (@Sendable (String) async -> Void)?
+    var beforeDelete: (@Sendable (String) async -> Void)?
     var beforeStat: (@Sendable (String) async -> Void)?
     var beforeList: (@Sendable (String) async -> Void)?
     var supportsSync = false
@@ -93,6 +94,7 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     func setDropConnectionOnUploadButStore(_ value: Bool) { dropConnectionOnUploadButStore = value }
     func setDropConnectionOnDownload(_ value: Bool) { dropConnectionOnDownload = value }
     func setBeforeUpload(_ hook: (@Sendable (String) async -> Void)?) { beforeUpload = hook }
+    func setBeforeDelete(_ hook: (@Sendable (String) async -> Void)?) { beforeDelete = hook }
     func setBeforeStat(_ hook: (@Sendable (String) async -> Void)?) { beforeStat = hook }
     func setBeforeList(_ hook: (@Sendable (String) async -> Void)?) { beforeList = hook }
     func setSupportsSync(_ value: Bool) { supportsSync = value }
@@ -248,6 +250,7 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
         try checkConnection()
         requestLog.append("DELETE \(rawPath) ifMatch=\(ifMatch ?? "-")")
         let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
+        if let beforeDelete { await beforeDelete(key) }
         if honorsIfMatch, let ifMatch, let f = files[key], f.etag != ifMatch { throw WebDAVError.preconditionFailed }
         guard exists(key) else { throw WebDAVError.notFound }
         remove(key)

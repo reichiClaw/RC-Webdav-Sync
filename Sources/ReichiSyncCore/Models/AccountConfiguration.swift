@@ -141,7 +141,10 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
             server,
             username,
             localRootPath,
-            localRootIdentity ?? Self.readRootIdentity(atPath: localRootPath) ?? "unavailable",
+            // Nur die persistierte Identität verwenden. Ein Getter darf den
+            // Mapping-Schlüssel nicht abhängig von vorübergehend lesbaren
+            // Dateisystemmetadaten ändern.
+            localRootIdentity ?? "unavailable",
             serverKind.rawValue,
             cloudreveSiteURL?.absoluteString ?? "",
             davAccountID ?? "",

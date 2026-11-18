@@ -24,7 +24,7 @@
 
 | Server | Art des Tests | Ergebnis |
 |---|---|---|
-| `FakeWebDAVServer` (In-Memory-Actor) | Integrationstests für Sync-, Race-, Lösch- und Recovery-Szenarien (36 Tests) | bestanden auf Linux |
+| `FakeWebDAVServer` (In-Memory-Actor) | Integrationstests für Sync-, Race-, Lösch- und Recovery-Szenarien (42 Tests) | bestanden auf Linux |
 | `Scripts/dev-webdav-server.py` (Python-stdlib, Klasse 1, starke ETags, Basic Auth) | echte HTTP-Tests: Capabilities, 401, If-Match/If-None-Match-Zyklus, kompletter Engine-Lauf | bestanden auf Linux |
 | Nextcloud / ownCloud | **nicht in dieser Umgebung getestet**; 207-Parser mit Nextcloud-Fixture (`Tests/…/Fixtures/nextcloud-propfind.xml`) geprüft; `OC-ETag`, `X-OC-Mtime`, `oc:`-Props, sync-collection-Format berücksichtigt | Verifikation auf einem Mac gegen eine echte Instanz empfohlen |
 | Apache `mod_dav`, Synology, Nginx DAV | nicht getestet; nur Klasse-1-Funktionen vorausgesetzt | sollten funktionieren, da keine Erweiterungen verlangt werden |

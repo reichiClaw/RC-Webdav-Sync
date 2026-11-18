@@ -294,6 +294,10 @@ public actor SyncStore {
 
     // MARK: - Meta
 
+    private static func deletionConfirmationKey(_ mappingID: String) -> String {
+        "confirmed-deletions.\(mappingID)"
+    }
+
     public func meta(_ key: String) throws -> String? {
         try db.query("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.string("value")
     }
@@ -415,6 +419,10 @@ public actor SyncStore {
         for table in ["entries", "local_index", "remote_index", "conflicts", "transfers", "queue", "pending_deletions", "upload_sessions"] {
             try db.execute("DELETE FROM \(table) WHERE mapping_id = ?", [.text(mappingID)])
         }
+        try db.execute(
+            "DELETE FROM meta WHERE key IN (?, ?)",
+            [.text("user-pause.\(mappingID)"), .text(Self.deletionConfirmationKey(mappingID))]
+        )
     }
 
     // MARK: - Baseline
@@ -656,6 +664,24 @@ public actor SyncStore {
         """, [.text(conflict.id), .text(mappingID), .text(conflict.path), .text(json), .text(conflict.status.rawValue), .real(conflict.detectedAt.timeIntervalSince1970)])
     }
 
+    /// Persistiert den neuen gemeinsamen Stand und den dazugehörigen Konflikt
+    /// atomar. Ohne diese Kopplung könnte die Konfliktkopie nach einem
+    /// SQLite-Fehler existieren, ohne in der Oberfläche auffindbar zu sein.
+    public func saveConflict(
+        _ conflict: ConflictRecord,
+        baseline: BaselineEntry,
+        replacingBaselineSubtree: Bool = false,
+        mappingID: String
+    ) throws {
+        try db.transaction {
+            if replacingBaselineSubtree {
+                try removeBaselineSubtree(path: baseline.path, mappingID: mappingID)
+            }
+            try upsertBaseline(baseline, mappingID: mappingID)
+            try saveConflict(conflict, mappingID: mappingID)
+        }
+    }
+
     public func deleteConflict(id: String) throws {
         try db.execute("DELETE FROM conflicts WHERE id = ?", [.text(id)])
     }
@@ -741,6 +767,7 @@ public actor SyncStore {
 
     public func replacePendingDeletions(_ items: [PendingDeletion], mappingID: String) throws {
         try db.transaction {
+            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
             try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
             for item in items {
                 try db.execute("INSERT OR REPLACE INTO pending_deletions(mapping_id, path, side, kind, planned_at) VALUES(?, ?, ?, ?, ?)",
@@ -764,8 +791,37 @@ public actor SyncStore {
         }
     }
 
+    /// Liefert nur Pläne, die noch eine Benutzerentscheidung benötigen.
+    public func pendingDeletionsAwaitingConfirmation(mappingID: String) throws -> [PendingDeletion] {
+        guard try meta(Self.deletionConfirmationKey(mappingID)) != "1" else { return [] }
+        return try pendingDeletions(mappingID: mappingID)
+    }
+
+    /// Liefert die persistent freigegebenen Löschungen. Die Freigabe bleibt bis
+    /// zum vollständig erfolgreichen Löschdurchgang bestehen.
+    public func confirmedPendingDeletions(mappingID: String) throws -> [PendingDeletion] {
+        guard try meta(Self.deletionConfirmationKey(mappingID)) == "1" else { return [] }
+        return try pendingDeletions(mappingID: mappingID)
+    }
+
+    @discardableResult
+    public func confirmPendingDeletions(mappingID: String) throws -> [PendingDeletion] {
+        try db.transaction {
+            let pending = try pendingDeletions(mappingID: mappingID)
+            if pending.isEmpty {
+                try setMeta(Self.deletionConfirmationKey(mappingID), nil)
+            } else {
+                try setMeta(Self.deletionConfirmationKey(mappingID), "1")
+            }
+            return pending
+        }
+    }
+
     public func clearPendingDeletions(mappingID: String) throws {
-        try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
+        try db.transaction {
+            try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
+            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
+        }
     }
 
     /// Verwirft einen bestätigungsbedürftigen Löschplan atomar: Entweder werden
@@ -776,7 +832,8 @@ public actor SyncStore {
             for item in pending {
                 try removeBaselineSubtree(path: item.path, mappingID: mappingID)
             }
-            try clearPendingDeletions(mappingID: mappingID)
+            try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
+            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
         }
     }
 

@@ -23,6 +23,27 @@ public enum LocalFileError: Error, Sendable, Equatable {
     }
 }
 
+/// Teilt die einmal gebundene Wurzelidentität zwischen Kopien des
+/// `LocalFileSystem`-Werts. Falls die Metadaten beim Erzeugen vorübergehend
+/// nicht lesbar sind, wird die erste später erfolgreich gelesene Identität
+/// atomar gebunden.
+private final class RootIdentityState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expected: String?
+
+    init(expected: String?) {
+        self.expected = expected
+    }
+
+    func accepts(_ current: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let expected { return expected == current }
+        expected = current
+        return true
+    }
+}
+
 /// Zugriff auf den lokalen Synchronisierungsordner.
 ///
 /// Alle Pfade sind relative Schlüsselpfade; der Zugriff bleibt stets innerhalb
@@ -32,15 +53,16 @@ public struct LocalFileSystem: Sendable {
     /// Gerät+Inode des beim Erzeugen ausgewählten Stammordners. Ein später unter
     /// demselben Pfad eingehängter Link oder anderer Ordner ist nicht dieselbe
     /// Sync-Wurzel und darf niemals automatisch verwendet werden.
-    private let rootFileID: String?
+    private let rootIdentity: RootIdentityState
     private var fm: FileManager { .default }
 
     /// Verzeichnis für temporäre Downloads innerhalb des Stammordners (gleiches Volume → atomare Ersetzung).
     public var temporaryDirectory: URL { root.appendingPathComponent(ExclusionRules.internalPrefix + "-tmp", isDirectory: true) }
 
-    public init(root: URL) {
+    public init(root: URL, expectedRootFileID: String? = nil) {
         self.root = root.standardizedFileURL.resolvingSymlinksInPath()
-        self.rootFileID = (try? POSIXFileMetadata.read(atPath: self.root.path))?.fileID
+        let observed = (try? POSIXFileMetadata.read(atPath: self.root.path))?.fileID
+        self.rootIdentity = RootIdentityState(expected: expectedRootFileID ?? observed)
     }
 
     public func rootExists() -> Bool {
@@ -58,10 +80,17 @@ public struct LocalFileSystem: Sendable {
     }
 
     public func validateRootIdentity() throws {
-        guard let expected = rootFileID,
-              let current = try POSIXFileMetadata.read(atPath: root.path),
-              !current.isSymbolicLink,
-              current.fileID == expected else {
+        let current: POSIXFileMetadata.Values
+        do {
+            guard let value = try POSIXFileMetadata.read(atPath: root.path) else {
+                throw LocalFileError.rootMissing
+            }
+            current = value
+        } catch {
+            throw LocalFileError.rootMissing
+        }
+        guard !current.isSymbolicLink,
+              rootIdentity.accepts(current.fileID) else {
             throw LocalFileError.rootMissing
         }
     }

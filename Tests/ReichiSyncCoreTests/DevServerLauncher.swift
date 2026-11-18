@@ -2,6 +2,11 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 import XCTest
 
 /// Startet `Scripts/dev-webdav-server.py` für HTTP-Integrationstests und beendet ihn wieder.
@@ -82,8 +87,28 @@ final class DevServerLauncher {
     }
 
     func stop() {
-        process?.terminate()
-        process?.waitUntilExit()
+        if let process {
+            let pid = process.processIdentifier
+            if pid > 0 {
+                _ = kill(pid, SIGTERM)
+                let deadline = Date().addingTimeInterval(2)
+                while Date() < deadline {
+                    if kill(pid, 0) == -1, errno == ESRCH { break }
+                    usleep(20_000)
+                }
+                if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
+            }
+        }
+        // `Process.waitUntilExit()` kann in swift-corelibs-foundation von
+        // dessen eigener Dispatch-Source aus synchron auf dieselbe Queue
+        // warten und sporadisch mit __DISPATCH_WAIT_FOR_QUEUE__ abbrechen.
+        // Foundation erntet den signalisierten Kindprozess asynchron.
+        #if os(Linux)
+        // Auch `Process.deinit` enthält dort denselben synchronen Queue-Wait.
+        // Das kleine Testobjekt bleibt deshalb bis zum Ende des Testprozesses
+        // absichtlich erhalten; der bereits signalisierte Python-Prozess nicht.
+        if let process { _ = Unmanaged.passRetained(process) }
+        #endif
         process = nil
         try? FileManager.default.removeItem(at: serverRoot)
     }

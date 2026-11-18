@@ -301,6 +301,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else if l.kind == .directory {
                     decisions[p] = .updateBaseline(path: p, local: l, remote: r)
                 } else {
@@ -312,6 +313,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else {
                     decisions[p] = .uploadChanged(path: p, local: l, remote: r)
                 }
@@ -319,6 +321,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else {
                     decisions[p] = .download(path: p, remote: r, replacing: l)
                 }
@@ -326,6 +329,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else if l.kind == .directory {
                     decisions[p] = .updateBaseline(path: p, local: l, remote: r)
                 } else {

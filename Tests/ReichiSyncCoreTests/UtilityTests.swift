@@ -116,14 +116,36 @@ final class PathSafetyTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
 
+        let expectedRootID = try XCTUnwrap(POSIXFileMetadata.read(atPath: root.path)?.fileID)
         let fileSystem = LocalFileSystem(root: root)
         try FileManager.default.moveItem(at: root, to: original)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         XCTAssertFalse(fileSystem.rootExists())
+        XCTAssertFalse(
+            LocalFileSystem(root: root, expectedRootFileID: expectedRootID).rootExists(),
+            "Auch eine neu erzeugte Engine muss die persistierte Ordneridentität prüfen"
+        )
         XCTAssertThrowsError(try fileSystem.url("nicht-hier.txt")) { error in
             XCTAssertEqual(error as? LocalFileError, .rootMissing)
         }
+    }
+
+    func testLocalFileSystemPinsRootAfterTransientlyMissingDirectory() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("root")
+        let original = base.appendingPathComponent("original")
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let fileSystem = LocalFileSystem(root: root)
+        XCTAssertFalse(fileSystem.rootExists())
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertTrue(fileSystem.rootExists(), "Die erste lesbare Wurzelidentität muss nachträglich gebunden werden")
+
+        try FileManager.default.moveItem(at: root, to: original)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertFalse(fileSystem.rootExists(), "Nach der Bindung darf ein Ersatzordner nicht akzeptiert werden")
     }
 
     func testMappingKeyChangesWhenRootDirectoryIsReplaced() throws {
