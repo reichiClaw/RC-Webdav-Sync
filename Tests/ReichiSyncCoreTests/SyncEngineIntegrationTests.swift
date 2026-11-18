@@ -32,15 +32,16 @@ final class EngineHarness {
             try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
             self.server = server ?? FakeWebDAVServer()
         }
-        root = baseDirectory.appendingPathComponent("Sync")
+        let selectedRoot = baseDirectory.appendingPathComponent("Sync")
         recovery = baseDirectory.appendingPathComponent("Recovery")
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: selectedRoot, withIntermediateDirectories: true)
+        let fs = LocalFileSystem(root: selectedRoot, prefersTrash: false)
+        root = fs.root
         dbPath = baseDirectory.appendingPathComponent("sync.sqlite").path
         store = try SyncStore(path: dbPath)
         account = AccountConfiguration(id: "acc", name: "Test", serverURL: URL(string: "https://fake.example.org/dav/")!, username: "u", localRootPath: root.path)
         try await store.saveAccount(account)
         mapping = try await store.mapping(for: account)
-        let fs = LocalFileSystem(root: root, prefersTrash: false)
         let config = SyncEngineConfiguration(deviceName: "TestMac", recoveryDirectory: recovery, maxConcurrentTransfers: 2,
                                              deletionGuard: deletionGuard, caseInsensitiveLocalFileSystem: true, settleTime: 0, minimumFreeSpace: 0)
         engine = SyncEngine(account: account, mapping: mapping, client: self.server, store: store, fileSystem: fs, rules: ExclusionRules(), configuration: config)
@@ -78,12 +79,19 @@ final class EngineHarness {
     }
 
     func localFiles() throws -> [String] {
-        let enumerator = FileManager.default.enumerator(atPath: root.path)!
         var result: [String] = []
-        while let p = enumerator.nextObject() as? String {
-            if p.hasPrefix(".reichi-sync") { continue }
-            result.append(p)
+        func appendContents(of directory: URL, prefix: String) throws {
+            for item in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) {
+                let name = item.lastPathComponent
+                if name.hasPrefix(".reichi-sync") { continue }
+                let relativePath = prefix.isEmpty ? name : "\(prefix)/\(name)"
+                result.append(relativePath)
+                if try item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                    try appendContents(of: item, prefix: relativePath)
+                }
+            }
         }
+        try appendContents(of: root, prefix: "")
         return result.sorted()
     }
 

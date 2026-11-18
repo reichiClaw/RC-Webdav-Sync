@@ -120,8 +120,10 @@ final class WebDAVClientHTTPTests: XCTestCase {
     func testEngineEndToEndOverHTTP() async throws {
         let client = try makeClient()
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("reichi-http-\(UUID().uuidString)")
-        let root = base.appendingPathComponent("Sync")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let selectedRoot = base.appendingPathComponent("Sync")
+        try FileManager.default.createDirectory(at: selectedRoot, withIntermediateDirectories: true)
+        let fileSystem = LocalFileSystem(root: selectedRoot, prefersTrash: false)
+        let root = fileSystem.root
         defer { try? FileManager.default.removeItem(at: base) }
 
         // Server-Vorbestand
@@ -141,7 +143,7 @@ final class WebDAVClientHTTPTests: XCTestCase {
             settleTime: 0,
             minimumFreeSpace: 0
         )
-        let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root), rules: ExclusionRules(), configuration: config)
+        let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: fileSystem, rules: ExclusionRules(), configuration: config)
         await engine.start()
         await engine.syncAndWait()
         var status = await engine.currentStatus
@@ -150,13 +152,27 @@ final class WebDAVClientHTTPTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: serverRoot.appendingPathComponent("lokal.txt"), encoding: .utf8), "lokal")
 
         // Serveränderung + lokale Löschung
-        try Data("remote v2".utf8).write(to: serverRoot.appendingPathComponent("Vom Server/remote.txt"))
+        let remoteUpdate = base.appendingPathComponent("remote-v2.txt")
+        try Data("remote v2".utf8).write(to: remoteUpdate)
+        let currentRemote = try await client.stat("Vom Server/remote.txt")
+        let previousRemote = try XCTUnwrap(currentRemote)
+        _ = try await client.upload(
+            file: remoteUpdate,
+            to: "Vom Server/remote.txt",
+            ifMatch: previousRemote.validator,
+            ifNoneMatchAll: false,
+            progress: nil
+        )
         try FileManager.default.removeItem(at: root.appendingPathComponent("lokal.txt"))
         try Data("neu".utf8).write(to: root.appendingPathComponent("neu.txt"))
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-30)], ofItemAtPath: root.appendingPathComponent("neu.txt").path)
         await engine.syncAndWait()
         status = await engine.currentStatus
-        XCTAssertEqual(status.health, .synced, status.headline)
+        let failures = await engine.transfers().filter { $0.state == .failed }
+        let diagnostics = failures.map {
+            "\($0.path): \($0.errorMessage ?? "unbekannt") [\($0.errorDetail ?? "keine Details")]"
+        }.joined(separator: "; ")
+        XCTAssertEqual(status.health, .synced, "\(status.headline): \(diagnostics)")
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Vom Server/remote.txt"), encoding: .utf8), "remote v2")
         XCTAssertFalse(FileManager.default.fileExists(atPath: serverRoot.appendingPathComponent("lokal.txt").path))
         XCTAssertEqual(try String(contentsOf: serverRoot.appendingPathComponent("neu.txt"), encoding: .utf8), "neu")
