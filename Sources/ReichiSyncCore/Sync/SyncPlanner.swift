@@ -90,6 +90,8 @@ public struct SyncPlan: Sendable {
     /// `true`, wenn Löschungen wegen unvollständiger Bestandsaufnahme unterdrückt wurden.
     public var deletionsSuppressed = false
     public var deletionsSuppressedReason: String?
+    /// Pfade, die wegen Namenskollisionen (Groß-/Kleinschreibung, Normalisierung) nicht synchronisiert werden können.
+    public var collisions: [String] = []
 
     public init() {}
 
@@ -169,6 +171,7 @@ public enum SyncPlanner {
             for (_, paths) in groups where paths.count > 1 {
                 for p in paths {
                     frozen.insert(p)
+                    plan.collisions.append(p)
                     let others = paths.filter { $0 != p }.joined(separator: ", ")
                     plan.skipped.append(.skip(path: p, reason: "Name kollidiert auf dem Mac mit „\(others)“ (Groß-/Kleinschreibung). Bitte eine Datei umbenennen."))
                 }

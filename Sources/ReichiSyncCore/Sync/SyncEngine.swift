@@ -131,7 +131,19 @@ public actor SyncEngine {
         runningTask = Task { [weak self] in
             guard let self else { return }
             await self.runLoop(trigger: trigger)
+            await self.finishedRunning()
         }
+    }
+
+    private func finishedRunning() {
+        runningTask = nil
+    }
+
+    /// Führt einen Abgleich aus und wartet auf dessen Abschluss (für Tests und Skripte).
+    public func syncAndWait(trigger: SyncTrigger = .manual) async {
+        while let running = runningTask { _ = await running.value }
+        requestSync(trigger: trigger)
+        while let running = runningTask { _ = await running.value }
     }
 
     public func pause() {
@@ -274,9 +286,6 @@ public actor SyncEngine {
     // MARK: - Durchlauf
 
     private func runLoop(trigger: SyncTrigger) async {
-        defer {
-            runningTask = nil
-        }
         var iterations = 0
         var currentTrigger = trigger
         repeat {
@@ -395,6 +404,24 @@ public actor SyncEngine {
         var plan = SyncPlanner.plan(input)
         if let reason = plan.deletionsSuppressedReason {
             logger.warning("engine", reason)
+            status.lastIssue = SyncIssue(message: remoteSnapshot.isComplete
+                                         ? "Der lokale Ordner konnte nicht vollständig gelesen werden. Löschungen wurden sicherheitshalber nicht übertragen."
+                                         : "Teile des Serverbestands konnten nicht gelesen werden. Löschungen wurden sicherheitshalber nicht übertragen.",
+                                         detail: remoteSnapshot.failedPrefixes.sorted().joined(separator: ", "), action: .retry)
+        }
+        let collisions = plan.collisions + scanResult.collisions
+        if !collisions.isEmpty {
+            status.lastIssue = SyncIssue(message: collisions.count == 1
+                                         ? "Ein Eintrag kann wegen eines Namenskonflikts nicht synchronisiert werden."
+                                         : "\(collisions.count) Einträge können wegen Namenskonflikten nicht synchronisiert werden.",
+                                         detail: collisions.sorted().joined(separator: ", "), action: .renameFile)
+        }
+        for case .skip(let path, let reason) in plan.skipped where !scanResult.snapshot.busyPaths.contains(path) {
+            var record = TransferRecord(id: "skip|" + path, path: path, direction: .upload, state: .skipped)
+            record.finishedAt = Date()
+            record.errorMessage = reason
+            record.suggestedAction = collisions.contains(path) ? .renameFile : .none
+            try? await store.saveTransfer(record, mappingID: mapping.id)
         }
 
         // 6. Löschschutz
@@ -729,8 +756,9 @@ public actor SyncEngine {
 
     private func performUpload(path: String, local: LocalItem, remote: RemoteItem?, conflictReason: ConflictReason?) async throws -> ActionResult {
         let record = await beginTransfer(.uploadNew(path: path, local: local))
+        let localPath = local.rawPath
         // Version festlegen, die hochgeladen wird.
-        guard let attrs = try fileSystem.attributes(path), attrs.kind == .file else {
+        guard let attrs = try fileSystem.attributes(localPath), attrs.kind == .file else {
             await finishTransfer(record, state: .skipped, note: "Datei ist lokal nicht mehr vorhanden")
             return .deferred
         }
@@ -738,9 +766,9 @@ public actor SyncEngine {
         if attrs.size != local.size || attrs.modified != local.modified {
             version.size = attrs.size
             version.modified = attrs.modified
-            version.hash = try fileSystem.hash(path)
+            version.hash = try fileSystem.hash(localPath)
         }
-        let fileURL = try fileSystem.url(path)
+        let fileURL = try fileSystem.url(localPath)
         var ifMatch: String?
         var ifNoneMatchAll = false
         if let remote {
@@ -783,7 +811,7 @@ public actor SyncEngine {
         }
         // Wurde die Datei während des Uploads verändert? Dann bleibt sie ausstehend.
         var note: String?
-        if let after = try fileSystem.attributes(path), after.size != version.size || after.modified != version.modified {
+        if let after = try fileSystem.attributes(localPath), after.size != version.size || after.modified != version.modified {
             note = "Datei wurde während der Übertragung erneut geändert – wird erneut hochgeladen"
         }
         try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: version.hash, localSize: version.size, localModified: version.modified,
@@ -841,6 +869,7 @@ public actor SyncEngine {
             await finishTransfer(record, state: .skipped, note: "Lokal ist inzwischen eine gleichnamige Datei entstanden – wird neu abgeglichen")
             return .deferred
         }
+        let targetPath = replacing?.rawPath ?? path
         let (temp, result, hash) = try await downloadToTemp(remote, recordID: record?.id)
         let (validator, strong, remoteModified) = await remoteValidatorAfterDownload(remote, result: result)
         let modifiedDate = remoteModified.map { Date(timeIntervalSince1970: $0) }
@@ -854,13 +883,13 @@ public actor SyncEngine {
             return .succeeded
         }
         do {
-            try fileSystem.installDownloadedFile(from: temp, to: path, expectedHash: replacing?.hash, expectedSize: replacing?.size,
+            try fileSystem.installDownloadedFile(from: temp, to: targetPath, expectedHash: replacing?.hash, expectedSize: replacing?.size,
                                                  expectedModified: replacing?.modified, modifiedDate: modifiedDate)
         } catch LocalFileError.changedSinceScan {
             await finishTransfer(record, state: .skipped, note: "Lokale Datei wurde zwischenzeitlich geändert – wird neu abgeglichen")
             return .deferred
         }
-        let installed = try fileSystem.attributes(path)
+        let installed = try fileSystem.attributes(targetPath)
         try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: hash, localSize: installed?.size ?? result.contentLength,
                                                      localModified: installed?.modified ?? 0, remoteValidator: validator, remoteValidatorIsStrong: strong,
                                                      remoteSize: result.contentLength, remoteModified: remoteModified), mappingID: mapping.id)
@@ -884,14 +913,15 @@ public actor SyncEngine {
         let (temp, result, remoteHash) = try await downloadToTemp(remote, recordID: record?.id)
         let (validator, strong, remoteModified) = await remoteValidatorAfterDownload(remote, result: result)
         // Lokale Version muss noch dem geplanten Stand entsprechen.
-        guard let attrs = try fileSystem.attributes(path), attrs.kind == .file else {
+        let localPath = local.rawPath
+        guard let attrs = try fileSystem.attributes(localPath), attrs.kind == .file else {
             try? FileManager.default.removeItem(at: temp)
             await finishTransfer(record, state: .skipped, note: "Lokale Datei nicht mehr vorhanden – wird neu abgeglichen")
             return .deferred
         }
         var localHash = local.hash
         if attrs.size != local.size || attrs.modified != local.modified {
-            localHash = try fileSystem.hash(path)
+            localHash = try fileSystem.hash(localPath)
         }
         if localHash == remoteHash {
             try? FileManager.default.removeItem(at: temp)
@@ -904,13 +934,13 @@ public actor SyncEngine {
         // Beide Versionen erhalten: lokale Version wird zur Konfliktkopie, Serverversion übernimmt den Pfad.
         let copyName = RelativePath.conflictCopyName(for: RelativePath.name(of: path), deviceName: config.deviceName)
         let copyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
-        try fileSystem.move(path, to: copyPath)
+        try fileSystem.move(localPath, to: copyPath)
         do {
             try fileSystem.installDownloadedFile(from: temp, to: path, expectedHash: nil, expectedSize: nil, expectedModified: nil,
                                                  modifiedDate: remoteModified.map { Date(timeIntervalSince1970: $0) })
         } catch {
             // Rückgängig machen, damit keine Version verloren geht.
-            try? fileSystem.move(copyPath, to: path)
+            try? fileSystem.move(copyPath, to: localPath)
             throw error
         }
         let installed = try fileSystem.attributes(path)
@@ -930,7 +960,7 @@ public actor SyncEngine {
         let record = await beginTransfer(.kindMismatch(path: path, local: local, remote: remote))
         let copyName = RelativePath.conflictCopyName(for: RelativePath.name(of: path), deviceName: config.deviceName)
         let copyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
-        try fileSystem.move(path, to: copyPath)
+        try fileSystem.move(local.rawPath, to: copyPath)
         try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
         if remote.kind == .directory {
             try fileSystem.createDirectory(path)
@@ -1033,25 +1063,26 @@ public actor SyncEngine {
 
     private func performDeleteLocal(path: String, local: LocalItem) async throws -> ActionResult {
         let record = await beginTransfer(.deleteLocal(path: path, local: local))
+        let localPath = local.rawPath
         // Sicherheitsprüfung: Der Eintrag muss lokal noch dem bekannten Stand entsprechen.
-        guard let attrs = try fileSystem.attributes(path) else {
+        guard let attrs = try fileSystem.attributes(localPath) else {
             try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
             await finishTransfer(record, state: .succeeded, note: "War lokal bereits entfernt")
             return .succeeded
         }
         if attrs.kind == .file {
-            if attrs.size != local.size || attrs.modified != local.modified, try fileSystem.hash(path) != local.hash {
+            if attrs.size != local.size || attrs.modified != local.modified, try fileSystem.hash(localPath) != local.hash {
                 await finishTransfer(record, state: .skipped, note: "Lokale Datei wurde zwischenzeitlich geändert – wird neu abgeglichen")
                 return .deferred
             }
         } else {
             let baseline = try await store.baseline(mappingID: mapping.id)
-            if try !directoryMatchesBaseline(path, baseline: baseline) {
+            if try !directoryMatchesBaseline(localPath, baseline: baseline) {
                 await finishTransfer(record, state: .skipped, note: "Im Ordner gibt es lokal neue oder geänderte Dateien – wird neu abgeglichen")
                 return .deferred
             }
         }
-        let destination = try fileSystem.trash(path, recoveryDirectory: config.recoveryDirectory)
+        let destination = try fileSystem.trash(localPath, recoveryDirectory: config.recoveryDirectory)
         try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
         let note = destination.map { $0.path.contains("/.Trash") ? "In den Papierkorb verschoben" : "In den Wiederherstellungsbereich verschoben" }
         await finishTransfer(record, state: .succeeded, note: note)

@@ -60,6 +60,13 @@ public struct ExclusionRules: Sendable, Hashable {
                 for ancestor in RelativePath.ancestors(of: relativePath) where Self.match(pattern: anchored, text: ancestor) {
                     return true
                 }
+            } else if pattern.contains("/") {
+                // Muster mit Pfadanteil: gegen den Pfad und alle Teilpfade ab einem Ordner prüfen.
+                let segments = relativePath.split(separator: "/").map(String.init)
+                for start in 0..<segments.count {
+                    let suffix = segments[start...].joined(separator: "/")
+                    if Self.match(pattern: pattern, text: suffix) { return true }
+                }
             } else {
                 for segment in relativePath.split(separator: "/") where Self.match(pattern: pattern, text: String(segment)) {
                     return true

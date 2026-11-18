@@ -7,4 +7,3 @@ build/
 dist/
 *.app
 .DS_Store
-/Tests/ReichiSyncCoreTests/Fixtures/.keep

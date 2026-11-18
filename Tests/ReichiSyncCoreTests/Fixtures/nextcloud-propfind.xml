@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/files/anna/Projekte/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getetag>&quot;5f3a1c2b9d8e7&quot;</d:getetag>
+        <d:getlastmodified>Tue, 17 Nov 2026 09:12:33 GMT</d:getlastmodified>
+        <oc:fileid>1234</oc:fileid>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+    <d:propstat>
+      <d:prop>
+        <d:getcontentlength/>
+        <d:getcontenttype/>
+      </d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/anna/Projekte/Bericht%20Q4%20%E2%80%93%20Entwurf%20%C3%BC.pdf</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype/>
+        <d:getetag>&quot;a1b2c3d4e5f6&quot;</d:getetag>
+        <d:getcontentlength>204800</d:getcontentlength>
+        <d:getlastmodified>Mon, 16 Nov 2026 18:45:10 GMT</d:getlastmodified>
+        <d:getcontenttype>application/pdf</d:getcontenttype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/anna/Projekte/Unterordner%20%F0%9F%93%81/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getetag>&quot;dir-etag&quot;</d:getetag>
+        <d:getlastmodified>Mon, 16 Nov 2026 10:00:00 GMT</d:getlastmodified>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/anna/Projekte/schwach.txt</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype/>
+        <d:getetag>W/&quot;weak-etag&quot;</d:getetag>
+        <d:getcontentlength>12</d:getcontentlength>
+        <d:getlastmodified>Mon, 16 Nov 2026 10:00:00 GMT</d:getlastmodified>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+    <d:propstat>
+      <d:prop>
+        <d:getcontenttype/>
+      </d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>

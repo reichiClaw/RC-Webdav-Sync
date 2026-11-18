@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/root/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getetag>"root"</d:getetag>
+        <d:supported-report-set>
+          <d:supported-report><d:report><d:expand-property/></d:report></d:supported-report>
+          <d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report>
+        </d:supported-report-set>
+        <d:sync-token>http://sabre.io/ns/sync/42</d:sync-token>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>

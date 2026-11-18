@@ -135,7 +135,7 @@ public struct LocalFileSystem: Sendable {
                     throw LocalFileError.changedSinceScan(relativePath)
                 }
             }
-            _ = try fm.replaceItemAt(target, withItemAt: temp, backupItemName: nil, options: [])
+            try atomicReplace(target: target, with: temp)
         } else {
             do {
                 try fm.moveItem(at: temp, to: target)
@@ -143,6 +143,28 @@ public struct LocalFileSystem: Sendable {
                 try? fm.removeItem(at: temp)
                 throw Self.mapError(error)
             }
+        }
+    }
+
+    /// Ersetzt `target` atomar durch `temp` (gleiches Volume).
+    private func atomicReplace(target: URL, with temp: URL) throws {
+        #if os(macOS)
+        do {
+            _ = try fm.replaceItemAt(target, withItemAt: temp, backupItemName: nil, options: [])
+            return
+        } catch {
+            // Rückfall auf rename(2), z. B. bei ungewöhnlichen Dateisystemen.
+        }
+        #endif
+        let result = temp.withUnsafeFileSystemRepresentation { tempPath in
+            target.withUnsafeFileSystemRepresentation { targetPath in
+                rename(tempPath!, targetPath!)
+            }
+        }
+        if result != 0 {
+            let err = NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
+            try? fm.removeItem(at: temp)
+            throw Self.mapError(err)
         }
     }
 

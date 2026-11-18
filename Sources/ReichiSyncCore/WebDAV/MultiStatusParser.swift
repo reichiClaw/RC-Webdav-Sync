@@ -31,6 +31,7 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
     private var inResourceType = false
     private var inSupportedReportSet = false
     private var parseError: Error?
+    private var sawMultistatus = false
 
     public static func parse(_ data: Data) throws -> MultiStatusResponse {
         let parser = MultiStatusParser()
@@ -42,9 +43,13 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
         xml.shouldProcessNamespaces = true
         xml.shouldReportNamespacePrefixes = false
         xml.delegate = self
-        guard xml.parse() else {
+        let ok = xml.parse()
+        guard ok, parseError == nil else {
             let desc = xml.parserError?.localizedDescription ?? parseError?.localizedDescription ?? "unbekannt"
             throw WebDAVError.invalidResponse("XML: \(desc)")
+        }
+        guard sawMultistatus else {
+            throw WebDAVError.invalidResponse("Kein multistatus-Element in der Antwort")
         }
         return MultiStatusResponse(resources: resources, syncToken: syncToken)
     }
@@ -59,6 +64,8 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
             return
         }
         switch elementName {
+        case "multistatus":
+            sawMultistatus = true
         case "response":
             currentHref = nil
             currentResponseStatus = nil
@@ -126,7 +133,11 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
             case "supported-report-set":
                 inSupportedReportSet = false
             case "sync-token":
-                if parentIsMultistatus { syncToken = value }
+                if parentIsMultistatus {
+                    syncToken = value
+                } else if inProp && parentIsProp {
+                    currentPropstatProps["sync-token"] = value
+                }
             case "response":
                 finishResponse()
             default:

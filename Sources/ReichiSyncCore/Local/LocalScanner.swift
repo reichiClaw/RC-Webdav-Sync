@@ -86,7 +86,8 @@ public struct LocalScanner: Sendable {
                 }
                 let size = Int64(values.fileSize ?? 0)
                 let modified = values.contentModificationDate?.timeIntervalSince1970 ?? 0
-                if now.timeIntervalSince1970 - modified < settleTime {
+                let age = now.timeIntervalSince1970 - modified
+                if age >= 0 && age < settleTime {
                     busy.insert(childRel)
                     continue
                 }
