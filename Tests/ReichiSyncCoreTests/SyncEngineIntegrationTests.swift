@@ -40,7 +40,7 @@ final class EngineHarness {
         account = AccountConfiguration(id: "acc", name: "Test", serverURL: URL(string: "https://fake.example.org/dav/")!, username: "u", localRootPath: root.path)
         try await store.saveAccount(account)
         mapping = try await store.mapping(for: account)
-        let fs = LocalFileSystem(root: root)
+        let fs = LocalFileSystem(root: root, prefersTrash: false)
         let config = SyncEngineConfiguration(deviceName: "TestMac", recoveryDirectory: recovery, maxConcurrentTransfers: 2,
                                              deletionGuard: deletionGuard, caseInsensitiveLocalFileSystem: true, settleTime: 0, minimumFreeSpace: 0)
         engine = SyncEngine(account: account, mapping: mapping, client: self.server, store: store, fileSystem: fs, rules: ExclusionRules(), configuration: config)

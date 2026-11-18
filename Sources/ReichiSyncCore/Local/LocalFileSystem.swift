@@ -54,15 +54,17 @@ public struct LocalFileSystem: Sendable {
     /// demselben Pfad eingehängter Link oder anderer Ordner ist nicht dieselbe
     /// Sync-Wurzel und darf niemals automatisch verwendet werden.
     private let rootIdentity: RootIdentityState
+    private let prefersTrash: Bool
     private var fm: FileManager { .default }
 
     /// Verzeichnis für temporäre Downloads innerhalb des Stammordners (gleiches Volume → atomare Ersetzung).
     public var temporaryDirectory: URL { root.appendingPathComponent(ExclusionRules.internalPrefix + "-tmp", isDirectory: true) }
 
-    public init(root: URL, expectedRootFileID: String? = nil) {
+    public init(root: URL, expectedRootFileID: String? = nil, prefersTrash: Bool = true) {
         self.root = root.standardizedFileURL.resolvingSymlinksInPath()
         let observed = (try? POSIXFileMetadata.read(atPath: self.root.path))?.fileID
         self.rootIdentity = RootIdentityState(expected: expectedRootFileID ?? observed)
+        self.prefersTrash = prefersTrash
     }
 
     public func rootExists() -> Bool {
@@ -257,7 +259,7 @@ public struct LocalFileSystem: Sendable {
         #if os(macOS)
         let exchange = temp.withUnsafeFileSystemRepresentation { tempPath in
             target.withUnsafeFileSystemRepresentation { targetPath in
-                renameatx_np(AT_FDCWD, tempPath!, AT_FDCWD, targetPath!, UInt32(RENAME_SWAP))
+                renamex_np(tempPath!, targetPath!, UInt32(RENAME_SWAP))
             }
         }
         if exchange == 0 {
@@ -276,7 +278,7 @@ public struct LocalFileSystem: Sendable {
             // gerettet und niemals vom Aufrufer als Temp-Datei entfernt.
             let rollback = temp.withUnsafeFileSystemRepresentation { tempPath in
                 target.withUnsafeFileSystemRepresentation { targetPath in
-                    renameatx_np(AT_FDCWD, tempPath!, AT_FDCWD, targetPath!, UInt32(RENAME_SWAP))
+                    renamex_np(tempPath!, targetPath!, UInt32(RENAME_SWAP))
                 }
             }
             if rollback != 0 {
@@ -321,12 +323,14 @@ public struct LocalFileSystem: Sendable {
         let target = try url(relativePath)
         guard fm.fileExists(atPath: target.path) else { return nil }
         #if os(macOS)
-        var resulting: NSURL?
-        do {
-            try fm.trashItem(at: target, resultingItemURL: &resulting)
-            return resulting as URL?
-        } catch {
-            SyncLogger.shared.warning("local", "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)")
+        if prefersTrash {
+            var resulting: NSURL?
+            do {
+                try fm.trashItem(at: target, resultingItemURL: &resulting)
+                return resulting as URL?
+            } catch {
+                SyncLogger.shared.warning("local", "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)")
+            }
         }
         #endif
         guard let recoveryDirectory else {
@@ -386,15 +390,17 @@ public struct LocalFileSystem: Sendable {
             }
 
             #if os(macOS)
-            var resulting: NSURL?
-            do {
-                try fm.trashItem(at: quarantine, resultingItemURL: &resulting)
-                return resulting as URL?
-            } catch {
-                SyncLogger.shared.warning(
-                    "local",
-                    "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)"
-                )
+            if prefersTrash {
+                var resulting: NSURL?
+                do {
+                    try fm.trashItem(at: quarantine, resultingItemURL: &resulting)
+                    return resulting as URL?
+                } catch {
+                    SyncLogger.shared.warning(
+                        "local",
+                        "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)"
+                    )
+                }
             }
             #endif
             guard let recoveryDirectory else {
