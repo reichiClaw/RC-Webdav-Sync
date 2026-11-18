@@ -117,6 +117,7 @@ final class NotificationService {
 }
 
 /// Darstellung von Werten für die Oberfläche.
+@MainActor
 enum Formatters {
     static let bytes: ByteCountFormatter = {
         let f = ByteCountFormatter()

@@ -4,6 +4,13 @@ import ReichiSyncCore
 struct MainWindow: View {
     @EnvironmentObject private var model: AppModel
 
+    private var sidebarSelection: Binding<AppModel.Section?> {
+        Binding(
+            get: { model.selectedSection },
+            set: { if let section = $0 { model.selectedSection = section } }
+        )
+    }
+
     var body: some View {
         Group {
             if !model.isReady {
@@ -19,7 +26,7 @@ struct MainWindow: View {
                 SetupAssistantView()
             } else {
                 NavigationSplitView {
-                    List(visibleSections, selection: $model.selectedSection) { section in
+                    List(visibleSections, selection: sidebarSelection) { section in
                         Label {
                             HStack {
                                 Text(section.title)
@@ -247,8 +254,8 @@ struct DeletionConfirmationCard: View {
             }
             HStack {
                 Button("Löschungen verwerfen – alles behalten") { model.discardDeletions() }
-                Button("Löschungen ausführen", role: .destructive) { model.confirmDeletions() }
                     .keyboardShortcut(.defaultAction)
+                Button("Löschungen ausführen", role: .destructive) { model.confirmDeletions() }
             }
         }
         .padding(12)
@@ -437,6 +444,11 @@ struct ConflictRow: View {
     let conflict: ConflictRecord
     @State private var confirmUseLocal = false
     @State private var confirmUseRemote = false
+    @State private var confirmDeletion = false
+
+    private var isDeletionConflict: Bool {
+        conflict.reason == .modifiedLocallyDeletedRemotely || conflict.reason == .deletedLocallyModifiedRemotely
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -467,26 +479,37 @@ struct ConflictRow: View {
             }
 
             HStack {
-                Button("Beide behalten") { model.resolve(conflict, with: .keepBoth) }
-                    .help("Beide Dateien bleiben bestehen; der Konflikt gilt als erledigt.")
-                Button("Lokale Version verwenden") { confirmUseLocal = true }
-                    .help("Die lokale Version ersetzt die Datei unter dem ursprünglichen Namen; die Serverversion wandert in den Papierkorb.")
-                    .disabled(conflict.conflictCopyPath == nil)
-                    .confirmationDialog("Lokale Version verwenden?", isPresented: $confirmUseLocal) {
-                        Button("Lokale Version verwenden") { model.resolve(conflict, with: .useLocal) }
-                        Button("Abbrechen", role: .cancel) {}
-                    } message: {
-                        Text("Die Serverversion wird lokal in den Papierkorb gelegt und auf dem Server durch deine Version ersetzt.")
-                    }
-                Button("Serverversion verwenden") { confirmUseRemote = true }
-                    .help("Die Konfliktkopie wandert in den Papierkorb; die Serverversion bleibt.")
-                    .disabled(conflict.conflictCopyPath == nil)
-                    .confirmationDialog("Serverversion verwenden?", isPresented: $confirmUseRemote) {
-                        Button("Serverversion verwenden") { model.resolve(conflict, with: .useRemote) }
-                        Button("Abbrechen", role: .cancel) {}
-                    } message: {
-                        Text("Deine Konfliktkopie wird lokal in den Papierkorb gelegt und beim nächsten Abgleich vom Server entfernt.")
-                    }
+                if isDeletionConflict {
+                    Button("Erhaltene Version behalten") { model.resolve(conflict, with: .keepBoth) }
+                    Button("Löschung trotzdem anwenden", role: .destructive) { confirmDeletion = true }
+                        .confirmationDialog("Löschung wirklich anwenden?", isPresented: $confirmDeletion) {
+                            Button("Löschung anwenden", role: .destructive) { model.resolve(conflict, with: .applyDeletion) }
+                            Button("Abbrechen", role: .cancel) {}
+                        } message: {
+                            Text("Die erhaltene Datei wird lokal in den Papierkorb verschoben. Der nächste sichere Abgleich versucht die Löschung auch auf dem Server.")
+                        }
+                } else {
+                    Button("Beide behalten") { model.resolve(conflict, with: .keepBoth) }
+                        .help("Beide Dateien bleiben bestehen; der Konflikt gilt als erledigt.")
+                    Button("Lokale Version verwenden") { confirmUseLocal = true }
+                        .help("Die lokale Version ersetzt die Datei unter dem ursprünglichen Namen; die Serverversion wandert in den Papierkorb.")
+                        .disabled(conflict.conflictCopyPath == nil || conflict.reason == .kindMismatch)
+                        .confirmationDialog("Lokale Version verwenden?", isPresented: $confirmUseLocal) {
+                            Button("Lokale Version verwenden") { model.resolve(conflict, with: .useLocal) }
+                            Button("Abbrechen", role: .cancel) {}
+                        } message: {
+                            Text("Die Serverversion wird lokal in den Papierkorb gelegt und auf dem Server durch deine Version ersetzt.")
+                        }
+                    Button("Serverversion verwenden") { confirmUseRemote = true }
+                        .help("Die Konfliktkopie wandert in den Papierkorb; die Serverversion bleibt.")
+                        .disabled(conflict.conflictCopyPath == nil || (conflict.reason == .kindMismatch && conflict.kind == .directory))
+                        .confirmationDialog("Serverversion verwenden?", isPresented: $confirmUseRemote) {
+                            Button("Serverversion verwenden") { model.resolve(conflict, with: .useRemote) }
+                            Button("Abbrechen", role: .cancel) {}
+                        } message: {
+                            Text("Deine Konfliktkopie wird lokal in den Papierkorb gelegt und beim nächsten Abgleich vom Server entfernt.")
+                        }
+                }
                 Spacer()
                 Button("Im Finder zeigen") { model.reveal(path: conflict.path) }
             }

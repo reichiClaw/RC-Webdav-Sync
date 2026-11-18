@@ -2,6 +2,11 @@ import AppKit
 import Foundation
 import ReichiSyncCore
 
+@MainActor
+private final class CloudreveAPIReference {
+    weak var value: CloudreveAPIClient?
+}
+
 /// Cloudreve-spezifische Teile des App-Modells: Anmeldung, Token-Verwaltung,
 /// WebDAV-Konto-Bereitstellung, Chunk-Upload-Transport und Freigabelinks.
 extension AppModel {
@@ -59,21 +64,35 @@ extension AppModel {
     func completeCloudreveSetup(name: String, api: CloudreveAPIClient, email: String, existingAccount: CloudreveDavAccount?,
                                 newRemoteFolder: String?, folder: URL, allowInsecureHTTP: Bool) async throws {
         guard let store else { throw NSError(domain: "reichi", code: 1, userInfo: [NSLocalizedDescriptionKey: storeError ?? "Datenbank nicht verfügbar"]) }
+        try validateSyncFolder(folder)
+        let bookmarkData = try bookmarks.makeData(folder: folder)
         let davAccount: CloudreveDavAccount
         if let existingAccount {
             davAccount = existingAccount
         } else {
-            let rootURI = CloudreveURI.rootURI(folderPath: newRemoteFolder ?? "")
+            let rootURI = try CloudreveURI.validatedRootURI(folderPath: newRemoteFolder ?? "")
             if rootURI != "cloudreve://my/" {
                 try await api.createFolder(uri: rootURI)
             }
             let device = Host.current().localizedName ?? "Mac"
             davAccount = try await api.createDavAccount(name: "reichi Sync (\(device))", uri: rootURI)
         }
+        let createdDavAccount = existingAccount == nil
+        do {
         guard !davAccount.readonly else {
             throw WebDAVError.invalidResponse("Das gewählte WebDAV-Konto ist schreibgeschützt. Bitte ein Konto mit Schreibzugriff wählen oder ein neues anlegen.")
         }
-        guard let tokens = api.currentTokens else { throw CloudreveError.authenticationRequired("Keine gültige Sitzung") }
+        _ = try CloudreveURI.fileURI(root: davAccount.uri, relativePath: "")
+        let davClient = try WebDAVClient(
+            baseURL: Self.davURL(for: api.siteURL),
+            credentials: WebDAVCredentials(
+                username: email.trimmingCharacters(in: .whitespacesAndNewlines),
+                password: davAccount.password
+            ),
+            allowInsecureHTTP: allowInsecureHTTP,
+            serverKindHint: .cloudreve
+        )
+        _ = try await davClient.probe()
 
         let newAccount = AccountConfiguration(
             name: name.isEmpty ? "reichi.cloud" : name,
@@ -85,22 +104,38 @@ extension AppModel {
             cloudreveSiteURL: api.siteURL,
             cloudreveEmail: email.trimmingCharacters(in: .whitespacesAndNewlines),
             davAccountID: davAccount.id,
+            davAccountManaged: createdDavAccount,
             davAccountURI: davAccount.uri
         )
-        try bookmarks.save(folder: folder, accountID: newAccount.id)
         try keychain.savePassword(davAccount.password, accountID: newAccount.id, label: "reichi Sync – WebDAV (\(newAccount.name))")
-        try saveCloudreveTokens(tokens, accountID: newAccount.id)
-        try await store.saveAccount(newAccount)
+        do {
+            guard let tokens = api.currentTokens else {
+                throw CloudreveError.authenticationRequired("Keine gültige Sitzung")
+            }
+            try saveCloudreveTokens(tokens, accountID: newAccount.id)
+            try await store.saveAccount(newAccount)
+        } catch {
+            try? keychain.deletePassword(accountID: newAccount.id)
+            try? keychain.deletePassword(accountID: Self.cloudreveTokenKey(accountID: newAccount.id))
+            throw error
+        }
+        bookmarks.save(data: bookmarkData, accountID: newAccount.id)
         account = newAccount
         if newAccount.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
         await startEngine(for: newAccount)
+        } catch {
+            if createdDavAccount {
+                try? await api.deleteDavAccount(id: davAccount.id)
+            }
+            throw error
+        }
     }
 
     // MARK: - Tokens
 
-    func loadCloudreveTokens(accountID: String) -> CloudreveTokens? {
-        guard let json = try? keychain.password(accountID: Self.cloudreveTokenKey(accountID: accountID)) else { return nil }
-        return try? JSONDecoder().decode(CloudreveTokens.self, from: Data(json.utf8))
+    func loadCloudreveTokens(accountID: String) throws -> CloudreveTokens? {
+        guard let json = try keychain.password(accountID: Self.cloudreveTokenKey(accountID: accountID)) else { return nil }
+        return try JSONDecoder().decode(CloudreveTokens.self, from: Data(json.utf8))
     }
 
     func saveCloudreveTokens(_ tokens: CloudreveTokens?, accountID: String) throws {
@@ -114,25 +149,46 @@ extension AppModel {
     }
 
     /// Erstellt den API-Client für eine Cloudreve-Verbindung aus den gespeicherten Tokens.
-    /// Ohne gültiges Refresh-Token bleibt der Client abgemeldet (Chunk-Upload und Freigaben
-    /// stehen dann erst nach erneuter Anmeldung zur Verfügung; der WebDAV-Abgleich läuft weiter).
-    func makeCloudreveClient(for account: AccountConfiguration) -> CloudreveAPIClient? {
+    /// Ohne gültiges Refresh-Token bleibt der Client abgemeldet. Uploads und
+    /// Freigaben warten dann auf eine erneute Anmeldung; sichere WebDAV-Downloads
+    /// und Bestandsaufnahmen laufen weiter.
+    func makeCloudreveClient(for account: AccountConfiguration, lifecycleGeneration generation: UInt64) -> CloudreveAPIClient? {
         guard account.isCloudreve, let site = account.cloudreveSiteURL else { return nil }
-        var tokens = loadCloudreveTokens(accountID: account.id)
-        if let current = tokens, current.refreshTokenExpired { tokens = nil }
+        var tokens: CloudreveTokens?
+        do {
+            tokens = try loadCloudreveTokens(accountID: account.id)
+        } catch {
+            presentedError = "Die Cloudreve-Sitzung im Schlüsselbund konnte nicht gelesen werden: \(error.localizedDescription)"
+            SyncLogger.shared.error("app", "Cloudreve-Tokens konnten nicht gelesen werden: \(error.localizedDescription)")
+        }
+        if let current = tokens, current.refreshTokenExpired {
+            tokens = nil
+            do {
+                try saveCloudreveTokens(nil, accountID: account.id)
+            } catch {
+                SyncLogger.shared.warning("app", "Abgelaufene Cloudreve-Tokens konnten nicht aus dem Schlüsselbund entfernt werden: \(error.localizedDescription)")
+            }
+        }
         let accountID = account.id
         do {
+            let apiReference = CloudreveAPIReference()
             let api = try CloudreveAPIClient(siteURL: site, tokens: tokens, allowInsecureHTTP: account.allowInsecureHTTP, onTokensChanged: { [weak self] updated in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self,
+                          self.lifecycleGeneration == generation,
+                          self.account?.id == accountID,
+                          let source = apiReference.value,
+                          source.currentTokens == updated else { return }
                     do {
                         try self.saveCloudreveTokens(updated, accountID: accountID)
                     } catch {
                         SyncLogger.shared.warning("app", "Cloudreve-Tokens konnten nicht gespeichert werden: \(error.localizedDescription)")
+                        self.presentedError = "Die erneuerte Cloudreve-Sitzung konnte nicht im Schlüsselbund gespeichert werden: \(error.localizedDescription)"
                     }
                     self.cloudreveSignedIn = updated != nil
                 }
             })
+            apiReference.value = api
             cloudreveSignedIn = api.isSignedIn
             return api
         } catch {
@@ -187,21 +243,48 @@ extension AppModel {
 
     func refreshShares() async {
         guard let account, let api = cloudreveAPI else { shares = []; return }
-        if let store, let cached = try? await store.shares(accountID: account.id), !cached.isEmpty, shares.isEmpty {
-            shares = cached
+        let generation = lifecycleGeneration
+        let accountID = account.id
+        if let store {
+            do {
+                let cached = try await store.shares(accountID: accountID)
+                guard lifecycleGeneration == generation,
+                      self.account?.id == accountID,
+                      cloudreveAPI === api else { return }
+                if !cached.isEmpty, shares.isEmpty { shares = cached }
+            } catch {
+                guard lifecycleGeneration == generation else { return }
+                presentedError = "Der Freigabe-Cache konnte nicht gelesen werden: \(error.localizedDescription)"
+                return
+            }
         }
         guard api.isSignedIn else { return }
         sharesLoading = true
-        defer { sharesLoading = false }
+        defer {
+            if lifecycleGeneration == generation, self.account?.id == accountID, cloudreveAPI === api {
+                sharesLoading = false
+            }
+        }
         do {
             let fresh = try await api.listShares()
+            guard lifecycleGeneration == generation,
+                  self.account?.id == accountID,
+                  cloudreveAPI === api else { return }
             shares = fresh
-            try? await store?.replaceShares(fresh, accountID: account.id)
+            try await store?.replaceShares(fresh, accountID: accountID)
         } catch let error as CloudreveError {
+            guard lifecycleGeneration == generation,
+                  self.account?.id == accountID,
+                  cloudreveAPI === api else { return }
             if case .authenticationRequired = error { cloudreveSignedIn = false }
             SyncLogger.shared.warning("app", "Freigaben konnten nicht geladen werden: \(error.userDescription)")
+            presentedError = error.userDescription
         } catch {
+            guard lifecycleGeneration == generation,
+                  self.account?.id == accountID,
+                  cloudreveAPI === api else { return }
             SyncLogger.shared.warning("app", "Freigaben konnten nicht geladen werden: \(error.localizedDescription)")
+            presentedError = "Freigaben konnten nicht geladen werden: \(error.localizedDescription)"
         }
     }
 

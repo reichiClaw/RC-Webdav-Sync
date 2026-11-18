@@ -4,7 +4,16 @@ import CoreServices
 /// Beobachtet den lokalen Synchronisierungsordner mit FSEvents und meldet
 /// Änderungen gebündelt nach einer Beruhigungszeit.
 final class FolderWatcher: @unchecked Sendable {
+    private final class CallbackContext {
+        weak var watcher: FolderWatcher?
+
+        init(watcher: FolderWatcher) {
+            self.watcher = watcher
+        }
+    }
+
     private var stream: FSEventStreamRef?
+    private var callbackContext: CallbackContext?
     private let queue = DispatchQueue(label: "de.reichi.sync.fsevents", qos: .utility)
     private let debounce: TimeInterval
     private let ignoredPrefix: String
@@ -24,12 +33,26 @@ final class FolderWatcher: @unchecked Sendable {
         stop()
     }
 
-    func start() {
-        guard stream == nil else { return }
-        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+    @discardableResult
+    func start() -> Bool {
+        guard stream == nil else { return true }
+        let holder = CallbackContext(watcher: self)
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(holder).toOpaque(),
+            retain: { info in
+                guard let info else { return nil }
+                return UnsafeRawPointer(Unmanaged<CallbackContext>.fromOpaque(info).retain().toOpaque())
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<CallbackContext>.fromOpaque(info).release()
+            },
+            copyDescription: nil
+        )
         let callback: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
             guard let info else { return }
-            let watcher = Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue()
+            guard let watcher = Unmanaged<CallbackContext>.fromOpaque(info).takeUnretainedValue().watcher else { return }
             guard let paths = Unmanaged<NSArray>.fromOpaque(eventPaths).takeUnretainedValue() as? [String] else {
                 watcher.scheduleNotification()
                 return
@@ -39,11 +62,19 @@ final class FolderWatcher: @unchecked Sendable {
         }
         let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagIgnoreSelf)
         guard let created = FSEventStreamCreate(nil, callback, &context, [root.path] as CFArray, FSEventStreamEventId(bitPattern: -1) /* kFSEventStreamEventIdSinceNow */, 1.0, flags) else {
-            return
+            return false
         }
+        callbackContext = holder
         stream = created
         FSEventStreamSetDispatchQueue(created, queue)
-        FSEventStreamStart(created)
+        guard FSEventStreamStart(created) else {
+            FSEventStreamInvalidate(created)
+            FSEventStreamRelease(created)
+            stream = nil
+            callbackContext = nil
+            return false
+        }
+        return true
     }
 
     func stop() {
@@ -52,6 +83,7 @@ final class FolderWatcher: @unchecked Sendable {
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream)
         self.stream = nil
+        callbackContext = nil
         lock.lock(); pending?.cancel(); pending = nil; lock.unlock()
     }
 

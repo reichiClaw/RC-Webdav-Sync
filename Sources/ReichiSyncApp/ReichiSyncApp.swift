@@ -13,10 +13,10 @@ struct ReichiSyncApp: App {
             MainWindow()
                 .environmentObject(model)
                 .frame(minWidth: 760, minHeight: 500)
-                .task {
+                .onAppear {
                     appDelegate.model = model
                     model.openMainWindowHandler = { openWindow(id: "main") }
-                    await model.bootstrap()
+                    model.beginBootstrap()
                 }
         }
         .defaultSize(width: 920, height: 600)
@@ -62,8 +62,12 @@ struct ReichiSyncApp: App {
 
 /// Hält die App nach dem Schließen des Hauptfensters in der Menüleiste am Leben
 /// und sichert beim Beenden den Zustand der Engine.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
+    private var terminationCleanupTask: Task<Void, Never>?
+    private var terminationTimeoutTask: Task<Void, Never>?
+    private var terminationReplySent = false
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
@@ -78,10 +82,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }
-        Task { @MainActor in
+        guard terminationCleanupTask == nil else { return .terminateLater }
+        terminationCleanupTask = Task { @MainActor [weak self, weak sender] in
             await model.prepareForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
+            guard let self, let sender else { return }
+            finishTermination(sender)
+        }
+        terminationTimeoutTask = Task { @MainActor [weak self, weak sender] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard !Task.isCancelled, let self, let sender else { return }
+            terminationCleanupTask?.cancel()
+            SyncLogger.shared.warning("app", "Beenden nach Zeitlimit fortgesetzt; ausstehende Arbeit wird beim nächsten Start erneut geprüft")
+            finishTermination(sender)
         }
         return .terminateLater
+    }
+
+    private func finishTermination(_ sender: NSApplication) {
+        guard !terminationReplySent else { return }
+        terminationReplySent = true
+        terminationTimeoutTask?.cancel()
+        sender.reply(toApplicationShouldTerminate: true)
     }
 }
