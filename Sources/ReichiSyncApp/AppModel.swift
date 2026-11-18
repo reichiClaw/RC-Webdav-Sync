@@ -167,7 +167,10 @@ final class AppModel: ObservableObject {
                 s.health = .paused
                 s.isPaused = true
                 s.pauseReason = .authenticationRequired
-                s.lastIssue = SyncIssue(message: "Für diese Verbindung ist kein Passwort im Schlüsselbund hinterlegt.", action: .checkCredentials)
+                s.lastIssue = SyncIssue(
+                    message: "Für diese Verbindung ist kein lesbares Passwort im Schlüsselbund verfügbar. Bitte das Passwort in den Einstellungen erneut eingeben.",
+                    action: .checkCredentials
+                )
                 status = s
                 return
             }
@@ -533,7 +536,7 @@ final class AppModel: ObservableObject {
                     throw NSError(
                         domain: "de.reichi.sync.settings",
                         code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "Im Schlüsselbund ist kein Passwort für die Verbindungsprüfung hinterlegt."]
+                        userInfo: [NSLocalizedDescriptionKey: "Im Schlüsselbund ist kein lesbares Passwort für die Verbindungsprüfung verfügbar."]
                     )
                 }
                 let candidate = try WebDAVClient(
