@@ -300,7 +300,7 @@ public struct LocalFileSystem: Sendable {
             )
         }
         throw Self.mapError(NSError(domain: NSPOSIXErrorDomain, code: Int(exchangeError)))
-        #endif
+        #else
         let result = temp.withUnsafeFileSystemRepresentation { tempPath in
             target.withUnsafeFileSystemRepresentation { targetPath in
                 rename(tempPath!, targetPath!)
@@ -311,6 +311,7 @@ public struct LocalFileSystem: Sendable {
             try? fm.removeItem(at: temp)
             throw Self.mapError(err)
         }
+        #endif
     }
 
     /// Verschiebt eine Datei oder einen Ordner in den Papierkorb; falls das nicht
