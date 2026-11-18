@@ -251,7 +251,7 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     }
 
     deinit {
-        session.invalidateAndCancel()
+        URLSessionLifecycle.invalidate(session)
     }
 
     /// Aktuelle Tokens (für Persistierung).

@@ -144,7 +144,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
     }
 
     deinit {
-        session.invalidateAndCancel()
+        URLSessionLifecycle.invalidate(session)
     }
 
     // MARK: - URL-Bildung
