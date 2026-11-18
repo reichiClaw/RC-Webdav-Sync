@@ -124,16 +124,16 @@ verlustfrei.
 
 ## Häufige Fehler
 
-- **`xcrun: error: invalid active developer path`**  
+- **`xcrun: error: invalid active developer path`**
   `xcode-select` wie oben auf die vollständige Xcode-Installation setzen.
-- **Signing verlangt ein Team**  
+- **Signing verlangt ein Team**
   Für lokale Skript-Builds ist kein Team nötig. In Xcode ein Team auswählen
   oder für eine reine Prüfung `CODE_SIGNING_ALLOWED=NO` verwenden.
-- **App kann den Ordner nach einem Neubau nicht öffnen**  
+- **App kann den Ordner nach einem Neubau nicht öffnen**
   Den Ordner in den App-Einstellungen erneut auswählen.
-- **Tests werden übersprungen oder der Testserver startet nicht**  
+- **Tests werden übersprungen oder der Testserver startet nicht**
   `python3 --version` prüfen und `python3 -m py_compile
   Scripts/dev-webdav-server.py` ausführen.
-- **Build auf Linux erfolgreich, App-Build dennoch fehlerhaft**  
+- **Build auf Linux erfolgreich, App-Build dennoch fehlerhaft**
   Linux kompiliert nur `ReichiSyncCore`; SwiftUI, AppKit, FSEvents, Keychain
   und das vollständige App-Bundle müssen auf macOS/Xcode geprüft werden.
