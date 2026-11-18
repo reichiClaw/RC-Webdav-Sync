@@ -20,6 +20,9 @@ struct SettingsView: View {
     @State private var confirmRemove = false
     @State private var testResult: String?
     @State private var testing = false
+    @State private var chunkedUploads = true
+    @State private var chunkThresholdMB: Int = 8
+    @State private var showReauth = false
 
     var body: some View {
         Group {
@@ -40,6 +43,31 @@ struct SettingsView: View {
 
     private var form: some View {
         Form {
+            if let account = model.account, account.isCloudreve {
+                Section("Cloudreve") {
+                    TextField("Bezeichnung", text: $name)
+                    LabeledContent("Server", value: account.cloudreveSiteURL?.absoluteString ?? "–")
+                    LabeledContent("Konto", value: account.cloudreveEmail ?? "–")
+                    LabeledContent("Server-Ordner", value: CloudreveURI.folderPath(from: account.davAccountURI ?? "cloudreve://my/"))
+                    LabeledContent("WebDAV-Konto", value: account.username)
+                    HStack {
+                        if model.cloudreveSignedIn {
+                            Label("Angemeldet – Chunk-Upload und Freigaben verfügbar", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Label("Sitzung abgelaufen – Dateiabgleich läuft weiter, Chunk-Upload und Freigaben benötigen eine neue Anmeldung", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                        }
+                        Spacer()
+                        Button("Erneut anmelden …") { showReauth = true }
+                    }
+                    .font(.callout)
+                    Text("Das Cloudreve-Passwort wird nicht gespeichert. Im Schlüsselbund liegen nur die Sitzungs-Tokens und das Passwort des WebDAV-Kontos, das reichi Sync für dieses Gerät angelegt hat.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .sheet(isPresented: $showReauth) { CloudreveReauthSheet() }
+            } else {
             Section("Verbindung") {
                 TextField("Bezeichnung", text: $name)
                 TextField("Server-Adresse (WebDAV-URL)", text: $serverURL)
@@ -64,6 +92,7 @@ struct SettingsView: View {
                 Text("Das Passwort wird ausschließlich im Schlüsselbund gespeichert. Zertifikate werden regulär vom System geprüft.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
             }
 
             Section("Lokaler Ordner") {
@@ -91,6 +120,21 @@ struct SettingsView: View {
                     Text("15 Minuten").tag(900.0)
                 }
                 Stepper("Gleichzeitige Übertragungen: \(maxConcurrent)", value: $maxConcurrent, in: 1...8)
+                if model.isCloudreveAccount {
+                    Toggle("Große Dateien in Teilen hochladen (fortsetzbar)", isOn: $chunkedUploads)
+                    if chunkedUploads {
+                        Picker("Ab Dateigröße", selection: $chunkThresholdMB) {
+                            Text("1 MB").tag(1)
+                            Text("4 MB").tag(4)
+                            Text("8 MB").tag(8)
+                            Text("32 MB").tag(32)
+                            Text("128 MB").tag(128)
+                        }
+                    }
+                    Text("Uploads ab dieser Größe laufen über die Cloudreve-Upload-API in Teilstücken. Bricht die Verbindung ab, wird beim nächsten Versuch an der letzten bestätigten Stelle fortgesetzt.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Stepper("Löschschutz ab \(deletionThreshold) Einträgen", value: $deletionThreshold, in: 5...500, step: 5)
                 Text("Werden in einem Durchgang mindestens so viele Einträge (oder mehr als 20 % des Bestands) gelöscht, wartet reichi Sync auf deine Bestätigung.")
                     .font(.caption)
@@ -148,6 +192,7 @@ struct SettingsView: View {
         return name != account.name || serverURL != account.serverURL.absoluteString || username != account.username || !newPassword.isEmpty
             || folderURL != nil || pollInterval != account.pollInterval || exclusionList != account.exclusionPatterns || allowInsecureHTTP != account.allowInsecureHTTP
             || notificationsEnabled != account.notificationsEnabled || deletionThreshold != account.deletionGuardThreshold || maxConcurrent != account.maxConcurrentTransfers
+            || chunkedUploads != account.chunkedUploadsEnabled || Int64(chunkThresholdMB) * 1024 * 1024 != account.chunkedUploadThreshold
     }
 
     private var exclusionList: [String] {
@@ -168,6 +213,8 @@ struct SettingsView: View {
         notificationsEnabled = account.notificationsEnabled
         deletionThreshold = account.deletionGuardThreshold
         maxConcurrent = account.maxConcurrentTransfers
+        chunkedUploads = account.chunkedUploadsEnabled
+        chunkThresholdMB = max(1, Int(account.chunkedUploadThreshold / (1024 * 1024)))
         testResult = nil
         model.refreshLoginItemState()
     }
@@ -187,6 +234,8 @@ struct SettingsView: View {
         account.notificationsEnabled = notificationsEnabled
         account.deletionGuardThreshold = deletionThreshold
         account.maxConcurrentTransfers = maxConcurrent
+        account.chunkedUploadsEnabled = chunkedUploads
+        account.chunkedUploadThreshold = Int64(chunkThresholdMB) * 1024 * 1024
         saving = true
         Task { @MainActor in
             await model.updateAccount(account, newPassword: newPassword.isEmpty ? nil : newPassword, newFolder: folderURL)
@@ -217,6 +266,65 @@ struct SettingsView: View {
                 testResult = error.userDescription
             } catch {
                 testResult = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// Erneute Cloudreve-Anmeldung nach Ablauf der Sitzung.
+struct CloudreveReauthSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var password = ""
+    @State private var otp = ""
+    @State private var needsOTP = false
+    @State private var working = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Bei Cloudreve anmelden").font(.title2.weight(.semibold))
+            Text("Konto: \(model.account?.cloudreveEmail ?? "–")")
+                .foregroundStyle(.secondary)
+            SecureField("Passwort", text: $password)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { if !password.isEmpty { submit() } }
+            if needsOTP {
+                TextField("Bestätigungscode (2FA)", text: $otp)
+                    .textFieldStyle(.roundedBorder)
+                    .textContentType(.oneTimeCode)
+            }
+            if let error {
+                Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Abbrechen") { dismiss() }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(working ? "Anmeldung …" : "Anmelden") { submit() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(working || password.isEmpty || (needsOTP && otp.count < 6))
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
+    }
+
+    private func submit() {
+        working = true
+        error = nil
+        let (pw, code) = (password, otp)
+        Task { @MainActor in
+            defer { working = false }
+            do {
+                try await model.reauthenticateCloudreve(password: pw, otp: needsOTP ? code : nil)
+                dismiss()
+            } catch CloudreveError.twoFactorRequired {
+                needsOTP = true
+            } catch let err as CloudreveError {
+                error = err.userDescription
+            } catch {
+                self.error = error.localizedDescription
             }
         }
     }

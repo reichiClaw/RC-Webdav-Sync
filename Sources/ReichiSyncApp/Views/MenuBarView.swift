@@ -41,6 +41,13 @@ struct MenuBarView: View {
                 if model.status.pendingDeletions > 0 {
                     menuButton("Löschungen prüfen", symbol: "trash") { open(.overview) }
                 }
+                if model.isCloudreveAccount {
+                    menuButton("Link teilen …", symbol: "link.badge.plus") {
+                        open(.shares)
+                        if let path = model.chooseItemToShare() { model.requestShare(forRelativePath: path) }
+                    }
+                    menuButton("Freigaben anzeigen", symbol: "link") { open(.shares) }
+                }
             } else {
                 Divider()
                 menuButton("Einrichtung starten", symbol: "wand.and.stars") { open(.overview) }

@@ -19,7 +19,7 @@ struct MainWindow: View {
                 SetupAssistantView()
             } else {
                 NavigationSplitView {
-                    List(AppModel.Section.allCases, selection: $model.selectedSection) { section in
+                    List(visibleSections, selection: $model.selectedSection) { section in
                         Label {
                             HStack {
                                 Text(section.title)
@@ -45,6 +45,7 @@ struct MainWindow: View {
                     case .overview: OverviewView()
                     case .activity: ActivityView()
                     case .conflicts: ConflictsView()
+                    case .shares: SharesView()
                     case .settings: SettingsView()
                     }
                 }
@@ -55,6 +56,11 @@ struct MainWindow: View {
         } message: {
             Text(model.presentedError ?? "")
         }
+    }
+
+    /// Freigaben gibt es nur bei Cloudreve-Verbindungen.
+    private var visibleSections: [AppModel.Section] {
+        AppModel.Section.allCases.filter { $0 != .shares || model.isCloudreveAccount }
     }
 
     private func badge(for section: AppModel.Section) -> Int? {
@@ -307,6 +313,9 @@ struct ActivityView: View {
                     TransferRow(transfer: transfer)
                         .contextMenu {
                             Button("Im Finder zeigen") { model.reveal(path: transfer.path) }
+                            if model.isCloudreveAccount {
+                                Button("Link teilen …") { model.requestShare(forRelativePath: transfer.path) }
+                            }
                         }
                 }
                 .listStyle(.inset)

@@ -33,6 +33,12 @@ struct ReichiSyncApp: App {
                 Button("Lokalen Ordner im Finder öffnen") { model.openLocalFolder() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(model.needsSetup)
+                Divider()
+                Button("Link teilen …") {
+                    if let path = model.chooseItemToShare() { model.requestShare(forRelativePath: path) }
+                }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                .disabled(!model.isCloudreveAccount || !model.cloudreveSignedIn)
             }
         }
 

@@ -179,6 +179,7 @@ public actor SyncStore {
             let mappings = try db.query("SELECT id FROM mappings WHERE account_id = ?", [.text(id)]).compactMap { $0.string("id") }
             for m in mappings { try deleteMappingData(m) }
             try db.execute("DELETE FROM mappings WHERE account_id = ?", [.text(id)])
+            try db.execute("DELETE FROM shares WHERE account_id = ?", [.text(id)])
             try db.execute("DELETE FROM accounts WHERE id = ?", [.text(id)])
         }
     }

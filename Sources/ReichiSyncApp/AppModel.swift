@@ -7,7 +7,7 @@ import ReichiSyncCore
 @MainActor
 final class AppModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
-        case overview, activity, conflicts, settings
+        case overview, activity, conflicts, shares, settings
         var id: String { rawValue }
 
         var title: String {
@@ -15,6 +15,7 @@ final class AppModel: ObservableObject {
             case .overview: return "Übersicht"
             case .activity: return "Aktivität"
             case .conflicts: return "Konflikte"
+            case .shares: return "Freigaben"
             case .settings: return "Einstellungen"
             }
         }
@@ -24,6 +25,7 @@ final class AppModel: ObservableObject {
             case .overview: return "rectangle.3.group"
             case .activity: return "arrow.up.arrow.down"
             case .conflicts: return "exclamationmark.triangle"
+            case .shares: return "link"
             case .settings: return "gearshape"
             }
         }
@@ -48,20 +50,30 @@ final class AppModel: ObservableObject {
     @Published var presentedError: String?
     @Published private(set) var isReady = false
     @Published private(set) var storeError: String?
+    /// Cloudreve: API-Sitzung gültig (Chunk-Upload und Freigaben verfügbar).
+    @Published var cloudreveSignedIn = false
+    @Published var shares: [CloudreveShare] = []
+    @Published var sharesLoading = false
+    /// Pfad, für den die Oberfläche das Freigabe-Formular öffnen soll.
+    @Published var shareRequestPath: String?
 
     var needsSetup: Bool { isReady && account == nil }
     var localRootURL: URL? { accessedRoot ?? account.map { URL(fileURLWithPath: $0.localRootPath, isDirectory: true) } }
+    /// `true`, wenn die aktuelle Verbindung eine Cloudreve-Instanz ist (Freigaben möglich).
+    var isCloudreveAccount: Bool { account?.isCloudreve ?? false }
 
-    private var store: SyncStore?
+    var store: SyncStore?
     private var engine: SyncEngine?
+    /// Cloudreve-REST-Client (nur bei Cloudreve-Verbindungen).
+    var cloudreveAPI: CloudreveAPIClient?
     private var watcher: FolderWatcher?
     private var connectivity: ConnectivityMonitor?
     private var wakeObserver: SleepWakeObserver?
     private var pollTask: Task<Void, Never>?
     private var accessedRoot: URL?
-    private let keychain = KeychainStore()
-    private let bookmarks = BookmarkStore()
-    private let notifications = NotificationService()
+    let keychain = KeychainStore()
+    let bookmarks = BookmarkStore()
+    let notifications = NotificationService()
     private var logObserver: UUID?
     private var lastStatusRunning = false
 
@@ -101,7 +113,7 @@ final class AppModel: ObservableObject {
         isReady = true
     }
 
-    private func startEngine(for account: AccountConfiguration) async {
+    func startEngine(for account: AccountConfiguration) async {
         guard let store else { return }
         await stopEngine()
         let root: URL
@@ -136,7 +148,7 @@ final class AppModel: ObservableObject {
         let client: WebDAVClient
         do {
             client = try WebDAVClient(baseURL: account.serverURL, credentials: WebDAVCredentials(username: account.username, password: password),
-                                      allowInsecureHTTP: account.allowInsecureHTTP)
+                                      allowInsecureHTTP: account.allowInsecureHTTP, serverKindHint: account.isCloudreve ? .cloudreve : .generic)
         } catch {
             presentedError = (error as? WebDAVError)?.userDescription ?? error.localizedDescription
             return
@@ -148,17 +160,25 @@ final class AppModel: ObservableObject {
             presentedError = "Synchronisierungsstand konnte nicht geladen werden: \(error)"
             return
         }
+        let api = makeCloudreveClient(for: account)
+        cloudreveAPI = api
+        var uploadTransport: ResumableUploadTransport?
+        if let api, account.chunkedUploadsEnabled, let rootURI = account.davAccountURI {
+            uploadTransport = CloudreveUploadTransport(api: api, dav: client, store: store, mappingID: mapping.id, rootURI: rootURI)
+        }
         let config = SyncEngineConfiguration(
             deviceName: Host.current().localizedName ?? "Mac",
             recoveryDirectory: AppPaths.recovery,
             maxConcurrentTransfers: account.maxConcurrentTransfers,
             deletionGuard: DeletionGuard(threshold: account.deletionGuardThreshold, fraction: account.deletionGuardFraction),
             caseInsensitiveLocalFileSystem: true,
-            settleTime: 2.0
+            settleTime: 2.0,
+            chunkedUploadThreshold: account.chunkedUploadsEnabled ? account.chunkedUploadThreshold : nil
         )
         let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root),
-                                rules: ExclusionRules(userPatterns: account.exclusionPatterns), configuration: config)
+                                rules: ExclusionRules(userPatterns: account.exclusionPatterns), configuration: config, uploadTransport: uploadTransport)
         self.engine = engine
+        if api != nil { Task { await refreshShares() } }
         await engine.setStatusHandler { [weak self] status in
             Task { @MainActor [weak self] in self?.apply(status) }
         }
@@ -203,6 +223,8 @@ final class AppModel: ObservableObject {
             await engine.shutdown()
         }
         engine = nil
+        cloudreveAPI = nil
+        cloudreveSignedIn = false
         accessedRoot?.stopAccessingSecurityScopedResource()
         accessedRoot = nil
     }
@@ -352,7 +374,8 @@ final class AppModel: ObservableObject {
         }
         let needsRestart = account.map { $0.mappingKey != updated.mappingKey || $0.pollInterval != updated.pollInterval || $0.exclusionPatterns != updated.exclusionPatterns
             || $0.maxConcurrentTransfers != updated.maxConcurrentTransfers || $0.allowInsecureHTTP != updated.allowInsecureHTTP || $0.username != updated.username
-            || $0.deletionGuardThreshold != updated.deletionGuardThreshold || $0.notificationsEnabled != updated.notificationsEnabled } ?? true
+            || $0.deletionGuardThreshold != updated.deletionGuardThreshold || $0.notificationsEnabled != updated.notificationsEnabled
+            || $0.chunkedUploadsEnabled != updated.chunkedUploadsEnabled || $0.chunkedUploadThreshold != updated.chunkedUploadThreshold } ?? true
         account = updated
         if needsRestart || newPassword != nil || newFolder != nil {
             if updated.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
@@ -364,6 +387,7 @@ final class AppModel: ObservableObject {
         guard let store, let account else { return }
         await stopEngine()
         try? keychain.deletePassword(accountID: account.id)
+        try? keychain.deletePassword(accountID: Self.cloudreveTokenKey(accountID: account.id))
         bookmarks.remove(accountID: account.id)
         try? await store.deleteAccount(id: account.id)
         self.account = nil
@@ -372,6 +396,7 @@ final class AppModel: ObservableObject {
         conflicts = []
         pendingDeletions = []
         queue = []
+        shares = []
     }
 
     func chooseFolder(prompt: String = "Ordner auswählen") -> URL? {
