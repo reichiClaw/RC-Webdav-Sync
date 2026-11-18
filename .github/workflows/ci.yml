@@ -39,6 +39,8 @@ jobs:
           -scheme ReichiSync
           -configuration Debug
           -destination 'platform=macOS'
+          ARCHS=x86_64
+          ONLY_ACTIVE_ARCH=YES
           CODE_SIGNING_ALLOWED=NO
           build
       - name: Build and verify universal app bundle
