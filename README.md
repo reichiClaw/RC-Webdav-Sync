@@ -13,9 +13,10 @@ fortgesetzt), automatische Bereitstellung eines WebDAV-Kontos pro Gerät und
 
 Oberste Regeln der Implementierung:
 
-- **Kein Datenverlust.** Konflikte werden nie automatisch zugunsten einer Seite
-  entschieden; es bleiben immer beide Versionen erhalten (Konfliktkopie mit
-  Gerätename und Zeitstempel).
+- **Datenerhalt vor Fortschritt.** Konflikte werden nicht automatisch zugunsten
+  einer Seite entschieden; beide erkannten Versionen bleiben erhalten
+  (Konfliktkopie mit Gerätename und Zeitstempel). Kann ein Server eine Mutation
+  nicht atomar gegen parallele Änderungen schützen, bleibt sie ausstehend.
 - **Löschungen nur, wenn sie eindeutig sind.** Eine Löschung wird nur
   übertragen, wenn der Eintrag im gemeinsamen Stand (Baseline) bekannt war, die
   Bestandsaufnahme der anderen Seite vollständig war und sich die Datei dort
@@ -109,7 +110,7 @@ Deshalb gilt:
 
 | Bereich | Status |
 |---|---|
-| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner, Cloudreve-Client, Chunk-Upload) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **98 Tests, 0 Fehler** |
+| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner, Cloudreve-Client, Chunk-Upload) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **134 Tests, 0 Fehler** |
 | Integrationstests gegen WebDAV-Testumgebung | **Ausgeführt**: Fake-Server-Actor (alle 13 Sync-Szenarien aus der Anforderung) **und** echter HTTP-Server (`Scripts/dev-webdav-server.py`) inkl. 401-Behandlung, If-Match/If-None-Match, kompletter Engine-Lauf über HTTP |
 | Cloudreve-Integration | **Gegen Emulation getestet** (`dev-webdav-server.py --cloudreve`, gebaut nach Cloudreve-v4-Quellcode und API-Dokumentation): Login/2FA/Token-Refresh, WebDAV-Konten, Chunk-Upload, **Wiederaufnahme ohne erneutes Senden bestätigter Chunks**, abgelaufene Sitzung, lokale Änderung während des Uploads, Versionsprüfung (`previous`), Freigaben, Engine-Schwelle. **Eine echte Cloudreve-Instanz existiert noch nicht** – der erste Lauf gegen reichi.cloud muss die Annahmen in `docs/WEBDAV.md` (Abschnitt Cloudreve) bestätigen. |
 | `ReichiSync` (SwiftUI/AppKit-App, Menüleiste, Services) | **Geschrieben, auf Linux nur syntaktisch geprüft (`swiftc -parse`)**. Typprüfung, Build und manueller Test müssen auf einem Mac erfolgen (Schritte unten). |
@@ -117,6 +118,9 @@ Deshalb gilt:
 | Szenario 14 (Fenster schließen → App läuft in Menüleiste weiter) | Implementiert in `AppDelegate.applicationShouldTerminateAfterLastWindowClosed` + `LSUIElement`; nur auf macOS prüfbar. |
 
 ### Exakte Verifikationsschritte auf einem Mac (macOS 14+, Xcode 15+)
+
+Eine ausführliche Anleitung einschließlich Xcode, universellem App-Bundle,
+Signierung und Fehlerdiagnose steht in [`docs/MAC_BUILD.md`](docs/MAC_BUILD.md).
 
 ```bash
 git clone <repo> && cd reichi-sync
@@ -246,8 +250,8 @@ swift test --filter WebDAVClientHTTPTests   # echter HTTP-Server (Python 3 nöti
    (beide Versionen, „Beide behalten / Lokale Version verwenden /
    Serverversion verwenden“), Freigaben (nur Cloudreve: Links erstellen,
    kopieren, löschen), Einstellungen (Verbindung, Ordner, Intervall,
-   Chunk-Upload-Schwelle, Ausschlüsse, Login-Item, Benachrichtigungen,
-   Dock-Symbol, erneute Cloudreve-Anmeldung).
+   Ausschlüsse, Login-Item, Benachrichtigungen, Dock-Symbol und erneute
+   Cloudreve-Anmeldung).
 4. **Wiederherstellung gelöschter Dateien**: Lokale Löschungen durch die App
    landen im macOS-Papierkorb. Falls das nicht möglich ist, im
    Wiederherstellungsbereich `~/Library/Containers/de.reichi.sync/Data/Library/Application Support/reichi Sync/Wiederherstellung/<Zeitstempel>/…`
@@ -284,9 +288,9 @@ Punkte, die die Anforderung offen ließ, wurden so entschieden:
 | Abfrageintervall | 60 s Standard, 30 s bis 15 min wählbar; zusätzlich Trigger bei Start, Aufwachen, Netzwerkrückkehr, FSEvents, manuell. |
 | Dock-Symbol | Standardmäßig reines Menüleisten-Programm (`LSUIElement`), optional Dock-Symbol in den Einstellungen. |
 | Speicherplatz | Downloads werden vor dem Start gegen freien Platz (+200 MB Reserve) geprüft; bei Platzmangel Pause mit Hinweis. |
-| Cloudreve-Anbindung | Hybrid: Listing/Download/Löschen/Verschieben über WebDAV (`/dav/`), nur Login, WebDAV-Konto-Anlage, Chunk-Upload und Freigaben über die REST-API (`/api/v4`). Fällt die API aus (Sitzung abgelaufen), läuft der Abgleich per WebDAV-PUT weiter. |
-| Chunk-Upload-Schwelle | Standard 8 MB (1–128 MB wählbar, abschaltbar). Zustand pro Datei in `upload_sessions` (Sitzung, bestätigte Chunks, Größe/mtime/Hash); Fortsetzung nur bei unveränderter Datei und > 2 min Restlaufzeit der Sitzung, sonst Neustart. |
-| Cloudreve `If-Match` | Cloudreve wertet `If-Match` beim PUT nicht aus (Quellcode `pkg/webdav`). Erkannt per `GET /api/v4/site/ping` → `honorsIfMatch = false`; die Engine prüft dann vor Überschreiben/Löschen per PROPFIND und nutzt beim Chunk-Upload `previous` (Entity-ID = ETag) als serverseitige Versionsprüfung. |
+| Cloudreve-Anbindung | Hybrid: Listing, Download und Ordneranlage über WebDAV (`/dav/`); Uploads über die versionierte REST-Upload-API (`/api/v4`). Da Cloudreve DAV-Vorbedingungen ignoriert, bleiben Server-Löschungen und -Umbenennungen sicherheitshalber ausstehend. Bei abgelaufener API-Sitzung funktionieren Lesen und Herunterladen weiter; Schreibvorgänge warten auf eine erneute Anmeldung. |
+| Cloudreve-Upload-Sitzungen | Cloudreve bestimmt die Chunk-Größe seiner sicheren REST-Sitzung. Zustand pro Datei in `upload_sessions` (Sitzung, bestätigte Chunks, Größe/mtime/Hash); Fortsetzung nur bei unveränderter Datei und > 2 min Restlaufzeit, sonst Neustart. Signierte URLs und Upload-Credentials werden nicht persistiert. |
+| Cloudreve `If-Match` | Cloudreve wertet `If-Match`/`If-None-Match` bei DAV-PUT, DELETE und MOVE nicht atomar aus. Der Cloudreve-Hinweis setzt deshalb auch bei fehlgeschlagenem Ping `honorsIfMatch = false`. Uploads nutzen `previous` beziehungsweise den atomaren Existenzschutz der REST-API; DELETE/MOVE werden ohne gleichwertige Servervorbedingung nicht automatisch ausgeführt. |
 | Freigaben | Nur Einträge innerhalb des Sync-Ordners; Passwort alphanumerisch ≤ 32 Zeichen (Cloudreve-Vorgabe), Ablauf 1 h–30 d, Download-Limit; Link inkl. Passwort-Teil `…/s/<id>/<pw>` wird kopiert. Lokaler Cache der Freigaben in `shares`. |
 | App-Icon | Vorlage auf heller macOS-Kachel mit Verlauf/Schatten (`Scripts/generate-icon.py`). Liegt `Design/logo.svg` vor, wird das Logo **pro Icon-Größe verlustfrei aus dem SVG gerendert** (`pip3 install cairosvg` oder `brew install librsvg`); sonst dient `Design/logo.png` (256 px) als Raster-Vorlage. Im Repo liegt bisher nur das PNG – die SVG-Datei einfach als `Design/logo.svg` ablegen und das Skript erneut ausführen. |
 
@@ -314,6 +318,7 @@ Scripts/build-app.sh           .app-Bundle aus SwiftPM-Build
 Scripts/generate-icon.py       App-Icon-PNGs erzeugen (SVG-Vorlage bevorzugt, PNG als Rückfall)
 docs/ARCHITECTURE.md           Entscheidungstabelle, Zustände, Datenmodell
 docs/WEBDAV.md                 Unterstützte WebDAV-Funktionen und Grenzen
+docs/MAC_BUILD.md              Schritt-für-Schritt-Bauanleitung für macOS
 docs/SIGNING.md                Signierung, Notarisierung, Sandbox
 ```
 
@@ -323,4 +328,5 @@ docs/SIGNING.md                Signierung, Notarisierung, Sandbox
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) – Drei-Wege-Entscheidungstabelle, Zustandsmodell, Datenbankschema, Sicherheitsmaßnahmen
 - [`docs/WEBDAV.md`](docs/WEBDAV.md) – unterstützte WebDAV-Funktionen, getestete Server, bekannte Grenzen, **Cloudreve-Abschnitt** (Upload-API, Annahmen, Grenzen)
+- [`docs/MAC_BUILD.md`](docs/MAC_BUILD.md) – vollständige Anleitung für Tests, App-Bundle, Xcode und Signierung auf macOS
 - [`docs/SIGNING.md`](docs/SIGNING.md) – Signierung, Notarisierung, Hinweise zur Sandbox

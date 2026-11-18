@@ -128,7 +128,7 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 
 „Synchronisiert“ wird also nur angezeigt, wenn tatsächlich nichts offen ist.
 
-## 5. Datenbankschema (SQLite, `user_version = 2`)
+## 5. Datenbankschema (SQLite, `user_version = 4`)
 
 | Tabelle | Inhalt |
 |---|---|
@@ -136,17 +136,21 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 | `accounts` | Verbindungen (JSON-kodierte `AccountConfiguration`, ohne Passwort) |
 | `mappings` | Zuordnung Server-URL + lokaler Pfad → Baseline-Satz; `sync_token`, `last_successful_sync`, `remote_index_complete` |
 | `entries` | Baseline pro Mapping und Pfad |
-| `local_index` | Hash-Cache (Pfad → Größe, mtime, SHA-256) |
+| `local_index` | Hash-Cache (Pfad → Größe, mtime, Geräte-/Inode-/ctime-Fingerabdruck, SHA-256) |
 | `remote_index` | zuletzt bekannter Serverbestand (für `sync-collection`) |
 | `conflicts` | offene/erledigte Konflikte inkl. Konfliktkopie-Pfad |
 | `transfers` | Aktivitätsprotokoll (Zustand, Bytes, Fehler, Empfehlung) |
 | `queue` | geplante, noch nicht ausgeführte Aktionen (für Offline-Anzeige) |
 | `pending_deletions` | zurückgehaltene Löschungen |
-| `upload_sessions` | (v2) Zustand unterbrochener Chunk-Uploads pro Mapping und Pfad (JSON `ResumableUploadState`: Sitzung, Chunk-Größe, bestätigte Chunks, Größe/mtime/Hash, Ablauf, Richtlinie) |
-| `shares` | (v2) lokaler Cache der Cloudreve-Freigaben pro Verbindung (Anzeige auch ohne gültige API-Sitzung) |
+| `upload_sessions` | Zustand unterbrochener Chunk-Uploads pro Mapping und Pfad; kurzlebige Zugangsdaten und signierte Upload-URLs werden nicht persistiert |
+| `shares` | Bereinigter lokaler Cache der Cloudreve-Freigaben; private Passwörter werden weder separat noch als URL-Pfadsegment gespeichert |
 
-Ändert sich Server-URL oder lokaler Ordner, entsteht ein neues Mapping; die
-alte Baseline wird nicht wiederverwendet (keine fehlerhaften Löschungen).
+Der Mapping-Schlüssel (`mapping-v3`) bindet den gemeinsamen Stand an
+Server-URL, Benutzer, Cloudreve-DAV-Konto/-Wurzel, lokalen Pfad samt
+Geräte-/Inode-Identität und Ausschlussregeln. Ändert sich einer dieser Werte,
+entsteht ein leerer, sicher zusammenzuführender Stand; eine fremde oder alte
+Baseline wird nicht wiederverwendet. Schema 4 entfernt außerdem potenziell
+geheime Altwerte mit `secure_delete`, WAL-Checkpoint und `VACUUM`.
 
 ## 6. Dateisystem-Details
 
@@ -157,11 +161,15 @@ alte Baseline wird nicht wiederverwendet (keine fehlerhaften Löschungen).
   bleibt. Server-`href`s werden dekodiert, gegen den Basis-Pfad geprüft und
   durch dieselbe Validierung geführt.
 - Downloads gehen in `.reichi-sync-tmp/` im Sync-Ordner (ausgeschlossen),
-  werden gehasht und mit `replaceItemAt` atomar eingesetzt – erst nachdem
-  geprüft wurde, dass die zu ersetzende lokale Datei noch Größe/mtime der
-  Bestandsaufnahme hat.
-- Lokale Löschungen: `FileManager.trashItem`; Fallback Wiederherstellungs-
-  ordner im App-Container.
+  werden gehasht und erst nach einer Hash-/Dateiidentitätsprüfung eingesetzt.
+  Auf macOS tauscht `renameatx_np(..., RENAME_SWAP)` Ziel und Arbeitsdatei
+  atomar; die tatsächlich verdrängte Version wird danach erneut geprüft und
+  bei jeder Abweichung erhalten beziehungsweise zurückgetauscht.
+- Lokale Dateilöschungen verschieben die konkrete Datei zuerst atomar in
+  Quarantäne, prüfen dort Identität und Hash und geben nur die bestätigte
+  Version an Papierkorb beziehungsweise Wiederherstellungsbereich weiter.
+  Ordner werden ausschließlich mit einer nichtrekursiven „nur wenn leer“-
+  Operation entfernt.
 - Case-insensitive APFS: Kollisionen auf dem Server werden erkannt und
   ausgelassen.
 - Symlinks werden nicht verfolgt; Bundles sind Ordner; xattrs werden nicht
