@@ -6,15 +6,24 @@ abgerundeten, hellen Hintergrund im macOS-Stil gesetzt. Der Rand um die
 Kachel bleibt transparent, wie bei macOS-Systemicons üblich.
 
 Aufruf:
-    python3 Scripts/generate-icon.py [Logo.png] [Zielordner]
+    python3 Scripts/generate-icon.py [Logo.svg|Logo.png] [Zielordner]
 
-Standard: Design/logo.png →
+Standard: Design/logo.svg (falls vorhanden, sonst Design/logo.png) →
           Sources/ReichiSyncApp/Resources/Assets.xcassets/AppIcon.appiconset
 
-Benötigt Pillow (`pip3 install pillow`).
+Eine SVG-Vorlage wird für jede Icon-Größe verlustfrei in der jeweils benötigten
+Auflösung gerendert (per `cairosvg`, ersatzweise `rsvg-convert` oder
+`inkscape`). Bei einer PNG-Vorlage wird aus einem 1024-px-Master skaliert.
+
+Benötigt Pillow (`pip3 install pillow`); für SVG zusätzlich
+`pip3 install cairosvg` oder `brew install librsvg`.
 """
+import io
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 try:
     from PIL import Image, ImageDraw, ImageFilter
@@ -42,8 +51,53 @@ def vertical_gradient(size, top, bottom):
     return grad.resize((size, size), Image.BILINEAR)
 
 
-def render_master(logo_path):
-    size = MASTER
+def render_svg(svg_path, px):
+    """Rendert das SVG mit `px` Pixeln auf der längeren Seite (Seitenverhältnis bleibt erhalten)."""
+    try:
+        import cairosvg  # type: ignore
+    except ImportError:
+        cairosvg = None
+    if cairosvg is not None:
+        # Erst mit quadratischer Zielgröße rendern; cairosvg behält das Seitenverhältnis des
+        # viewBox bei, deshalb anschließend auf den sichtbaren Inhalt zuschneiden.
+        data = cairosvg.svg2png(url=svg_path, output_width=px, output_height=px)
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    for tool in ("rsvg-convert", "inkscape"):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            out = tmp.name
+        try:
+            if tool == "rsvg-convert":
+                subprocess.run([exe, "-w", str(px), "-h", str(px), "--keep-aspect-ratio", "-o", out, svg_path], check=True)
+            else:
+                subprocess.run([exe, svg_path, "--export-type=png", f"--export-width={px}", f"--export-filename={out}"], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return Image.open(out).convert("RGBA")
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+    sys.exit("Kein SVG-Renderer gefunden: pip3 install cairosvg  (oder brew install librsvg)")
+
+
+def load_logo(logo_path, target_px):
+    """Lädt das Logo so, dass die längere Seite mindestens `target_px` Pixel hat."""
+    if logo_path.lower().endswith(".svg"):
+        # Etwas größer rendern und dann mit Lanczos auf Zielgröße bringen → glattere Kanten.
+        logo = render_svg(logo_path, target_px * 2)
+    else:
+        logo = Image.open(logo_path).convert("RGBA")
+    bbox = logo.getbbox()
+    if bbox:
+        logo = logo.crop(bbox)
+    return logo
+
+
+def render_icon(logo_path, size):
+    """Rendert das fertige Icon (Kachel + Logo) in `size` × `size` Pixeln."""
     # macOS-Kachel: ~80 % der Fläche, Eckenradius ~22,4 % der Kachel
     inset = int(size * 0.0977)
     tile = size - 2 * inset
@@ -72,11 +126,8 @@ def render_master(logo_path):
     canvas.alpha_composite(border)
 
     # Logo zentriert, ca. 68 % der Kachelbreite
-    logo = Image.open(logo_path).convert("RGBA")
-    bbox = logo.getbbox()
-    if bbox:
-        logo = logo.crop(bbox)
     target = int(tile * 0.68)
+    logo = load_logo(logo_path, target)
     scale = target / max(logo.size)
     logo = logo.resize((max(1, int(logo.width * scale)), max(1, int(logo.height * scale))), Image.LANCZOS)
     x = (size - logo.width) // 2
@@ -85,18 +136,28 @@ def render_master(logo_path):
     return canvas
 
 
+def default_logo(root):
+    svg = os.path.join(root, "Design", "logo.svg")
+    return svg if os.path.exists(svg) else os.path.join(root, "Design", "logo.png")
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    logo_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "Design", "logo.png")
+    logo_path = sys.argv[1] if len(sys.argv) > 1 else default_logo(root)
     target = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         root, "Sources", "ReichiSyncApp", "Resources", "Assets.xcassets", "AppIcon.appiconset")
+    if not os.path.exists(logo_path):
+        sys.exit(f"Logo nicht gefunden: {logo_path}")
     os.makedirs(target, exist_ok=True)
-    master = render_master(logo_path)
+    is_vector = logo_path.lower().endswith(".svg")
+    print("Vorlage:", logo_path, "(Vektor, pro Größe gerendert)" if is_vector else "(Raster, aus 1024-px-Master skaliert)")
+    master = render_icon(logo_path, MASTER)
     master.save(os.path.join(root, "Design", "AppIcon-1024.png"))
     for base, scale in SIZES:
         px = base * scale
         name = f"icon_{base}x{base}.png" if scale == 1 else f"icon_{base}x{base}@{scale}x.png"
-        master.resize((px, px), Image.LANCZOS).save(os.path.join(target, name))
+        image = render_icon(logo_path, px) if is_vector and px != MASTER else master.resize((px, px), Image.LANCZOS)
+        image.save(os.path.join(target, name))
         print("wrote", name)
 
 

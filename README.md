@@ -288,7 +288,7 @@ Punkte, die die Anforderung offen ließ, wurden so entschieden:
 | Chunk-Upload-Schwelle | Standard 8 MB (1–128 MB wählbar, abschaltbar). Zustand pro Datei in `upload_sessions` (Sitzung, bestätigte Chunks, Größe/mtime/Hash); Fortsetzung nur bei unveränderter Datei und > 2 min Restlaufzeit der Sitzung, sonst Neustart. |
 | Cloudreve `If-Match` | Cloudreve wertet `If-Match` beim PUT nicht aus (Quellcode `pkg/webdav`). Erkannt per `GET /api/v4/site/ping` → `honorsIfMatch = false`; die Engine prüft dann vor Überschreiben/Löschen per PROPFIND und nutzt beim Chunk-Upload `previous` (Entity-ID = ETag) als serverseitige Versionsprüfung. |
 | Freigaben | Nur Einträge innerhalb des Sync-Ordners; Passwort alphanumerisch ≤ 32 Zeichen (Cloudreve-Vorgabe), Ablauf 1 h–30 d, Download-Limit; Link inkl. Passwort-Teil `…/s/<id>/<pw>` wird kopiert. Lokaler Cache der Freigaben in `shares`. |
-| App-Icon | Vorlage `Design/logo.png` (256 px) auf heller macOS-Kachel mit Verlauf/Schatten (`Scripts/generate-icon.py`). Für gestochen scharfe 1024-px-Varianten sollte eine höher aufgelöste Vorlage nachgereicht werden. |
+| App-Icon | Vorlage auf heller macOS-Kachel mit Verlauf/Schatten (`Scripts/generate-icon.py`). Liegt `Design/logo.svg` vor, wird das Logo **pro Icon-Größe verlustfrei aus dem SVG gerendert** (`pip3 install cairosvg` oder `brew install librsvg`); sonst dient `Design/logo.png` (256 px) als Raster-Vorlage. Im Repo liegt bisher nur das PNG – die SVG-Datei einfach als `Design/logo.svg` ablegen und das Skript erneut ausführen. |
 
 ---
 
@@ -311,7 +311,7 @@ Tests/ReichiSyncCoreTests/     Unit-, Integrations- und HTTP-Tests, Fixtures, Fa
 Scripts/dev-webdav-server.py   WebDAV-Testserver (Python 3, stdlib); --cloudreve emuliert die Cloudreve-API
 Design/                        Icon-Vorlage (logo.png) und 1024-px-Master
 Scripts/build-app.sh           .app-Bundle aus SwiftPM-Build
-Scripts/generate-icon.py       App-Icon-PNGs erzeugen
+Scripts/generate-icon.py       App-Icon-PNGs erzeugen (SVG-Vorlage bevorzugt, PNG als Rückfall)
 docs/ARCHITECTURE.md           Entscheidungstabelle, Zustände, Datenmodell
 docs/WEBDAV.md                 Unterstützte WebDAV-Funktionen und Grenzen
 docs/SIGNING.md                Signierung, Notarisierung, Sandbox
