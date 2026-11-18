@@ -156,22 +156,29 @@ final class WebDAVClientHTTPTests: XCTestCase {
         try Data("remote v2".utf8).write(to: remoteUpdate)
         let currentRemote = try await client.stat("Vom Server/remote.txt")
         let previousRemote = try XCTUnwrap(currentRemote)
-        _ = try await client.upload(
+        let updatedRemote = try await client.upload(
             file: remoteUpdate,
             to: "Vom Server/remote.txt",
             ifMatch: previousRemote.validator,
             ifNoneMatchAll: false,
             progress: nil
         )
+        XCTAssertNotEqual(updatedRemote.etag, previousRemote.validator)
         try FileManager.default.removeItem(at: root.appendingPathComponent("lokal.txt"))
         try Data("neu".utf8).write(to: root.appendingPathComponent("neu.txt"))
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-30)], ofItemAtPath: root.appendingPathComponent("neu.txt").path)
         await engine.syncAndWait()
         status = await engine.currentStatus
-        let failures = await engine.transfers().filter { $0.state == .failed }
-        let diagnostics = failures.map {
-            "\($0.path): \($0.errorMessage ?? "unbekannt") [\($0.errorDetail ?? "keine Details")]"
-        }.joined(separator: "; ")
+        let transfers = await engine.transfers()
+        let queue = await engine.queue()
+        let pendingDeletions = await engine.pendingDeletions()
+        let diagnostics = [
+            "issue=\(status.lastIssue?.message ?? "keine") [\(status.lastIssue?.detail ?? "keine Details")]",
+            "pending=\(status.pendingCount), deletions=\(status.pendingDeletions)",
+            "queue=\(queue.map(\.path))",
+            "held=\(pendingDeletions.map(\.path))",
+            "transfers=\(transfers.map { "\($0.path):\($0.state.rawValue):\($0.errorMessage ?? "-"):\($0.errorDetail ?? "-")" })",
+        ].joined(separator: "; ")
         XCTAssertEqual(status.health, .synced, "\(status.headline): \(diagnostics)")
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Vom Server/remote.txt"), encoding: .utf8), "remote v2")
         XCTAssertFalse(FileManager.default.fileExists(atPath: serverRoot.appendingPathComponent("lokal.txt").path))
