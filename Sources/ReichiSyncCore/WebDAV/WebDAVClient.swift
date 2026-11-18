@@ -102,9 +102,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         guard let scheme = baseURL.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
             throw WebDAVError.invalidResponse("Ungültiges URL-Schema")
         }
-        let host = baseURL.host?.lowercased() ?? ""
-        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
-        if scheme == "http" && !allowInsecureHTTP && !isLoopback {
+        if scheme == "http" && !allowInsecureHTTP && !WebDAVClient.isLoopback(baseURL) {
             throw WebDAVError.insecureURL
         }
         var normalized = baseURL.absoluteString
@@ -135,6 +133,12 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
     // MARK: - URL-Bildung
 
     /// Baut die vollständige URL für einen relativen Pfad (jedes Segment einzeln kodiert).
+    /// Verbindungen zu localhost dürfen auch ohne TLS aufgebaut werden (Testserver).
+    public static func isLoopback(_ url: URL) -> Bool {
+        let host = url.host?.lowercased() ?? ""
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
     public func url(for rawPath: String, isCollection: Bool = false) -> URL {
         var result = baseURL
         for seg in rawPath.split(separator: "/", omittingEmptySubsequences: true) {
