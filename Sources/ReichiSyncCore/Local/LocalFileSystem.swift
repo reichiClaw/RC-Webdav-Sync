@@ -125,6 +125,11 @@ public struct LocalFileSystem: Sendable {
     }
 
     public func attributes(at target: URL) throws -> Attributes? {
+        // Foundation verschachtelt ENOENT auf macOS teilweise in einem
+        // NSCocoaError, statt den Fehler zuverlässig als Cocoa-Code zu
+        // klassifizieren. lstat liefert für den üblichen Nicht-vorhanden-Fall
+        // plattformübergreifend eine eindeutige Antwort.
+        guard try POSIXFileMetadata.read(atPath: target.path) != nil else { return nil }
         let attrs: [FileAttributeKey: Any]
         do {
             attrs = try fm.attributesOfItem(atPath: target.path)
@@ -273,7 +278,10 @@ public struct LocalFileSystem: Sendable {
         if exchange == 0 {
             let displacedMetadata = try POSIXFileMetadata.read(atPath: temp.path)
             let displacedHash = try? SHA256Hasher.hashFile(at: temp)
-            if displacedMetadata?.cacheToken == expectedMetadata.cacheToken,
+            // Ein Rename verändert auf macOS die ctime und damit absichtlich
+            // den Cache-Token. Geräte-/Inode-Identität plus Inhalts-Hash
+            // beweisen dagegen, dass genau die geprüfte Datei verdrängt wurde.
+            if displacedMetadata?.fileID == expectedMetadata.fileID,
                displacedMetadata?.isSymbolicLink == false,
                displacedHash == expectedHash {
                 try fm.removeItem(at: temp)
