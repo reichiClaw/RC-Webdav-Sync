@@ -129,10 +129,7 @@ public struct LocalFileSystem: Sendable {
         do {
             attrs = try fm.attributesOfItem(atPath: target.path)
         } catch {
-            let ns = error as NSError
-            if (ns.domain == NSCocoaErrorDomain
-                && (ns.code == NSFileNoSuchFileError || ns.code == NSFileReadNoSuchFileError))
-                || (ns.domain == NSPOSIXErrorDomain && (ns.code == Int(ENOENT) || ns.code == Int(ENOTDIR))) {
+            if Self.isMissingPathError(error) {
                 return nil
             }
             throw Self.mapError(error)
@@ -143,6 +140,17 @@ public struct LocalFileSystem: Sendable {
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         return Attributes(kind: kind, size: size, modified: modified, isSymlink: isSymlink)
+    }
+
+    private static func isMissingPathError(_ error: Error) -> Bool {
+        let outer = error as NSError
+        let candidates = [outer, outer.userInfo[NSUnderlyingErrorKey] as? NSError].compactMap { $0 }
+        return candidates.contains { candidate in
+            (candidate.domain == NSCocoaErrorDomain
+                && (candidate.code == NSFileNoSuchFileError || candidate.code == NSFileReadNoSuchFileError))
+                || (candidate.domain == NSPOSIXErrorDomain
+                    && (candidate.code == Int(ENOENT) || candidate.code == Int(ENOTDIR)))
+        }
     }
 
     public func hash(_ relativePath: String) throws -> String {
