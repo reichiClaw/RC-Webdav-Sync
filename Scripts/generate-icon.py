@@ -119,10 +119,10 @@ def render_icon(logo_path, size):
     tile_layer.paste(background, mask=tile_mask)
     canvas.alpha_composite(tile_layer)
 
-    # Dezenter innerer Rand
+    # Dezenter innerer Rand, proportional zur Größe (4 px bei 1024 px); unter 256 px entfällt er (width=0 zeichnet nichts)
     border = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     bd = ImageDraw.Draw(border)
-    bd.rounded_rectangle((inset, inset, size - inset - 1, size - inset - 1), radius=radius, outline=(255, 255, 255, 160), width=max(2, size // 256))
+    bd.rounded_rectangle((inset, inset, size - inset - 1, size - inset - 1), radius=radius, outline=(255, 255, 255, 160), width=size // 256)
     canvas.alpha_composite(border)
 
     # Logo zentriert, ca. 68 % der Kachelbreite
