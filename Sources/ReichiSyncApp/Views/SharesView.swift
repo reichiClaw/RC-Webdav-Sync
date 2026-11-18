@@ -300,7 +300,9 @@ struct CreateShareSheet: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .onChange(of: password) { _, new in
-                            let filtered = String(new.filter { $0.isLetter || $0.isNumber }.prefix(32))
+                            let filtered = String(new.filter {
+                                $0.isASCII && ($0.isLetter || $0.isNumber)
+                            }.prefix(32))
                             if filtered != new { password = filtered }
                         }
                     Button("Zufällig") { password = Self.randomPassword() }

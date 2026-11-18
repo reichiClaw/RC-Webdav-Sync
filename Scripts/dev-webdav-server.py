@@ -65,6 +65,8 @@ UPLOAD_SESSIONS = {}
 SHARES = {}
 REQUEST_LOG = []
 FAIL_CHUNKS = set()   # Chunk-Indizes, bei denen die Verbindung einmalig abgebrochen wird
+DROP_AFTER_COMMIT_CHUNKS = set()  # Antwort erst nach erfolgreichem Commit verlieren
+REFRESH_DELAY = {"seconds": 0.0}  # Test-Hook: laufenden Token-Refresh blockieren
 COUNTER = {"value": 0}
 
 
@@ -121,7 +123,13 @@ def uri_to_local(uri):
     rel = parts[len(root_parts):]
     if ".." in rel:
         return None
-    return os.path.join(ROOT, *rel) if rel else ROOT
+    candidate = os.path.join(ROOT, *rel) if rel else ROOT
+    try:
+        if os.path.commonpath([os.path.realpath(ROOT), os.path.realpath(candidate)]) != os.path.realpath(ROOT):
+            return None
+    except ValueError:
+        return None
+    return candidate
 
 
 def iso(ts):
@@ -151,13 +159,19 @@ class Handler(BaseHTTPRequestHandler):
         raw = url_path if url_path is not None else self.path
         raw = raw.split("?", 1)[0]
         decoded = urllib.parse.unquote(raw)
-        if not decoded.startswith(PREFIX):
+        if decoded != PREFIX and not decoded.startswith(PREFIX + "/"):
             return None
         rel = decoded[len(PREFIX):].lstrip("/")
         parts = [p for p in rel.split("/") if p not in ("", ".")]
         if ".." in parts:
             return None
-        return os.path.join(ROOT, *parts) if parts else ROOT
+        candidate = os.path.join(ROOT, *parts) if parts else ROOT
+        try:
+            if os.path.commonpath([os.path.realpath(ROOT), os.path.realpath(candidate)]) != os.path.realpath(ROOT):
+                return None
+        except ValueError:
+            return None
+        return candidate
 
     def _href(self, local):
         rel = os.path.relpath(local, ROOT)
@@ -245,6 +259,11 @@ class Handler(BaseHTTPRequestHandler):
                 FAIL_CHUNKS.update(int(i) for i in body.get("indexes", []))
             self._send(204)
             return True
+        if path == "/__test/drop-after-commit":
+            with LOCK:
+                DROP_AFTER_COMMIT_CHUNKS.update(int(i) for i in body.get("indexes", []))
+            self._send(204)
+            return True
         if path == "/__test/expire-sessions":
             with LOCK:
                 UPLOAD_SESSIONS.clear()
@@ -253,6 +272,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/__test/expire-tokens":
             with LOCK:
                 TOKENS.clear()
+            self._send(204)
+            return True
+        if path == "/__test/delay-refresh":
+            with LOCK:
+                REFRESH_DELAY["seconds"] = max(0.0, float(body.get("seconds", 0)))
             self._send(204)
             return True
         if path == "/__test/sessions":
@@ -268,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v4/session/token" and self.command == "POST":
             body = self._read_json()
             if body.get("email") != USER or body.get("password") != PASSWORD:
-                self._json(code=40020, msg="Incorrect password")
+                self._json(code=40080, msg="Incorrect password")
                 return True
             if TWO_FA:
                 sid = secrets.token_hex(8)
@@ -289,6 +313,10 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             token = body.get("refresh_token")
             with LOCK:
+                delay = REFRESH_DELAY["seconds"]
+            if delay:
+                time.sleep(delay)
+            with LOCK:
                 valid = token in REFRESH and REFRESH[token] > time.time()
                 if valid:
                     del REFRESH[token]
@@ -305,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/v4/devices/dav":
             if self.command == "GET":
-                self._json(data={"pagination": {"page": 0, "page_size": 100, "next_token": "", "is_cursor": True}, "accounts": list(DAV_ACCOUNTS)})
+                self._json(data={"pagination": {"page": 0, "page_size": 100, "is_cursor": True}, "accounts": list(DAV_ACCOUNTS)})
                 return True
             if self.command == "PUT":
                 body = self._read_json()
@@ -314,6 +342,21 @@ class Handler(BaseHTTPRequestHandler):
                 DAV_ACCOUNTS.append(account)
                 self._json(data=account)
                 return True
+
+        if path.startswith("/api/v4/devices/dav/") and self.command == "DELETE":
+            account_id = urllib.parse.unquote(path.removeprefix("/api/v4/devices/dav/"))
+            if not account_id or "/" in account_id:
+                self._json(code=40001, msg="Invalid account")
+                return True
+            with LOCK:
+                match = next((item for item in DAV_ACCOUNTS if item.get("id") == account_id), None)
+                if match is not None:
+                    DAV_ACCOUNTS.remove(match)
+            if match is None:
+                self._json(code=404, msg="Account not found", status=404)
+            else:
+                self._json(data=None)
+            return True
 
         if path == "/api/v4/file/create" and self.command == "POST":
             body = self._read_json()
@@ -365,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(data=url + ("/" + password if password else ""))
                 return True
             if self.command == "GET":
-                self._json(data={"pagination": {"page": 0, "page_size": 100, "next_token": "", "is_cursor": True}, "shares": list(SHARES.values())})
+                self._json(data={"pagination": {"page": 0, "page_size": 100, "is_cursor": True}, "shares": list(SHARES.values())})
                 return True
         m = re.match(r"^/api/v4/share/([^/]+)$", path)
         if m and self.command == "DELETE":
@@ -461,6 +504,18 @@ class Handler(BaseHTTPRequestHandler):
                 mtime = int(session["last_modified"]) / 1000.0
                 os.utime(session["local"], (mtime, mtime))
             bump_etag(session["local"])
+        with LOCK:
+            drop_after_commit = index in DROP_AFTER_COMMIT_CHUNKS
+            DROP_AFTER_COMMIT_CHUNKS.discard(index)
+        if drop_after_commit:
+            log("TEST: Abschlussantwort nach Commit von Chunk %d verloren" % index)
+            self.close_connection = True
+            try:
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.connection.close()
+            except Exception:
+                pass
+            return True
         self._json(data=None)
         return True
 
@@ -563,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(405, b"Method Not Allowed")
             return
         exists = os.path.isfile(local)
-        if self.headers.get("If-None-Match") == "*" and exists:
+        if self.headers.get("If-None-Match") == "*" and exists and not CLOUDREVE:
             self._read_body()
             self._send(412, b"Precondition Failed")
             return
@@ -573,10 +628,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(412, b"Precondition Failed")
             return
         data = self._read_body()
-        tmp = local + ".uploading"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, local)
+        tmp = local + f".uploading-{uuid4()}"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, local)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
         mtime_header = self.headers.get("X-OC-Mtime")
         if mtime_header and mtime_header.isdigit():
             os.utime(local, (int(mtime_header), int(mtime_header)))
@@ -629,6 +688,12 @@ class Handler(BaseHTTPRequestHandler):
         source = self._local_path()
         dest_header = self.headers.get("Destination", "")
         parsed = urllib.parse.urlparse(dest_header)
+        if parsed.scheme and (
+            parsed.scheme.lower() not in ("http", "https")
+            or parsed.netloc.lower() != self.headers.get("Host", "").lower()
+        ):
+            self._send(502, b"Foreign Destination")
+            return
         dest = self._local_path(parsed.path if parsed.scheme else dest_header)
         if source is None or dest is None or source == ROOT:
             self._send(403, b"Forbidden")
@@ -637,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"Not Found")
             return
         if_match = self.headers.get("If-Match")
-        if if_match and os.path.isfile(source) and compute_etag(source) != if_match:
+        if if_match and not CLOUDREVE and os.path.isfile(source) and compute_etag(source) != if_match:
             self._send(412, b"Precondition Failed")
             return
         overwrite = self.headers.get("Overwrite", "T").upper() != "F"

@@ -6,6 +6,8 @@ public struct UploadRequestInfo: Sendable {
     public var path: String
     /// Pfad für das lokale Dateisystem.
     public var rawPath: String
+    /// Pfad mit der vom Server gelieferten Schreibweise seiner Elternsegmente.
+    public var remotePath: String
     public var fileURL: URL
     public var size: Int64
     public var modified: Double
@@ -13,9 +15,10 @@ public struct UploadRequestInfo: Sendable {
     /// Validator (ETag) der Serverversion, die ersetzt werden soll; `nil` bei neuer Datei.
     public var replacingValidator: String?
 
-    public init(path: String, rawPath: String, fileURL: URL, size: Int64, modified: Double, hash: String, replacingValidator: String?) {
+    public init(path: String, rawPath: String, remotePath: String? = nil, fileURL: URL, size: Int64, modified: Double, hash: String, replacingValidator: String?) {
         self.path = path
         self.rawPath = rawPath
+        self.remotePath = remotePath ?? path
         self.fileURL = fileURL
         self.size = size
         self.modified = modified
@@ -37,6 +40,7 @@ public protocol ResumableUploadTransport: Sendable {
 
 /// Persistierter Zustand eines unterbrochenen Chunk-Uploads.
 public struct ResumableUploadState: Codable, Sendable, Hashable {
+    static let maximumChunkSize: Int64 = 64 * 1024 * 1024
     public var path: String
     public var uri: String
     public var sessionID: String
@@ -47,6 +51,9 @@ public struct ResumableUploadState: Codable, Sendable, Hashable {
     public var size: Int64
     public var modified: Double
     public var hash: String
+    /// Serverversion, gegen die die Sitzung angelegt wurde. Eine Sitzung darf
+    /// nach einem erneuten Scan nicht gegen eine andere Remote-Version laufen.
+    public var replacingValidator: String?
     public var expires: Date
     public var policyType: String
     public var policyRelay: Bool
@@ -64,22 +71,33 @@ public struct ResumableUploadState: Codable, Sendable, Hashable {
         self.size = info.size
         self.modified = info.modified
         self.hash = info.hash
+        self.replacingValidator = info.replacingValidator
         self.expires = session.expires
         self.policyType = session.policy.type
         self.policyRelay = session.policy.relay
-        self.uploadURLs = session.uploadURLs
-        self.credential = session.credential
+        // Signierte Drittanbieter-URLs und Upload-Credentials gehören nicht in
+        // SQLite. Direkte Remote-Policies werden deshalb nicht fortgesetzt.
+        self.uploadURLs = []
+        self.credential = nil
         self.createdAt = Date()
     }
 
     public static func chunkCount(size: Int64, chunkSize: Int64) -> Int {
-        if chunkSize <= 0 || size == 0 { return 1 }
-        return Int((size + chunkSize - 1) / chunkSize)
+        guard chunkSize > 0, size > 0 else { return 1 }
+        return Int(size / chunkSize + (size % chunkSize == 0 ? 0 : 1))
     }
 
     /// Passt der gespeicherte Zustand zur aktuellen lokalen Version und ist die Sitzung noch gültig?
     public func matches(_ info: UploadRequestInfo, uri: String, now: Date = Date()) -> Bool {
-        path == info.path && self.uri == uri && size == info.size && modified == info.modified && hash == info.hash
+        size >= 0
+            && chunkSize >= 0
+            && chunkSize <= Self.maximumChunkSize
+            && totalChunks == Self.chunkCount(size: size, chunkSize: chunkSize)
+            && uploadedChunks >= 0
+            && uploadedChunks <= totalChunks
+            && !sessionID.isEmpty
+            && path == info.path && self.uri == uri && size == info.size && modified == info.modified && hash == info.hash
+            && replacingValidator == info.replacingValidator
             && expires.timeIntervalSince(now) > 120
     }
 
@@ -120,15 +138,24 @@ public final class CloudreveUploadTransport: ResumableUploadTransport, @unchecke
     }
 
     public func upload(_ info: UploadRequestInfo, progress: TransferProgress?) async throws -> UploadResult {
-        let uri = try CloudreveURI.fileURI(root: rootURI, relativePath: info.rawPath)
+        guard info.size >= 0 else { throw CloudreveError.invalidResponse("Ungültige Upload-Größe") }
+        let uri = try CloudreveURI.fileURI(root: rootURI, relativePath: info.remotePath)
         var state: ResumableUploadState
-        if let saved = try? await store.uploadState(path: info.path, mappingID: mappingID), saved.matches(info, uri: uri) {
+        let saved = try await store.uploadState(path: info.path, mappingID: mappingID)
+        if let saved, saved.matches(info, uri: uri) {
+            if saved.uploadedChunks >= max(0, saved.totalChunks - 1),
+               await destinationMatches(info) {
+                try await store.removeUploadState(path: info.path, mappingID: mappingID)
+                await api.deleteUploadSession(id: saved.sessionID, uri: uri)
+                logger.notice("cloudreve", "Upload von \(info.path) war trotz verlorener Abschlussantwort vollständig")
+                return UploadResult(etag: nil, status: 201)
+            }
             state = saved
             logger.info("cloudreve", "Upload von \(info.path) wird fortgesetzt (Chunk \(saved.uploadedChunks + 1)/\(saved.totalChunks))")
         } else {
-            if let stale = try? await store.uploadState(path: info.path, mappingID: mappingID) {
+            if let stale = saved {
                 await api.deleteUploadSession(id: stale.sessionID, uri: stale.uri)
-                try? await store.removeUploadState(path: info.path, mappingID: mappingID)
+                try await store.removeUploadState(path: info.path, mappingID: mappingID)
             }
             state = try await createSession(info, uri: uri)
         }
@@ -137,9 +164,14 @@ public final class CloudreveUploadTransport: ResumableUploadTransport, @unchecke
         } catch let error as CloudreveError {
             switch error {
             case .uploadSessionExpired, .invalidChunk:
+                if await destinationMatches(info) {
+                    try await store.removeUploadState(path: info.path, mappingID: mappingID)
+                    await api.deleteUploadSession(id: state.sessionID, uri: uri)
+                    return UploadResult(etag: nil, status: 201)
+                }
                 // Sitzung unbrauchbar: einmal komplett neu beginnen.
                 logger.notice("cloudreve", "Upload-Sitzung für \(info.path) ungültig (\(error)); Neustart")
-                try? await store.removeUploadState(path: info.path, mappingID: mappingID)
+                try await store.removeUploadState(path: info.path, mappingID: mappingID)
                 await api.deleteUploadSession(id: state.sessionID, uri: uri)
                 var fresh = try await createSession(info, uri: uri)
                 do {
@@ -153,8 +185,29 @@ public final class CloudreveUploadTransport: ResumableUploadTransport, @unchecke
         }
     }
 
+    private func destinationMatches(_ info: UploadRequestInfo) async -> Bool {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(".reichi-sync-verify-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: temp) }
+        do {
+            let result = try await dav.download(info.remotePath, to: temp, progress: nil)
+            guard result.contentLength == info.size else { return false }
+            return try SHA256Hasher.hashFile(at: temp) == info.hash
+        } catch {
+            return false
+        }
+    }
+
     private func createSession(_ info: UploadRequestInfo, uri: String) async throws -> ResumableUploadState {
-        let previous = info.replacingValidator.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")).replacingOccurrences(of: "W/", with: "") }
+        let previous: String?
+        if let validator = info.replacingValidator {
+            guard let entityID = Self.entityID(fromETag: validator) else {
+                throw CloudreveError.unsupportedStoragePolicy("Cloudreve ohne verwertbare Entity-ID für die vorhandene Datei")
+            }
+            previous = entityID
+        } else {
+            previous = nil
+        }
         let session: CloudreveUploadSession
         do {
             session = try await api.createUploadSession(uri: uri, size: info.size, lastModified: Date(timeIntervalSince1970: info.modified),
@@ -162,59 +215,107 @@ public final class CloudreveUploadTransport: ResumableUploadTransport, @unchecke
         } catch let error as CloudreveError {
             throw error.asWebDAVError
         }
-        guard session.usesLocalChunkAPI || session.usesRemoteChunkAPI else {
+        guard session.usesLocalChunkAPI, !session.policy.encryption else {
             await api.deleteUploadSession(id: session.sessionID, uri: uri)
-            throw CloudreveError.unsupportedStoragePolicy(session.policy.type)
+            let reason = session.policy.encryption ? "\(session.policy.type) (verschlüsselt)" : session.policy.type
+            throw CloudreveError.unsupportedStoragePolicy(reason)
         }
         var adjusted = session
         if adjusted.chunkSize <= 0 && fallbackChunkSize > 0 { adjusted.chunkSize = fallbackChunkSize }
+        guard adjusted.chunkSize >= 0, adjusted.chunkSize <= ResumableUploadState.maximumChunkSize else {
+            await api.deleteUploadSession(id: session.sessionID, uri: uri)
+            throw CloudreveError.unsupportedStoragePolicy("\(session.policy.type) (Chunk größer als 64 MiB)")
+        }
         var state = ResumableUploadState(path: info.path, uri: uri, session: adjusted, info: info)
         state.uploadedChunks = 0
-        try await store.saveUploadState(state, mappingID: mappingID)
-        logger.info("cloudreve", "Upload-Sitzung für \(info.path): \(state.totalChunks) Chunk(s) à \(state.chunkSize) Bytes, Richtlinie \(session.policy.type)")
+        do {
+            try await store.saveUploadState(state, mappingID: mappingID)
+        } catch {
+            await api.deleteUploadSession(id: session.sessionID, uri: uri)
+            throw error
+        }
+        let chunkDescription = state.chunkSize == 0 ? "ungeteilt" : "\(state.totalChunks) Chunk(s) à \(state.chunkSize) Bytes"
+        logger.info("cloudreve", "Upload-Sitzung für \(info.path): \(chunkDescription), Richtlinie \(session.policy.type)")
         return state
     }
 
-    private func sendChunks(_ state: inout ResumableUploadState, info: UploadRequestInfo, uri: String, progress: TransferProgress?) async throws -> UploadResult {
-        let handle = try FileHandle(forReadingFrom: info.fileURL)
-        defer { try? handle.close() }
-        let session = state.session
-        let chunkSize = state.chunkSize > 0 ? state.chunkSize : max(info.size, 1)
-        while state.uploadedChunks < state.totalChunks {
-            try Task.checkCancellation()
-            // Lokale Datei darf sich zwischen den Chunks nicht ändern.
-            let attrs = try FileManager.default.attributesOfItem(atPath: info.fileURL.path)
-            let currentSize = (attrs[.size] as? NSNumber)?.int64Value ?? -1
-            let currentModified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
-            if currentSize != info.size || currentModified != info.modified {
-                logger.notice("cloudreve", "\(info.path) wurde während des Uploads geändert – Sitzung verworfen")
-                try? await store.removeUploadState(path: info.path, mappingID: mappingID)
-                await api.deleteUploadSession(id: state.sessionID, uri: uri)
-                throw LocalFileError.changedSinceScan(info.path)
-            }
-            let index = state.uploadedChunks
-            let offset = Int64(index) * chunkSize
-            let length = Int(min(chunkSize, info.size - offset))
-            try handle.seek(toOffset: UInt64(offset))
-            let data = length > 0 ? (try handle.read(upToCount: length) ?? Data()) : Data()
-            guard data.count == length else { throw WebDAVError.network("Datei konnte nicht vollständig gelesen werden") }
-            let base = offset
-            let total = info.size
-            let chunkProgress: TransferProgress? = progress.map { handler in
-                { @Sendable sent, _ in handler(min(total, base + sent), total) }
-            }
-            try await api.uploadChunk(data, index: index, session: session, progress: chunkProgress)
-            state.uploadedChunks = index + 1
-            try await store.saveUploadState(state, mappingID: mappingID)
-            progress?(min(total, offset + Int64(length)), total)
+    private static func entityID(fromETag validator: String) -> String? {
+        let quoted: String
+        if validator.hasPrefix("W/") {
+            quoted = String(validator.dropFirst(2))
+        } else {
+            quoted = validator
         }
-        try? await store.removeUploadState(path: info.path, mappingID: mappingID)
+        guard quoted.isStrongHTTPETag else { return nil }
+        let entityID = String(quoted.dropFirst().dropLast())
+        return entityID.isEmpty ? nil : entityID
+    }
+
+    private func sendChunks(_ state: inout ResumableUploadState, info: UploadRequestInfo, uri: String, progress: TransferProgress?) async throws -> UploadResult {
+        guard let initialMetadata = try POSIXFileMetadata.read(atPath: info.fileURL.path),
+              !initialMetadata.isSymbolicLink else {
+            throw LocalFileError.changedSinceScan(info.path)
+        }
+        let session = state.session
+        if state.chunkSize == 0 {
+            try Task.checkCancellation()
+            try await api.uploadSingleFile(info.fileURL, size: info.size, session: session, progress: progress)
+            state.uploadedChunks = 1
+            try await store.saveUploadState(state, mappingID: mappingID)
+        } else {
+            let handle = try FileHandle(forReadingFrom: info.fileURL)
+            defer { try? handle.close() }
+            let chunkSize = state.chunkSize
+            while state.uploadedChunks < state.totalChunks {
+                try Task.checkCancellation()
+                // Lokale Datei darf sich zwischen den Chunks nicht ändern.
+                let attrs = try FileManager.default.attributesOfItem(atPath: info.fileURL.path)
+                let currentSize = (attrs[.size] as? NSNumber)?.int64Value ?? -1
+                let currentModified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+                let currentMetadata = try POSIXFileMetadata.read(atPath: info.fileURL.path)
+                if currentSize != info.size || currentModified != info.modified
+                    || currentMetadata?.cacheToken != initialMetadata.cacheToken
+                    || currentMetadata?.isSymbolicLink == true {
+                    logger.notice("cloudreve", "\(info.path) wurde während des Uploads geändert – Sitzung verworfen")
+                    try await store.removeUploadState(path: info.path, mappingID: mappingID)
+                    await api.deleteUploadSession(id: state.sessionID, uri: uri)
+                    throw LocalFileError.changedSinceScan(info.path)
+                }
+                let index = state.uploadedChunks
+                let offset = Int64(index) * chunkSize
+                let length = Int(min(chunkSize, info.size - offset))
+                try handle.seek(toOffset: UInt64(offset))
+                let data = length > 0 ? (try handle.read(upToCount: length) ?? Data()) : Data()
+                guard data.count == length else { throw WebDAVError.network("Datei konnte nicht vollständig gelesen werden") }
+                let base = offset
+                let total = info.size
+                let chunkProgress: TransferProgress? = progress.map { handler in
+                    { @Sendable sent, _ in handler(min(total, base + sent), total) }
+                }
+                try await api.uploadChunk(data, index: index, session: session, progress: chunkProgress)
+                state.uploadedChunks = index + 1
+                try await store.saveUploadState(state, mappingID: mappingID)
+                progress?(min(total, offset + Int64(length)), total)
+            }
+        }
+        let finalMetadata = try POSIXFileMetadata.read(atPath: info.fileURL.path)
+        guard finalMetadata?.cacheToken == initialMetadata.cacheToken,
+              finalMetadata?.isSymbolicLink == false,
+              try SHA256Hasher.hashFile(at: info.fileURL) == info.hash else {
+            try await store.removeUploadState(path: info.path, mappingID: mappingID)
+            await api.deleteUploadSession(id: state.sessionID, uri: uri)
+            throw LocalFileError.changedSinceScan(info.path)
+        }
+        try await store.removeUploadState(path: info.path, mappingID: mappingID)
         // Neue Version abfragen (ETag = Entity-ID).
-        let stat = try await dav.stat(info.rawPath)
+        let stat = try await dav.stat(info.remotePath)
         if let stat, stat.size != info.size {
             logger.warning("cloudreve", "Größe nach Upload weicht ab (\(stat.size) ≠ \(info.size)) für \(info.path)")
             throw WebDAVError.invalidResponse("Server meldet nach dem Upload eine abweichende Dateigröße")
         }
-        return UploadResult(etag: stat?.validator, status: 201)
+        // Der Validator stammt aus einem nachträglichen PROPFIND und ist daher
+        // nicht kausal an die hochgeladenen Bytes gebunden. Die Engine bestätigt
+        // Inhalt und Validator gemeinsam über einen GET.
+        return UploadResult(etag: nil, status: 201)
     }
 }

@@ -57,10 +57,15 @@ final class AppModel: ObservableObject {
     /// Pfad, für den die Oberfläche das Freigabe-Formular öffnen soll.
     @Published var shareRequestPath: String?
 
-    var needsSetup: Bool { isReady && account == nil }
+    var needsSetup: Bool { isReady && account == nil && storeError == nil }
     var localRootURL: URL? { accessedRoot ?? account.map { URL(fileURLWithPath: $0.localRootPath, isDirectory: true) } }
     /// `true`, wenn die aktuelle Verbindung eine Cloudreve-Instanz ist (Freigaben möglich).
     var isCloudreveAccount: Bool { account?.isCloudreve ?? false }
+
+    /// Veröffentlicht ein bereits persistiertes Konto aus einer AppModel-Erweiterung.
+    func setActiveAccount(_ newAccount: AccountConfiguration) {
+        account = newAccount
+    }
 
     var store: SyncStore?
     private var engine: SyncEngine?
@@ -76,15 +81,13 @@ final class AppModel: ObservableObject {
     let notifications = NotificationService()
     private var logObserver: UUID?
     private var lastStatusRunning = false
+    /// Monotoner Lebenszyklus-Token. Jede Start-/Stop-Operation macht alle
+    /// älteren Fortsetzungen und Callbacks nach einem `await` wirkungslos.
+    private(set) var lifecycleGeneration: UInt64 = 0
 
     init() {
         showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? false
         SyncLogger.shared.enableFileLogging(at: AppPaths.logFile)
-        do {
-            store = try SyncStore(path: AppPaths.database.path)
-        } catch {
-            storeError = "Die Datenbank konnte nicht geöffnet werden: \(error)"
-        }
         logEntries = SyncLogger.shared.recentEntries(limit: 300)
         logObserver = SyncLogger.shared.addObserver { [weak self] entry in
             Task { @MainActor [weak self] in
@@ -98,37 +101,70 @@ final class AppModel: ObservableObject {
     // MARK: - Start
 
     private var bootstrapped = false
+    private var bootstrapTask: Task<Void, Never>?
 
-    func bootstrap() async {
+    /// Startet die Initialisierung als vom Fensterlebenszyklus unabhängige
+    /// Aufgabe. Das Schließen des letzten Fensters darf den Menüleistenprozess
+    /// nicht in einem halb initialisierten Zustand zurücklassen.
+    func beginBootstrap() {
+        guard bootstrapTask == nil else { return }
+        bootstrapTask = Task { @MainActor [weak self] in
+            await self?.bootstrap()
+        }
+    }
+
+    private func bootstrap() async {
         guard !bootstrapped else { return }
         bootstrapped = true
         NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
         refreshLoginItemState()
+        if store == nil {
+            let databasePath = AppPaths.database.path
+            do {
+                store = try await Task.detached(priority: .utility) {
+                    try SyncStore(path: databasePath)
+                }.value
+            } catch {
+                storeError = "Die Datenbank konnte nicht geöffnet oder aktualisiert werden: \(error.localizedDescription)"
+                presentedError = storeError
+            }
+        }
         guard let store else { isReady = true; return }
-        if let first = (try? await store.accounts())?.first {
-            account = first
-            if first.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
-            await startEngine(for: first)
+        do {
+            if let first = (try await store.accounts()).first {
+                account = first
+                // Beim ersten Start nach einem Schema-Upgrade wird eine aus
+                // dem Dateisystem ergänzte Root-Identität dauerhaft gebunden.
+                // Sonst könnte ein später ersetzter Ordner am gleichen Pfad
+                // bei jedem Neustart als neue legitime Wurzel erscheinen.
+                do {
+                    try await store.saveAccount(first)
+                } catch {
+                    // Die geladene Verbindung bleibt verwendbar. Ein
+                    // ergänzender Migrations-Write darf den Start nicht als
+                    // vermeintlichen Lesefehler blockieren.
+                    SyncLogger.shared.warning(
+                        "app",
+                        "Ergänzte Ordneridentität konnte nicht gespeichert werden: \(error.localizedDescription)"
+                    )
+                    presentedError = "Die Verbindung wurde geladen, aber eine ergänzte Ordneridentität konnte nicht gespeichert werden: \(error.localizedDescription)"
+                }
+                if first.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
+                await startEngine(for: first)
+            }
+        } catch {
+            storeError = "Die gespeicherte Verbindung konnte nicht gelesen werden: \(error.localizedDescription)"
+            presentedError = storeError
         }
         isReady = true
     }
 
     func startEngine(for account: AccountConfiguration) async {
         guard let store else { return }
-        await stopEngine()
-        let root: URL
-        do {
-            root = try bookmarks.resolveAndStartAccessing(accountID: account.id, fallbackPath: account.localRootPath)
-            accessedRoot = root
-        } catch {
-            var s = SyncStatus()
-            s.health = .paused
-            s.isPaused = true
-            s.pauseReason = .localRootMissing
-            s.lastIssue = SyncIssue(message: error.localizedDescription, action: .none)
-            status = s
-            return
-        }
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        await detachAndStopCurrentEngine()
+        guard lifecycleGeneration == generation else { return }
         let password: String
         do {
             guard let stored = try keychain.password(accountID: account.id) else {
@@ -136,13 +172,23 @@ final class AppModel: ObservableObject {
                 s.health = .paused
                 s.isPaused = true
                 s.pauseReason = .authenticationRequired
-                s.lastIssue = SyncIssue(message: "Für diese Verbindung ist kein Passwort im Schlüsselbund hinterlegt.", action: .checkCredentials)
+                s.lastIssue = SyncIssue(
+                    message: "Für diese Verbindung ist kein lesbares Passwort im Schlüsselbund verfügbar. Bitte das Passwort in den Einstellungen erneut eingeben.",
+                    action: .checkCredentials
+                )
                 status = s
                 return
             }
             password = stored
         } catch {
-            presentedError = error.localizedDescription
+            let message = error.localizedDescription
+            var s = SyncStatus()
+            s.health = .paused
+            s.isPaused = true
+            s.pauseReason = .authenticationRequired
+            s.lastIssue = SyncIssue(message: message, action: .checkCredentials)
+            status = s
+            presentedError = message
             return
         }
         let client: WebDAVClient
@@ -157,13 +203,15 @@ final class AppModel: ObservableObject {
         do {
             mapping = try await store.mapping(for: account)
         } catch {
-            presentedError = "Synchronisierungsstand konnte nicht geladen werden: \(error)"
+            if lifecycleGeneration == generation {
+                presentedError = "Synchronisierungsstand konnte nicht geladen werden: \(error)"
+            }
             return
         }
-        let api = makeCloudreveClient(for: account)
-        cloudreveAPI = api
+        guard lifecycleGeneration == generation else { return }
+        let api = makeCloudreveClient(for: account, lifecycleGeneration: generation)
         var uploadTransport: ResumableUploadTransport?
-        if let api, account.chunkedUploadsEnabled, let rootURI = account.davAccountURI {
+        if let api, let rootURI = account.davAccountURI {
             uploadTransport = CloudreveUploadTransport(api: api, dav: client, store: store, mappingID: mapping.id, rootURI: rootURI)
         }
         let config = SyncEngineConfiguration(
@@ -175,43 +223,120 @@ final class AppModel: ObservableObject {
             settleTime: 2.0,
             chunkedUploadThreshold: account.chunkedUploadsEnabled ? account.chunkedUploadThreshold : nil
         )
-        let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root),
-                                rules: ExclusionRules(userPatterns: account.exclusionPatterns), configuration: config, uploadTransport: uploadTransport)
-        self.engine = engine
-        if api != nil { Task { await refreshShares() } }
-        await engine.setStatusHandler { [weak self] status in
-            Task { @MainActor [weak self] in self?.apply(status) }
+        let root: URL
+        do {
+            root = try bookmarks.resolveAndStartAccessing(accountID: account.id, fallbackPath: account.localRootPath)
+            do {
+                try validateSyncFolder(root)
+            } catch {
+                root.stopAccessingSecurityScopedResource()
+                throw error
+            }
+            let configuredPath = URL(fileURLWithPath: account.localRootPath, isDirectory: true)
+                .standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
+            let resolvedPath = root.standardizedFileURL.resolvingSymlinksInPath().path.precomposedStringWithCanonicalMapping
+            guard configuredPath == resolvedPath else {
+                root.stopAccessingSecurityScopedResource()
+                throw BookmarkStore.BookmarkError.cannotAccess
+            }
+            guard account.matchesLocalRootIdentity(atPath: root.path) else {
+                root.stopAccessingSecurityScopedResource()
+                throw LocalFileError.rootMissing
+            }
+        } catch {
+            var s = SyncStatus()
+            s.health = .paused
+            s.isPaused = true
+            s.pauseReason = .localRootMissing
+            s.lastIssue = SyncIssue(
+                message: (error as? LocalFileError)?.userDescription
+                    ?? "Die Ordnerberechtigung passt nicht zum gespeicherten Synchronisierungsordner. Bitte den Ordner in den Einstellungen erneut auswählen.",
+                detail: error.localizedDescription,
+                action: .none
+            )
+            status = s
+            return
+        }
+        guard lifecycleGeneration == generation else {
+            root.stopAccessingSecurityScopedResource()
+            return
+        }
+        let candidate = SyncEngine(
+            account: account,
+            mapping: mapping,
+            client: client,
+            store: store,
+            fileSystem: LocalFileSystem(root: root, expectedRootFileID: account.localRootIdentity),
+            rules: ExclusionRules(userPatterns: account.exclusionPatterns),
+            configuration: config,
+            uploadTransport: uploadTransport
+        )
+        await candidate.setStatusHandler { [weak self] status in
+            Task { @MainActor [weak self] in
+                guard let self, self.lifecycleGeneration == generation else { return }
+                self.apply(status)
+            }
         }
         let notificationsEnabled = account.notificationsEnabled
-        await engine.setEventHandler { [weak self] event in
-            Task { @MainActor [weak self] in self?.handle(event, notify: notificationsEnabled) }
+        await candidate.setEventHandler { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self, self.lifecycleGeneration == generation else { return }
+                self.handle(event, notify: notificationsEnabled)
+            }
         }
-        await engine.start()
-        await refreshLists()
+        await candidate.start()
+        guard lifecycleGeneration == generation else {
+            await candidate.shutdown()
+            root.stopAccessingSecurityScopedResource()
+            return
+        }
 
-        watcher = FolderWatcher(root: root, debounce: 2.0) { [weak engine] in
-            Task { await engine?.requestSync(trigger: .localChange) }
+        accessedRoot = root
+        cloudreveAPI = api
+        engine = candidate
+        if api != nil {
+            Task { @MainActor [weak self] in
+                guard let self, self.lifecycleGeneration == generation else { return }
+                await self.refreshShares()
+            }
         }
-        watcher?.start()
-        connectivity = ConnectivityMonitor { [weak engine] in
-            Task { await engine?.requestSync(trigger: .connectivityRestored) }
+        await refreshLists(generation: generation)
+        guard lifecycleGeneration == generation else { return }
+
+        watcher = FolderWatcher(root: root, debounce: 2.0) { [weak candidate] in
+            Task { await candidate?.requestSync(trigger: .localChange) }
+        }
+        if watcher?.start() != true {
+            presentedError = "Der lokale Ordner konnte nicht kontinuierlich überwacht werden. Der regelmäßige Abgleich bleibt aktiv."
+            watcher = nil
+        }
+        connectivity = ConnectivityMonitor { [weak candidate] in
+            Task { await candidate?.requestSync(trigger: .connectivityRestored) }
         }
         connectivity?.start()
-        wakeObserver = SleepWakeObserver { [weak self] in
-            Task { await self?.engine?.requestSync(trigger: .wake) }
+        wakeObserver = SleepWakeObserver { [weak candidate] in
+            Task { await candidate?.requestSync(trigger: .wake) }
         }
         let interval = max(15, account.pollInterval)
-        pollTask = Task { [weak self] in
+        pollTask = Task { [weak candidate] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard !Task.isCancelled else { break }
-                await self?.engine?.requestSync(trigger: .interval)
+                await candidate?.requestSync(trigger: .interval)
             }
         }
-        await engine.requestSync(trigger: .appStart)
+        await candidate.requestSync(trigger: .appStart)
     }
 
     private func stopEngine() async {
+        lifecycleGeneration &+= 1
+        await detachAndStopCurrentEngine()
+    }
+
+    /// Trennt alle Referenzen synchron auf dem Main Actor, bevor auf den alten
+    /// Engine-Actor gewartet wird. Dadurch kann eine ältere Stop-Fortsetzung
+    /// niemals eine inzwischen installierte neue Engine wieder entfernen.
+    private func detachAndStopCurrentEngine() async {
         pollTask?.cancel()
         pollTask = nil
         watcher?.stop()
@@ -219,14 +344,14 @@ final class AppModel: ObservableObject {
         connectivity?.stop()
         connectivity = nil
         wakeObserver = nil
-        if let engine {
-            await engine.shutdown()
-        }
+        let oldEngine = engine
+        let oldRoot = accessedRoot
         engine = nil
         cloudreveAPI = nil
         cloudreveSignedIn = false
-        accessedRoot?.stopAccessingSecurityScopedResource()
         accessedRoot = nil
+        if let oldEngine { await oldEngine.shutdown() }
+        oldRoot?.stopAccessingSecurityScopedResource()
     }
 
     /// Wird vor dem Beenden aufgerufen: laufende Arbeiten abbrechen, Zustand sichern.
@@ -247,12 +372,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func refreshLists() async {
-        guard let engine else { return }
-        transfers = await engine.transfers()
-        conflicts = await engine.conflicts()
-        pendingDeletions = await engine.pendingDeletions()
-        queue = await engine.queue()
+    func refreshLists(generation expectedGeneration: UInt64? = nil) async {
+        guard let currentEngine = engine else { return }
+        async let newTransfers = currentEngine.transfers()
+        async let newConflicts = currentEngine.conflicts()
+        async let newPendingDeletions = currentEngine.pendingDeletions()
+        async let newQueue = currentEngine.queue()
+        let values = await (newTransfers, newConflicts, newPendingDeletions, newQueue)
+        guard engine === currentEngine,
+              expectedGeneration.map({ $0 == lifecycleGeneration }) != false else { return }
+        (transfers, conflicts, pendingDeletions, queue) = values
     }
 
     private func handle(_ event: SyncEvent, notify: Bool) {
@@ -310,6 +439,8 @@ final class AppModel: ObservableObject {
                 try await engine?.resolveConflict(id: conflict.id, resolution: resolution)
             } catch SyncEngine.ConflictResolutionError.filesChangedSinceDetection {
                 presentedError = "Die beteiligten Dateien wurden seit der Erkennung erneut geändert. Bitte den Konflikt nach dem nächsten Abgleich erneut prüfen."
+            } catch SyncEngine.ConflictResolutionError.notApplicable {
+                presentedError = "Diese Entscheidung kann für die vorliegenden Datei-/Ordnerarten nicht sicher umgesetzt werden. Bitte beide Versionen behalten oder die Dateien manuell ordnen."
             } catch {
                 presentedError = "Die Entscheidung konnte nicht umgesetzt werden: \(error.localizedDescription)"
             }
@@ -341,14 +472,44 @@ final class AppModel: ObservableObject {
         return ConnectionCheck(capabilities: caps)
     }
 
+    func validateSyncFolder(_ folder: URL) throws {
+        var isDirectory: ObjCBool = false
+        let path = folder.standardizedFileURL.resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: path.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              FileManager.default.isWritableFile(atPath: path.path) else {
+            throw LocalFileError.io("Der ausgewählte Ordner ist nicht vorhanden oder nicht beschreibbar")
+        }
+        let folderComponents = path.pathComponents
+        let supportComponents = AppPaths.applicationSupport.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let overlapsApplicationState = folderComponents.starts(with: supportComponents)
+            || supportComponents.starts(with: folderComponents)
+        guard !overlapsApplicationState else {
+            throw LocalFileError.io("Der Synchronisierungsordner darf den internen Datenordner von reichi Sync weder enthalten noch darin liegen")
+        }
+    }
+
     func completeSetup(name: String, urlString: String, username: String, password: String, folder: URL, allowInsecureHTTP: Bool) async throws {
         guard let store else { throw NSError(domain: "reichi", code: 1, userInfo: [NSLocalizedDescriptionKey: storeError ?? "Datenbank nicht verfügbar"]) }
+        try validateSyncFolder(folder)
         guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else { throw WebDAVError.invalidResponse("Ungültige Adresse") }
+        _ = try await testConnection(
+            urlString: url.absoluteString,
+            username: username,
+            password: password,
+            allowInsecureHTTP: allowInsecureHTTP
+        )
         let newAccount = AccountConfiguration(name: name.isEmpty ? "WebDAV" : name, serverURL: url, username: username,
                                               localRootPath: folder.standardizedFileURL.path, allowInsecureHTTP: allowInsecureHTTP)
-        try bookmarks.save(folder: folder, accountID: newAccount.id)
+        let bookmarkData = try bookmarks.makeData(folder: folder)
         try keychain.savePassword(password, accountID: newAccount.id, label: "reichi Sync – \(newAccount.name)")
-        try await store.saveAccount(newAccount)
+        do {
+            try await store.saveAccount(newAccount)
+        } catch {
+            try? keychain.deletePassword(accountID: newAccount.id)
+            throw error
+        }
+        bookmarks.save(data: bookmarkData, accountID: newAccount.id)
         account = newAccount
         if newAccount.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
         await startEngine(for: newAccount)
@@ -359,15 +520,56 @@ final class AppModel: ObservableObject {
     func updateAccount(_ updated: AccountConfiguration, newPassword: String?, newFolder: URL?) async {
         guard let store else { return }
         var updated = updated
+        let oldAccount = account
         do {
+            let bookmarkData = try newFolder.map { try bookmarks.makeData(folder: $0) }
             if let newFolder {
-                try bookmarks.save(folder: newFolder, accountID: updated.id)
-                updated.localRootPath = newFolder.standardizedFileURL.path
+                try validateSyncFolder(newFolder)
+                updated.setLocalRootPath(newFolder.standardizedFileURL.path)
             }
+            let connectionChanged = oldAccount?.serverURL != updated.serverURL
+                || oldAccount?.username != updated.username
+                || oldAccount?.allowInsecureHTTP != updated.allowInsecureHTTP
+                || (newPassword?.isEmpty == false)
+            if connectionChanged {
+                let effectivePassword: String
+                if let newPassword, !newPassword.isEmpty {
+                    effectivePassword = newPassword
+                } else if let stored = try keychain.password(accountID: updated.id) {
+                    effectivePassword = stored
+                } else {
+                    throw NSError(
+                        domain: "de.reichi.sync.settings",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Im Schlüsselbund ist kein lesbares Passwort für die Verbindungsprüfung verfügbar."]
+                    )
+                }
+                let candidate = try WebDAVClient(
+                    baseURL: updated.serverURL,
+                    credentials: WebDAVCredentials(username: updated.username, password: effectivePassword),
+                    allowInsecureHTTP: updated.allowInsecureHTTP,
+                    serverKindHint: updated.isCloudreve ? .cloudreve : .generic
+                )
+                _ = try await candidate.probe()
+                guard self.account?.id == updated.id else { return }
+            }
+            let oldPassword = try newPassword.flatMap { $0.isEmpty ? nil : try keychain.password(accountID: updated.id) }
             if let newPassword, !newPassword.isEmpty {
                 try keychain.savePassword(newPassword, accountID: updated.id, label: "reichi Sync – \(updated.name)")
             }
-            try await store.saveAccount(updated)
+            do {
+                try await store.saveAccount(updated)
+            } catch {
+                if let newPassword, !newPassword.isEmpty {
+                    if let oldPassword {
+                        try? keychain.savePassword(oldPassword, accountID: updated.id, label: "reichi Sync – \(oldAccount?.name ?? updated.name)")
+                    } else {
+                        try? keychain.deletePassword(accountID: updated.id)
+                    }
+                }
+                throw error
+            }
+            if let bookmarkData { bookmarks.save(data: bookmarkData, accountID: updated.id) }
         } catch {
             presentedError = error.localizedDescription
             return
@@ -385,11 +587,34 @@ final class AppModel: ObservableObject {
 
     func removeAccount() async {
         guard let store, let account else { return }
+        let apiForRevocation = cloudreveAPI
         await stopEngine()
-        try? keychain.deletePassword(accountID: account.id)
-        try? keychain.deletePassword(accountID: Self.cloudreveTokenKey(accountID: account.id))
+        do {
+            try await store.deleteAccount(id: account.id)
+        } catch {
+            presentedError = "Die Verbindung konnte nicht entfernt werden: \(error.localizedDescription)"
+            await startEngine(for: account)
+            return
+        }
+        var cleanupIssues: [String] = []
+        if account.davAccountManaged, let davAccountID = account.davAccountID {
+            if let apiForRevocation, apiForRevocation.isSignedIn {
+                do {
+                    try await apiForRevocation.deleteDavAccount(id: davAccountID)
+                } catch {
+                    cleanupIssues.append("Das von der App angelegte Cloudreve-WebDAV-Konto konnte nicht widerrufen werden: \(error.localizedDescription)")
+                }
+            } else {
+                cleanupIssues.append("Das von der App angelegte Cloudreve-WebDAV-Konto konnte ohne gültige Anmeldung nicht widerrufen werden. Bitte entferne es in Cloudreve manuell.")
+            }
+        }
+        do {
+            try keychain.deletePassword(accountID: account.id)
+            try keychain.deletePassword(accountID: Self.cloudreveTokenKey(accountID: account.id))
+        } catch {
+            cleanupIssues.append("Schlüsselbunddaten konnten nicht vollständig gelöscht werden: \(error.localizedDescription)")
+        }
         bookmarks.remove(accountID: account.id)
-        try? await store.deleteAccount(id: account.id)
         self.account = nil
         status = SyncStatus()
         transfers = []
@@ -397,6 +622,9 @@ final class AppModel: ObservableObject {
         pendingDeletions = []
         queue = []
         shares = []
+        if !cleanupIssues.isEmpty {
+            presentedError = "Die Verbindung wurde lokal entfernt. " + cleanupIssues.joined(separator: "\n")
+        }
     }
 
     func chooseFolder(prompt: String = "Ordner auswählen") -> URL? {

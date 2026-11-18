@@ -40,7 +40,9 @@ public enum RelativePath {
     /// Schlüssel für die Erkennung von Kollisionen bei Groß-/Kleinschreibung
     /// (APFS/HFS+ sind standardmäßig nicht case-sensitiv).
     public static func caseInsensitiveKey(_ normalizedPath: String) -> String {
-        normalizedPath.lowercased()
+        normalizedPath
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
     }
 
     public static func parent(of path: String) -> String? {
@@ -100,10 +102,28 @@ public enum RelativePath {
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let device = safeDevice.isEmpty ? "Gerät" : safeDevice
-        let ext = (name as NSString).pathExtension
-        let base = ext.isEmpty ? name : (name as NSString).deletingPathExtension
+        let device = truncateUTF8(safeDevice.isEmpty ? "Gerät" : safeDevice, maxBytes: 40)
+        let originalExtension = (name as NSString).pathExtension
+        let ext = truncateUTF8(originalExtension, maxBytes: 32)
+        let originalBase = originalExtension.isEmpty ? name : (name as NSString).deletingPathExtension
         let suffix = " (Konfliktkopie von \(device) \(stamp))"
-        return ext.isEmpty ? base + suffix : base + suffix + "." + ext
+        let extensionPart = ext.isEmpty ? "" : "." + ext
+        let baseBudget = max(1, 255 - suffix.utf8.count - extensionPart.utf8.count)
+        var base = truncateUTF8(originalBase, maxBytes: baseBudget)
+        if base.isEmpty { base = truncateUTF8("Datei", maxBytes: baseBudget) }
+        return base + suffix + extensionPart
+    }
+
+    static func truncateUTF8(_ value: String, maxBytes: Int) -> String {
+        guard maxBytes > 0, value.utf8.count > maxBytes else { return maxBytes > 0 ? value : "" }
+        var result = ""
+        var used = 0
+        for character in value {
+            let bytes = String(character).utf8.count
+            guard used + bytes <= maxBytes else { break }
+            result.append(character)
+            used += bytes
+        }
+        return result
     }
 }

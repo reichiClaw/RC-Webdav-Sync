@@ -62,7 +62,7 @@ final class PathSafetyTests: XCTestCase {
         XCTAssertTrue(RelativePath.isDescendant("x", of: ""))
     }
 
-    func testConflictCopyName() {
+    func testConflictCopyName() throws {
         let date = Date(timeIntervalSince1970: 1_700_000_000)
         let name = RelativePath.conflictCopyName(for: "Bericht.final.pdf", deviceName: "Annas MacBook", date: date)
         XCTAssertTrue(name.hasPrefix("Bericht.final (Konfliktkopie von Annas MacBook "), name)
@@ -70,6 +70,204 @@ final class PathSafetyTests: XCTestCase {
         let noExt = RelativePath.conflictCopyName(for: "Notizen", deviceName: "Mac/Pro:1", date: date)
         XCTAssertTrue(noExt.hasPrefix("Notizen (Konfliktkopie von Mac-Pro-1 "), noExt)
         XCTAssertFalse(noExt.contains("/"))
+
+        let long = RelativePath.conflictCopyName(
+            for: String(repeating: "ä", count: 120) + "." + String(repeating: "x", count: 80),
+            deviceName: String(repeating: "Mac😀", count: 30),
+            date: date
+        )
+        XCTAssertLessThanOrEqual(long.utf8.count, 255)
+        XCTAssertTrue(long.contains("Konfliktkopie"))
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root.appendingPathComponent(long))
+        let unique = try LocalFileSystem(root: root).uniqueRelativePath(long)
+        XCTAssertNotEqual(unique, long)
+        XCTAssertLessThanOrEqual(RelativePath.name(of: unique).utf8.count, 255)
+    }
+
+    func testLocalFileSystemRejectsSymlinkAncestor() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("root")
+        let outside = base.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("link"),
+            withDestinationURL: outside
+        )
+
+        let fileSystem = LocalFileSystem(root: root)
+        XCTAssertThrowsError(try fileSystem.createDirectory("link/server-ordner")) { error in
+            guard case LocalFileError.symbolicLink = error else {
+                return XCTFail("Unerwarteter Fehler: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("server-ordner").path))
+    }
+
+    func testLocalFileSystemRejectsReplacedRootDirectory() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("root")
+        let original = base.appendingPathComponent("original")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let expectedRootID = try XCTUnwrap(POSIXFileMetadata.read(atPath: root.path)?.fileID)
+        let fileSystem = LocalFileSystem(root: root)
+        try FileManager.default.moveItem(at: root, to: original)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        XCTAssertFalse(fileSystem.rootExists())
+        XCTAssertFalse(
+            LocalFileSystem(root: root, expectedRootFileID: expectedRootID).rootExists(),
+            "Auch eine neu erzeugte Engine muss die persistierte Ordneridentität prüfen"
+        )
+        XCTAssertThrowsError(try fileSystem.url("nicht-hier.txt")) { error in
+            XCTAssertEqual(error as? LocalFileError, .rootMissing)
+        }
+    }
+
+    func testLocalFileSystemPinsRootAfterTransientlyMissingDirectory() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("root")
+        let original = base.appendingPathComponent("original")
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let fileSystem = LocalFileSystem(root: root)
+        XCTAssertFalse(fileSystem.rootExists())
+
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertTrue(fileSystem.rootExists(), "Die erste lesbare Wurzelidentität muss nachträglich gebunden werden")
+
+        try FileManager.default.moveItem(at: root, to: original)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        XCTAssertFalse(fileSystem.rootExists(), "Nach der Bindung darf ein Ersatzordner nicht akzeptiert werden")
+    }
+
+    func testMappingKeyChangesWhenRootDirectoryIsReplaced() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("root")
+        let oldRoot = base.appendingPathComponent("old-root")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let first = AccountConfiguration(
+            name: "Test",
+            serverURL: URL(string: "https://example.org/dav/")!,
+            username: "anna",
+            localRootPath: root.path
+        )
+
+        try FileManager.default.moveItem(at: root, to: oldRoot)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let replacement = AccountConfiguration(
+            id: first.id,
+            name: first.name,
+            serverURL: first.serverURL,
+            username: first.username,
+            localRootPath: root.path
+        )
+
+        XCTAssertNotEqual(first.localRootIdentity, replacement.localRootIdentity)
+        XCTAssertNotEqual(first.mappingKey, replacement.mappingKey)
+        XCTAssertFalse(first.matchesLocalRootIdentity(atPath: root.path))
+        XCTAssertTrue(replacement.matchesLocalRootIdentity(atPath: root.path))
+    }
+
+    func testRemoveDirectoryIfEmptyNeverRemovesChildren() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("d"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = root.appendingPathComponent("d/neu.txt")
+        try Data("neu".utf8).write(to: child)
+        let fileSystem = LocalFileSystem(root: root)
+
+        XCTAssertFalse(try fileSystem.removeDirectoryIfEmpty("d", rules: ExclusionRules()))
+        XCTAssertEqual(try String(contentsOf: child, encoding: .utf8), "neu")
+        try FileManager.default.removeItem(at: child)
+        XCTAssertTrue(try fileSystem.removeDirectoryIfEmpty("d", rules: ExclusionRules()))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("d").path))
+    }
+
+    func testVerifiedTrashRestoresUnexpectedFileVersion() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("wichtig.txt")
+        try Data("neu".utf8).write(to: file)
+        let fileSystem = LocalFileSystem(root: root)
+
+        XCTAssertThrowsError(
+            try fileSystem.trashVerifiedFile(
+                "wichtig.txt",
+                expectedHash: SHA256Hasher.hash(Data("alt".utf8)),
+                recoveryDirectory: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? LocalFileError, .changedSinceScan("wichtig.txt"))
+        }
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "neu")
+    }
+
+    func testScannerInvalidatesHashCacheWhenSizeAndMtimeArePreserved() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("gleich.txt")
+        let modified = Date(timeIntervalSince1970: 1_700_000_000)
+        try Data("AAAA".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: file.path)
+
+        let scanner = LocalScanner(fileSystem: LocalFileSystem(root: root), rules: ExclusionRules(), settleTime: 0)
+        let first = try scanner.scan(previousIndex: [:])
+        Thread.sleep(forTimeInterval: 0.01)
+        try Data("BBBB".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: file.path)
+        let second = try scanner.scan(previousIndex: first.hashIndex)
+
+        XCTAssertNotEqual(first.snapshot.items["gleich.txt"]?.hash, second.snapshot.items["gleich.txt"]?.hash)
+        XCTAssertEqual(second.snapshot.items["gleich.txt"]?.hash, SHA256Hasher.hash(Data("BBBB".utf8)))
+    }
+
+    func testScannerFreezesCanonicallyEquivalentNames() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nfc = "über.txt"
+        let nfd = "u\u{308}ber.txt"
+        try Data("nfc".utf8).write(to: root.appendingPathComponent(nfc))
+        try Data("nfd".utf8).write(to: root.appendingPathComponent(nfd))
+        let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        guard Set(names.map { Data($0.utf8) }).count == 2 else {
+            throw XCTSkip("Das Dateisystem unterscheidet NFC und NFD nicht")
+        }
+
+        let scanner = LocalScanner(fileSystem: LocalFileSystem(root: root), rules: ExclusionRules(), settleTime: 0)
+        let result = try scanner.scan(previousIndex: [:])
+
+        XCTAssertEqual(result.collisions, [nfc])
+        XCTAssertNil(result.snapshot.items[nfc])
+        XCTAssertNotNil(result.snapshot.skippedPaths[nfc])
+    }
+
+    func testRemoteEnumeratorRejectsCanonicallyEquivalentServerNames() async throws {
+        let server = FakeWebDAVServer()
+        let nfc = "über.txt"
+        let nfd = "u\u{308}ber.txt"
+        await server.setAdditionalListItems([
+            RemoteItem(path: nfc, rawPath: nfc, kind: .file, size: 1, validator: "\"a\"", validatorIsStrong: true),
+            RemoteItem(path: nfd, rawPath: nfd, kind: .file, size: 1, validator: "\"b\"", validatorIsStrong: true),
+        ])
+
+        let snapshot = try await RemoteEnumerator(client: server, rules: ExclusionRules()).fullWalk()
+
+        XCTAssertFalse(snapshot.isComplete)
+        XCTAssertEqual(snapshot.collisions, [nfc])
+        XCTAssertNil(snapshot.items[nfc])
+        XCTAssertTrue(snapshot.failedPrefixes.contains(""))
     }
 }
 
@@ -111,6 +309,8 @@ final class LoggerRedactionTests: XCTestCase {
         let logger = SyncLogger()
         logger.registerSecret("geheim123")
         XCTAssertEqual(logger.redact("Passwort geheim123 gesendet"), "Passwort ••• gesendet")
+        logger.registerSecret("xy")
+        XCTAssertEqual(logger.redact("Token xy"), "Token •••")
         XCTAssertEqual(logger.redact("Authorization: Basic dXNlcjpwYXNz"), "Authorization: Basic •••")
         XCTAssertEqual(logger.redact("https://anna:pw@example.org/dav"), "https://•••@example.org/dav")
     }
@@ -134,7 +334,27 @@ final class RetryAndGuardTests: XCTestCase {
         XCTAssertFalse(guardRule.requiresConfirmation(deletionImpact: 0, baselineCount: 100, localItemCount: 100))
         XCTAssertFalse(guardRule.requiresConfirmation(deletionImpact: 3, baselineCount: 100, localItemCount: 97))
         XCTAssertTrue(guardRule.requiresConfirmation(deletionImpact: 30, baselineCount: 100, localItemCount: 70))
-        XCTAssertFalse(guardRule.requiresConfirmation(deletionImpact: 30, baselineCount: 1000, localItemCount: 970))
+        XCTAssertTrue(guardRule.requiresConfirmation(deletionImpact: 30, baselineCount: 1000, localItemCount: 970),
+                      "Die absolute Schwelle gilt unabhängig vom Anteil")
+        XCTAssertTrue(guardRule.requiresConfirmation(deletionImpact: 9, baselineCount: 10, localItemCount: 1),
+                      "Ein großer Anteil kleiner Bestände muss ebenfalls bestätigt werden")
         XCTAssertTrue(guardRule.requiresConfirmation(deletionImpact: 5, baselineCount: 5, localItemCount: 0), "Leerer lokaler Ordner muss nachfragen")
+    }
+}
+
+final class TransportSafetyTests: XCTestCase {
+    func testRedirectOriginIncludesEffectivePort() {
+        XCTAssertTrue(TransportDelegate.hasSameOrigin(
+            URL(string: "https://example.org/dav")!,
+            URL(string: "https://EXAMPLE.org:443/other")!
+        ))
+        XCTAssertFalse(TransportDelegate.hasSameOrigin(
+            URL(string: "https://example.org/dav")!,
+            URL(string: "https://example.org:8443/other")!
+        ))
+        XCTAssertFalse(TransportDelegate.hasSameOrigin(
+            URL(string: "https://example.org/dav")!,
+            URL(string: "http://example.org/dav")!
+        ))
     }
 }

@@ -111,11 +111,16 @@ public struct SHA256Hasher {
     #endif
 
     /// Hasht eine Datei blockweise mit begrenztem Arbeitsspeicher.
-    public static func hashFile(at url: URL, bufferSize: Int = 1 << 20) throws -> String {
+    public static func hashFile(
+        at url: URL,
+        bufferSize: Int = 1 << 20,
+        isCancelled: @Sendable () -> Bool = { Task<Never, Never>.isCancelled }
+    ) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256Hasher()
         while true {
+            if isCancelled() { throw CancellationError() }
             let chunk = try handle.read(upToCount: bufferSize) ?? Data()
             if chunk.isEmpty { break }
             hasher.update(chunk)

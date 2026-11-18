@@ -19,9 +19,20 @@ struct BookmarkStore {
 
     private func key(_ accountID: String) -> String { "bookmark." + accountID }
 
-    func save(folder: URL, accountID: String) throws {
-        let data = try folder.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    func makeData(folder: URL) throws -> Data {
+        try folder.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+
+    func save(data: Data, accountID: String) {
         defaults.set(data, forKey: key(accountID))
+    }
+
+    func save(folder: URL, accountID: String) throws {
+        save(data: try makeData(folder: folder), accountID: accountID)
+    }
+
+    func data(accountID: String) -> Data? {
+        defaults.data(forKey: key(accountID))
     }
 
     func remove(accountID: String) {
@@ -42,7 +53,12 @@ struct BookmarkStore {
         let url = try URL(resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
         guard url.startAccessingSecurityScopedResource() else { throw BookmarkError.cannotAccess }
         if stale {
-            try? save(folder: url, accountID: accountID)
+            do {
+                try save(folder: url, accountID: accountID)
+            } catch {
+                url.stopAccessingSecurityScopedResource()
+                throw error
+            }
         }
         return url
     }

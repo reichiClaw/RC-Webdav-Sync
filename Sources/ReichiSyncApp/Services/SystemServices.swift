@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import Network
 import ServiceManagement
-import UserNotifications
+@preconcurrency import UserNotifications
 import ReichiSyncCore
 
 /// Pfade für Datenbank, Protokolle und Wiederherstellungsbereich – außerhalb des
@@ -54,7 +54,7 @@ final class ConnectivityMonitor: @unchecked Sendable {
 final class SleepWakeObserver {
     private var token: NSObjectProtocol?
 
-    init(onWake: @escaping @MainActor () -> Void) {
+    init(onWake: @escaping @MainActor @Sendable () -> Void) {
         token = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in onWake() }
         }
@@ -117,6 +117,7 @@ final class NotificationService {
 }
 
 /// Darstellung von Werten für die Oberfläche.
+@MainActor
 enum Formatters {
     static let bytes: ByteCountFormatter = {
         let f = ByteCountFormatter()

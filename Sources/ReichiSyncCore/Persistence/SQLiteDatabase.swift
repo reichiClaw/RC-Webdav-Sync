@@ -70,6 +70,9 @@ public final class SQLiteDatabase {
         try execute("PRAGMA synchronous = NORMAL")
         try execute("PRAGMA foreign_keys = ON")
         try execute("PRAGMA busy_timeout = 5000")
+        // Gelöschte JSON-Datensätze dürfen keine früher gespeicherten
+        // Zugangsdaten in frei gewordenen Datenbankseiten hinterlassen.
+        try execute("PRAGMA secure_delete = ON")
     }
 
     deinit {
@@ -92,15 +95,26 @@ public final class SQLiteDatabase {
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         for (i, p) in params.enumerated() {
             let idx = Int32(i + 1)
+            let bindResult: Int32
             switch p {
-            case .null: sqlite3_bind_null(stmt, idx)
-            case .integer(let v): sqlite3_bind_int64(stmt, idx, v)
-            case .real(let v): sqlite3_bind_double(stmt, idx, v)
-            case .text(let v): sqlite3_bind_text(stmt, idx, v, -1, transient)
+            case .null:
+                bindResult = sqlite3_bind_null(stmt, idx)
+            case .integer(let v):
+                bindResult = sqlite3_bind_int64(stmt, idx, v)
+            case .real(let v):
+                bindResult = sqlite3_bind_double(stmt, idx, v)
+            case .text(let v):
+                bindResult = sqlite3_bind_text(stmt, idx, v, -1, transient)
             case .blob(let v):
-                v.withUnsafeBytes { ptr in
-                    _ = sqlite3_bind_blob(stmt, idx, ptr.baseAddress, Int32(v.count), transient)
+                bindResult = v.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(stmt, idx, ptr.baseAddress, Int32(v.count), transient)
                 }
+            }
+            guard bindResult == SQLITE_OK else {
+                throw SQLiteError(
+                    code: bindResult,
+                    message: String(cString: sqlite3_errmsg(handle)) + " — Parameter \(idx), SQL: \(sql)"
+                )
             }
         }
         var rows: [SQLRow] = []
@@ -146,8 +160,14 @@ public final class SQLiteDatabase {
         }
     }
 
-    public var userVersion: Int {
-        get { (try? query("PRAGMA user_version").first?.int("user_version")) ?? 0 }
-        set { try? execute("PRAGMA user_version = \(newValue)") }
+    public func userVersion() throws -> Int {
+        try query("PRAGMA user_version").first?.int("user_version") ?? 0
+    }
+
+    public func setUserVersion(_ version: Int) throws {
+        guard version >= 0 else {
+            throw SQLiteError(code: SQLITE_MISUSE, message: "Ungültige Schema-Version \(version)")
+        }
+        try execute("PRAGMA user_version = \(version)")
     }
 }

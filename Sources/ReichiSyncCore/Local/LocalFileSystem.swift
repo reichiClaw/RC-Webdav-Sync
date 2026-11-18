@@ -7,6 +7,7 @@ public enum LocalFileError: Error, Sendable, Equatable {
     case notFound(String)
     case changedSinceScan(String)
     case nameCollision(String)
+    case symbolicLink(String)
     case io(String)
 
     public var userDescription: String {
@@ -16,8 +17,30 @@ public enum LocalFileError: Error, Sendable, Equatable {
         case .notFound(let p): return "Die lokale Datei „\(p)“ wurde nicht gefunden."
         case .changedSinceScan(let p): return "„\(p)“ wurde zwischenzeitlich lokal geändert und wird beim nächsten Abgleich erneut geprüft."
         case .nameCollision(let p): return "„\(p)“ kollidiert mit einem gleichnamigen Eintrag (Groß-/Kleinschreibung)."
+        case .symbolicLink(let p): return "„\(p)“ enthält einen symbolischen Link. Der Zugriff wurde aus Sicherheitsgründen abgebrochen."
         case .io(let s): return "Dateifehler: \(s)"
         }
+    }
+}
+
+/// Teilt die einmal gebundene Wurzelidentität zwischen Kopien des
+/// `LocalFileSystem`-Werts. Falls die Metadaten beim Erzeugen vorübergehend
+/// nicht lesbar sind, wird die erste später erfolgreich gelesene Identität
+/// atomar gebunden.
+private final class RootIdentityState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expected: String?
+
+    init(expected: String?) {
+        self.expected = expected
+    }
+
+    func accepts(_ current: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let expected { return expected == current }
+        expected = current
+        return true
     }
 }
 
@@ -27,22 +50,66 @@ public enum LocalFileError: Error, Sendable, Equatable {
 /// des Stammordners (`RelativePath.localURL`).
 public struct LocalFileSystem: Sendable {
     public let root: URL
+    /// Gerät+Inode des beim Erzeugen ausgewählten Stammordners. Ein später unter
+    /// demselben Pfad eingehängter Link oder anderer Ordner ist nicht dieselbe
+    /// Sync-Wurzel und darf niemals automatisch verwendet werden.
+    private let rootIdentity: RootIdentityState
+    private let prefersTrash: Bool
     private var fm: FileManager { .default }
 
     /// Verzeichnis für temporäre Downloads innerhalb des Stammordners (gleiches Volume → atomare Ersetzung).
     public var temporaryDirectory: URL { root.appendingPathComponent(ExclusionRules.internalPrefix + "-tmp", isDirectory: true) }
 
-    public init(root: URL) {
-        self.root = root.standardizedFileURL
+    public init(root: URL, expectedRootFileID: String? = nil, prefersTrash: Bool = true) {
+        self.root = root.standardizedFileURL.resolvingSymlinksInPath()
+        let observed = (try? POSIXFileMetadata.read(atPath: self.root.path))?.fileID
+        self.rootIdentity = RootIdentityState(expected: expectedRootFileID ?? observed)
+        self.prefersTrash = prefersTrash
     }
 
     public func rootExists() -> Bool {
+        guard (try? validateRootIdentity()) != nil else { return false }
         var isDir: ObjCBool = false
         return fm.fileExists(atPath: root.path, isDirectory: &isDir) && isDir.boolValue
     }
 
     public func url(_ relativePath: String) throws -> URL {
-        try RelativePath.localURL(root: root, relativePath: relativePath)
+        try validateRootIdentity()
+        let target = try RelativePath.localURL(root: root, relativePath: relativePath)
+        try rejectSymbolicLinkComponents(relativePath)
+        try validateRootIdentity()
+        return target
+    }
+
+    public func validateRootIdentity() throws {
+        let current: POSIXFileMetadata.Values
+        do {
+            guard let value = try POSIXFileMetadata.read(atPath: root.path) else {
+                throw LocalFileError.rootMissing
+            }
+            current = value
+        } catch {
+            throw LocalFileError.rootMissing
+        }
+        guard !current.isSymbolicLink,
+              rootIdentity.accepts(current.fileID) else {
+            throw LocalFileError.rootMissing
+        }
+    }
+
+    /// Prüft jede bereits vorhandene Pfadkomponente mit `lstat`, also ohne
+    /// Links zu folgen. Nicht vorhandene Restkomponenten sind für neue Dateien
+    /// und Ordner zulässig.
+    private func rejectSymbolicLinkComponents(_ relativePath: String) throws {
+        let normalized = try RelativePath.normalize(relativePath)
+        var current = root
+        for segment in normalized.split(separator: "/") {
+            current.appendPathComponent(String(segment))
+            guard let metadata = try POSIXFileMetadata.read(atPath: current.path) else { break }
+            if metadata.isSymbolicLink {
+                throw LocalFileError.symbolicLink(normalized)
+            }
+        }
     }
 
     public struct Attributes: Sendable, Equatable {
@@ -58,7 +125,20 @@ public struct LocalFileSystem: Sendable {
     }
 
     public func attributes(at target: URL) throws -> Attributes? {
-        guard let attrs = try? fm.attributesOfItem(atPath: target.path) else { return nil }
+        // Foundation verschachtelt ENOENT auf macOS teilweise in einem
+        // NSCocoaError, statt den Fehler zuverlässig als Cocoa-Code zu
+        // klassifizieren. lstat liefert für den üblichen Nicht-vorhanden-Fall
+        // plattformübergreifend eine eindeutige Antwort.
+        guard try POSIXFileMetadata.read(atPath: target.path) != nil else { return nil }
+        let attrs: [FileAttributeKey: Any]
+        do {
+            attrs = try fm.attributesOfItem(atPath: target.path)
+        } catch {
+            if Self.isMissingPathError(error) {
+                return nil
+            }
+            throw Self.mapError(error)
+        }
         let type = attrs[.type] as? FileAttributeType
         let isSymlink = type == .typeSymbolicLink
         let kind: ItemKind = type == .typeDirectory ? .directory : .file
@@ -67,27 +147,43 @@ public struct LocalFileSystem: Sendable {
         return Attributes(kind: kind, size: size, modified: modified, isSymlink: isSymlink)
     }
 
+    private static func isMissingPathError(_ error: Error) -> Bool {
+        let outer = error as NSError
+        let candidates = [outer, outer.userInfo[NSUnderlyingErrorKey] as? NSError].compactMap { $0 }
+        return candidates.contains { candidate in
+            (candidate.domain == NSCocoaErrorDomain
+                && (candidate.code == NSFileNoSuchFileError || candidate.code == NSFileReadNoSuchFileError))
+                || (candidate.domain == NSPOSIXErrorDomain
+                    && (candidate.code == Int(ENOENT) || candidate.code == Int(ENOTDIR)))
+        }
+    }
+
     public func hash(_ relativePath: String) throws -> String {
         try SHA256Hasher.hashFile(at: url(relativePath))
     }
 
     public func ensureTemporaryDirectory() throws {
-        if !fm.fileExists(atPath: temporaryDirectory.path) {
-            try fm.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        let directory = try url(ExclusionRules.internalPrefix + "-tmp")
+        if !fm.fileExists(atPath: directory.path) {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
             var values = URLResourceValues()
             values.isHidden = true
-            var dir = temporaryDirectory
+            var dir = directory
             try? dir.setResourceValues(values)
         }
     }
 
     public func makeTemporaryFileURL() throws -> URL {
         try ensureTemporaryDirectory()
-        return temporaryDirectory.appendingPathComponent(ExclusionRules.internalPrefix + "-" + UUID().uuidString + ".part")
+        return try url(
+            ExclusionRules.internalPrefix + "-tmp/"
+                + ExclusionRules.internalPrefix + "-" + UUID().uuidString + ".part"
+        )
     }
 
     public func cleanupTemporaryFiles(olderThan age: TimeInterval = 60 * 60 * 24) {
-        guard let items = try? fm.contentsOfDirectory(at: temporaryDirectory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        guard let directory = try? url(ExclusionRules.internalPrefix + "-tmp"),
+              let items = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
         for item in items {
             if let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate, Date().timeIntervalSince(date) > age {
                 try? fm.removeItem(at: item)
@@ -108,12 +204,13 @@ public struct LocalFileSystem: Sendable {
     /// Verschiebt eine heruntergeladene temporäre Datei an ihren Zielort.
     ///
     /// - Wenn `expectedHash` gesetzt ist, muss die vorhandene Datei noch genau diesen
-    ///   Inhalt haben (Prüfung zunächst über Größe/Änderungszeit, bei Abweichung über Hash),
-    ///   sonst wird abgebrochen und die temporäre Datei entfernt.
+    ///   Inhalt haben. Größe und Zeitstempel allein reichen dafür nicht aus.
     /// - Wenn `expectedHash` `nil` ist, darf am Ziel noch keine Datei liegen.
-    public func installDownloadedFile(from temp: URL, to relativePath: String, expectedHash: String?, expectedSize: Int64?, expectedModified: Double?, modifiedDate: Date?) throws {
+    public func installDownloadedFile(from temp: URL, to relativePath: String, expectedHash: String?,
+                                      expectedSize _: Int64?, expectedModified _: Double?, modifiedDate: Date?) throws {
         let target = try url(relativePath)
         try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        _ = try url(relativePath)
         if let modifiedDate {
             try? fm.setAttributes([.modificationDate: modifiedDate], ofItemAtPath: temp.path)
         }
@@ -127,17 +224,40 @@ public struct LocalFileSystem: Sendable {
                 try? fm.removeItem(at: temp)
                 throw LocalFileError.changedSinceScan(relativePath)
             }
-            let unchangedByStat = expectedSize == existing.size && expectedModified.map { abs($0 - existing.modified) < 0.001 } == true
-            if !unchangedByStat {
-                let currentHash = try SHA256Hasher.hashFile(at: target)
-                if currentHash != expectedHash {
-                    try? fm.removeItem(at: temp)
-                    throw LocalFileError.changedSinceScan(relativePath)
-                }
+            guard let before = try POSIXFileMetadata.read(atPath: target.path),
+                  !before.isSymbolicLink else {
+                try? fm.removeItem(at: temp)
+                throw LocalFileError.changedSinceScan(relativePath)
             }
-            try atomicReplace(target: target, with: temp)
+            let currentHash = try SHA256Hasher.hashFile(at: target)
+            guard let afterHash = try POSIXFileMetadata.read(atPath: target.path),
+                  afterHash.cacheToken == before.cacheToken,
+                  !afterHash.isSymbolicLink,
+                  currentHash == expectedHash else {
+                try? fm.removeItem(at: temp)
+                throw LocalFileError.changedSinceScan(relativePath)
+            }
+            _ = try url(relativePath)
+            guard let immediatelyBeforeReplace = try POSIXFileMetadata.read(atPath: target.path),
+                  immediatelyBeforeReplace.cacheToken == before.cacheToken,
+                  !immediatelyBeforeReplace.isSymbolicLink else {
+                try? fm.removeItem(at: temp)
+                throw LocalFileError.changedSinceScan(relativePath)
+            }
+            try atomicReplace(
+                target: target,
+                with: temp,
+                expectedMetadata: before,
+                expectedHash: expectedHash,
+                relativePath: relativePath
+            )
         } else {
+            guard expectedHash == nil else {
+                try? fm.removeItem(at: temp)
+                throw LocalFileError.changedSinceScan(relativePath)
+            }
             do {
+                _ = try url(relativePath)
                 try fm.moveItem(at: temp, to: target)
             } catch {
                 try? fm.removeItem(at: temp)
@@ -147,15 +267,58 @@ public struct LocalFileSystem: Sendable {
     }
 
     /// Ersetzt `target` atomar durch `temp` (gleiches Volume).
-    private func atomicReplace(target: URL, with temp: URL) throws {
+    private func atomicReplace(target: URL, with temp: URL, expectedMetadata: POSIXFileMetadata.Values,
+                               expectedHash: String, relativePath: String) throws {
         #if os(macOS)
-        do {
-            _ = try fm.replaceItemAt(target, withItemAt: temp, backupItemName: nil, options: [])
-            return
-        } catch {
-            // Rückfall auf rename(2), z. B. bei ungewöhnlichen Dateisystemen.
+        let exchange = temp.withUnsafeFileSystemRepresentation { tempPath in
+            target.withUnsafeFileSystemRepresentation { targetPath in
+                renamex_np(tempPath!, targetPath!, UInt32(RENAME_SWAP))
+            }
         }
-        #endif
+        if exchange == 0 {
+            let displacedMetadata = try POSIXFileMetadata.read(atPath: temp.path)
+            let displacedHash = try? SHA256Hasher.hashFile(at: temp)
+            // Ein Rename verändert auf macOS die ctime und damit absichtlich
+            // den Cache-Token. Geräte-/Inode-Identität plus Inhalts-Hash
+            // beweisen dagegen, dass genau die geprüfte Datei verdrängt wurde.
+            if displacedMetadata?.fileID == expectedMetadata.fileID,
+               displacedMetadata?.isSymbolicLink == false,
+               displacedHash == expectedHash {
+                try fm.removeItem(at: temp)
+                return
+            }
+
+            // Die atomar verdrängte Datei war nicht mehr die geprüfte Version.
+            // Zuerst den Tausch rückgängig machen. Schlägt selbst das fehl,
+            // wird die unbekannte lokale Version unter einem sichtbaren Namen
+            // gerettet und niemals vom Aufrufer als Temp-Datei entfernt.
+            let rollback = temp.withUnsafeFileSystemRepresentation { tempPath in
+                target.withUnsafeFileSystemRepresentation { targetPath in
+                    renamex_np(tempPath!, targetPath!, UInt32(RENAME_SWAP))
+                }
+            }
+            if rollback != 0 {
+                let rescue = uniqueDestination(
+                    for: root.appendingPathComponent("Lokale Sicherheitskopie \(UUID().uuidString)")
+                )
+                do {
+                    try fm.moveItem(at: temp, to: rescue)
+                } catch {
+                    throw LocalFileError.io(
+                        "„\(relativePath)“ änderte sich während der atomaren Ersetzung; die lokale Version liegt noch unter \(temp.path)"
+                    )
+                }
+            }
+            throw LocalFileError.changedSinceScan(relativePath)
+        }
+        let exchangeError = errno
+        if exchangeError == ENOTSUP || exchangeError == EINVAL {
+            throw LocalFileError.io(
+                "Das Dateisystem unterstützt keine atomar abgesicherte Ersetzung von „\(relativePath)“"
+            )
+        }
+        throw Self.mapError(NSError(domain: NSPOSIXErrorDomain, code: Int(exchangeError)))
+        #else
         let result = temp.withUnsafeFileSystemRepresentation { tempPath in
             target.withUnsafeFileSystemRepresentation { targetPath in
                 rename(tempPath!, targetPath!)
@@ -166,6 +329,7 @@ public struct LocalFileSystem: Sendable {
             try? fm.removeItem(at: temp)
             throw Self.mapError(err)
         }
+        #endif
     }
 
     /// Verschiebt eine Datei oder einen Ordner in den Papierkorb; falls das nicht
@@ -175,28 +339,108 @@ public struct LocalFileSystem: Sendable {
         let target = try url(relativePath)
         guard fm.fileExists(atPath: target.path) else { return nil }
         #if os(macOS)
-        var resulting: NSURL?
-        do {
-            try fm.trashItem(at: target, resultingItemURL: &resulting)
-            return resulting as URL?
-        } catch {
-            SyncLogger.shared.warning("local", "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)")
+        if prefersTrash {
+            var resulting: NSURL?
+            do {
+                try fm.trashItem(at: target, resultingItemURL: &resulting)
+                return resulting as URL?
+            } catch {
+                SyncLogger.shared.warning("local", "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)")
+            }
         }
         #endif
         guard let recoveryDirectory else {
             throw LocalFileError.io("Weder Papierkorb noch Wiederherstellungsbereich verfügbar")
         }
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let dest = recoveryDirectory.appendingPathComponent(stamp, isDirectory: true).appendingPathComponent(relativePath)
+        let desired = recoveryDirectory.appendingPathComponent(stamp, isDirectory: true).appendingPathComponent(relativePath)
+        let dest = uniqueDestination(for: desired)
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        _ = try url(relativePath)
         try fm.moveItem(at: target, to: dest)
         return dest
+    }
+
+    /// Nimmt genau den am Pfad vorhandenen Datei-Inode atomar aus dem
+    /// Sync-Ordner, prüft erst danach dessen Inhalt und entfernt ausschließlich
+    /// diese verifizierte Version. Eine zwischen Scan und Löschung atomar
+    /// ersetzte Datei wird wiederhergestellt oder als sichtbare
+    /// Sicherheitskopie bewahrt.
+    @discardableResult
+    public func trashVerifiedFile(_ relativePath: String, expectedHash: String,
+                                  recoveryDirectory: URL?) throws -> URL? {
+        let target = try url(relativePath)
+        let quarantine = try makeTemporaryFileURL()
+        do {
+            try fm.moveItem(at: target, to: quarantine)
+        } catch {
+            try? fm.removeItem(at: quarantine)
+            throw Self.mapError(error)
+        }
+
+        func restoreUnexpectedVersion() {
+            if !fm.fileExists(atPath: target.path) {
+                try? fm.moveItem(at: quarantine, to: target)
+            }
+            if fm.fileExists(atPath: quarantine.path) {
+                let rescue = uniqueDestination(
+                    for: root.appendingPathComponent("Lokale Sicherheitskopie \(UUID().uuidString)")
+                )
+                try? fm.moveItem(at: quarantine, to: rescue)
+            }
+        }
+
+        do {
+            guard let before = try POSIXFileMetadata.read(atPath: quarantine.path),
+                  !before.isSymbolicLink else {
+                restoreUnexpectedVersion()
+                throw LocalFileError.changedSinceScan(relativePath)
+            }
+            let actualHash = try SHA256Hasher.hashFile(at: quarantine)
+            guard let after = try POSIXFileMetadata.read(atPath: quarantine.path),
+                  after.cacheToken == before.cacheToken,
+                  !after.isSymbolicLink,
+                  actualHash == expectedHash else {
+                restoreUnexpectedVersion()
+                throw LocalFileError.changedSinceScan(relativePath)
+            }
+
+            #if os(macOS)
+            if prefersTrash {
+                var resulting: NSURL?
+                do {
+                    try fm.trashItem(at: quarantine, resultingItemURL: &resulting)
+                    return resulting as URL?
+                } catch {
+                    SyncLogger.shared.warning(
+                        "local",
+                        "Papierkorb nicht verfügbar für \(relativePath): \(error.localizedDescription)"
+                    )
+                }
+            }
+            #endif
+            guard let recoveryDirectory else {
+                restoreUnexpectedVersion()
+                throw LocalFileError.io("Weder Papierkorb noch Wiederherstellungsbereich verfügbar")
+            }
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let desired = recoveryDirectory.appendingPathComponent(stamp, isDirectory: true)
+                .appendingPathComponent(relativePath)
+            let destination = uniqueDestination(for: desired)
+            try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: quarantine, to: destination)
+            return destination
+        } catch {
+            if fm.fileExists(atPath: quarantine.path) { restoreUnexpectedVersion() }
+            throw error
+        }
     }
 
     public func move(_ from: String, to: String) throws {
         let source = try url(from)
         let dest = try url(to)
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        _ = try url(to)
         if fm.fileExists(atPath: dest.path) { throw LocalFileError.io("Zielpfad „\(to)“ existiert bereits") }
         try fm.moveItem(at: source, to: dest)
     }
@@ -205,20 +449,69 @@ public struct LocalFileSystem: Sendable {
         let source = try url(from)
         let dest = try url(to)
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        _ = try url(to)
         if fm.fileExists(atPath: dest.path) { throw LocalFileError.io("Zielpfad „\(to)“ existiert bereits") }
         try fm.copyItem(at: source, to: dest)
     }
 
-    /// Entfernt einen leeren Ordner (keine Dateien, nur ausgeschlossene Einträge erlaubt).
-    public func removeDirectoryIfEmpty(_ relativePath: String, rules: ExclusionRules) throws -> Bool {
-        let target = try url(relativePath)
-        guard let children = try? fm.contentsOfDirectory(atPath: target.path) else { return false }
-        for child in children {
-            let childPath = RelativePath.join(relativePath, child.precomposedStringWithCanonicalMapping)
-            if !rules.isExcluded(relativePath: childPath) { return false }
+    /// Liefert einen freien relativen Pfad, ohne vorhandene Dateien zu
+    /// überschreiben. Der Suffix bleibt vor der Dateiendung.
+    public func uniqueRelativePath(_ desiredPath: String) throws -> String {
+        let normalized = try RelativePath.normalize(desiredPath)
+        if !fm.fileExists(atPath: try url(normalized).path) { return normalized }
+        let parent = RelativePath.parent(of: normalized) ?? ""
+        let name = RelativePath.name(of: normalized)
+        let nameURL = URL(fileURLWithPath: name)
+        let ext = nameURL.pathExtension
+        let base = nameURL.deletingPathExtension().lastPathComponent
+        for number in 2...10_000 {
+            let candidateName = disambiguatedFileName(base: base, extension: ext, suffix: " \(number)")
+            let candidate = RelativePath.join(parent, candidateName)
+            if !fm.fileExists(atPath: try url(candidate).path) { return candidate }
         }
-        try fm.removeItem(at: target)
-        return true
+        return RelativePath.join(
+            parent,
+            disambiguatedFileName(base: base, extension: ext, suffix: " \(UUID().uuidString)")
+        )
+    }
+
+    private func disambiguatedFileName(base: String, extension ext: String, suffix: String) -> String {
+        let safeExtension = RelativePath.truncateUTF8(ext, maxBytes: 32)
+        let extensionPart = safeExtension.isEmpty ? "" : "." + safeExtension
+        let baseBudget = max(1, 255 - suffix.utf8.count - extensionPart.utf8.count)
+        var safeBase = RelativePath.truncateUTF8(base, maxBytes: baseBudget)
+        if safeBase.isEmpty { safeBase = RelativePath.truncateUTF8("Datei", maxBytes: baseBudget) }
+        return safeBase + suffix + extensionPart
+    }
+
+    /// Entfernt ausschließlich einen tatsächlich leeren Ordner. Ausgeschlossene
+    /// Inhalte gehören weiterhin dem Benutzer und dürfen nie nebenbei verschwinden.
+    public func removeDirectoryIfEmpty(_ relativePath: String, rules _: ExclusionRules) throws -> Bool {
+        let target = try url(relativePath)
+        _ = try url(relativePath)
+        let result = target.withUnsafeFileSystemRepresentation { path in
+            rmdir(path!)
+        }
+        if result == 0 { return true }
+        let code = errno
+        if code == ENOTEMPTY || code == EEXIST { return false }
+        if code == ENOENT { return true }
+        throw Self.mapError(NSError(domain: NSPOSIXErrorDomain, code: Int(code)))
+    }
+
+    private func uniqueDestination(for desired: URL) -> URL {
+        guard fm.fileExists(atPath: desired.path) else { return desired }
+        let directory = desired.deletingLastPathComponent()
+        let ext = desired.pathExtension
+        let base = desired.deletingPathExtension().lastPathComponent
+        for number in 2...10_000 {
+            var name = "\(base) \(number)"
+            if !ext.isEmpty { name += ".\(ext)" }
+            let candidate = directory.appendingPathComponent(name)
+            if !fm.fileExists(atPath: candidate.path) { return candidate }
+        }
+        let fallback = directory.appendingPathComponent("\(base) \(UUID().uuidString)")
+        return ext.isEmpty ? fallback : fallback.appendingPathExtension(ext)
     }
 
     /// Freier Speicherplatz auf dem Volume des Stammordners.

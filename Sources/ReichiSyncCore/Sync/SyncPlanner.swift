@@ -50,6 +50,17 @@ public enum SyncAction: Sendable, Hashable {
         }
     }
 
+    public var deletionAuthorization: DeletionAuthorization? {
+        switch self {
+        case .deleteRemote(let path, let remote):
+            return DeletionAuthorization(path: path, kind: remote.kind, side: .remote)
+        case .deleteLocal(let path, let local):
+            return DeletionAuthorization(path: path, kind: local.kind, side: .local)
+        default:
+            return nil
+        }
+    }
+
     public var direction: TransferDirection? {
         switch self {
         case .uploadNew, .uploadChanged, .keepLocalAfterRemoteDelete: return .upload
@@ -100,19 +111,30 @@ public struct SyncPlan: Sendable {
     public var transferCount: Int { directoryCreations.count + moves.count + transfers.count + deletions.count }
     public var estimatedBytes: Int64 { transfers.reduce(0) { $0 + $1.estimatedBytes } }
 
-    /// Anzahl Dateien, die eine Löschung betrifft (Ordner zählen mit ihren bekannten Inhalten).
+    /// Anzahl tatsächlich ausführbarer Löschungen. Lokale Ordner zählen mit
+    /// ihren bekannten Inhalten; rekursive Serverordner-Löschungen sind gesperrt.
     public func deletionImpact(baseline: [String: BaselineEntry]) -> Int {
-        var count = 0
+        var affected: Set<String> = []
         for action in deletions {
             switch action {
             case .deleteRemote(let p, let r):
-                count += r.kind == .file ? 1 : max(1, baseline.keys.filter { RelativePath.isDescendant($0, of: p) }.count)
+                if r.kind == .file {
+                    affected.insert(p)
+                }
+                // Serverordner werden von der Engine grundsätzlich nicht
+                // rekursiv gelöscht und zählen daher nicht als ausführbare
+                // Löschung. Bekannte Kinder besitzen eigene Dateiaktionen.
             case .deleteLocal(let p, let l):
-                count += l.kind == .file ? 1 : max(1, baseline.keys.filter { RelativePath.isDescendant($0, of: p) }.count)
+                if l.kind == .file {
+                    affected.insert(p)
+                } else {
+                    let files = baseline.values.filter { RelativePath.isDescendant($0.path, of: p) && $0.kind == .file }
+                    if files.isEmpty { affected.insert(p) } else { affected.formUnion(files.map(\.path)) }
+                }
             default: break
             }
         }
-        return count
+        return affected.count
     }
 }
 
@@ -125,17 +147,14 @@ public struct PlannerInput: Sendable {
     public var openConflictPaths: Set<String>
     /// Lokales Dateisystem unterscheidet keine Groß-/Kleinschreibung (APFS-Standard).
     public var caseInsensitiveLocalFileSystem: Bool
-    /// Vom Benutzer bestätigte Löschungen (siehe Löschschutz). `nil` = keine Einschränkung.
-    public var allowedDeletions: Set<String>?
 
     public init(baseline: [String: BaselineEntry], local: LocalSnapshot, remote: RemoteSnapshot, openConflictPaths: Set<String> = [],
-                caseInsensitiveLocalFileSystem: Bool = true, allowedDeletions: Set<String>? = nil) {
+                caseInsensitiveLocalFileSystem: Bool = true) {
         self.baseline = baseline
         self.local = local
         self.remote = remote
         self.openConflictPaths = openConflictPaths
         self.caseInsensitiveLocalFileSystem = caseInsensitiveLocalFileSystem
-        self.allowedDeletions = allowedDeletions
     }
 }
 
@@ -164,6 +183,14 @@ public enum SyncPlanner {
         for p in local.busyPaths { plan.skipped.append(.skip(path: p, reason: "Datei wird gerade geschrieben; wird beim nächsten Abgleich übertragen")) }
         for (p, reason) in local.skippedPaths { plan.skipped.append(.skip(path: p, reason: reason)) }
         for p in input.openConflictPaths { plan.skipped.append(.skip(path: p, reason: "Konflikt wartet auf Entscheidung")) }
+        for p in remote.collisions {
+            frozen.insert(p)
+            plan.collisions.append(p)
+            plan.skipped.append(.skip(
+                path: p,
+                reason: "Mehrere Servereinträge ergeben auf dem Mac denselben Unicode-normalisierten Namen. Bitte einen Eintrag auf dem Server umbenennen."
+            ))
+        }
 
         if input.caseInsensitiveLocalFileSystem {
             var groups: [String: [String]] = [:]
@@ -217,9 +244,19 @@ public enum SyncPlanner {
                 guard let b else { return .new }
                 if r.kind != b.kind { return .changed }
                 if r.kind == .directory { return .unchanged }
-                if let v = r.validator { return v == b.remoteValidator ? .unchanged : .changed }
-                // Kein Validator: nur Größe als Hinweis verfügbar.
-                return r.size == b.remoteSize ? .unchanged : .changed
+                if let v = r.validator {
+                    guard v == b.remoteValidator else { return .changed }
+                    // Nur ein starker ETag beweist Bytegleichheit. Schwache ETags
+                    // und Ersatzvalidatoren dürfen bei einem Dateisync auch dann
+                    // nicht als Inhaltsbeweis dienen, wenn ihr Text gleich blieb.
+                    if !r.validatorIsStrong { return .changed }
+                    return .unchanged
+                }
+                guard r.size == b.remoteSize else { return .changed }
+                // Ohne Validator ist Gleichheit grundsätzlich nicht beweisbar.
+                // Wiederholtes Lesen ist teurer, verhindert aber unbemerkte
+                // gleich große Serveränderungen.
+                return .changed
             }
             guard b != nil else { return .absent }
             if remote.isUnderFailedPrefix(p) { return .unknown }
@@ -261,6 +298,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else if l.kind == .directory {
                     decisions[p] = .updateBaseline(path: p, local: l, remote: r)
                 } else {
@@ -272,6 +310,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else {
                     decisions[p] = .uploadChanged(path: p, local: l, remote: r)
                 }
@@ -279,6 +318,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else {
                     decisions[p] = .download(path: p, remote: r, replacing: l)
                 }
@@ -286,6 +326,7 @@ public enum SyncPlanner {
                 guard let l, let r else { continue }
                 if l.kind != r.kind {
                     decisions[p] = .kindMismatch(path: p, local: l, remote: r)
+                    frozen.insert(p)
                 } else if l.kind == .directory {
                     decisions[p] = .updateBaseline(path: p, local: l, remote: r)
                 } else {
@@ -334,13 +375,21 @@ public enum SyncPlanner {
                     // Ohne Entscheidung: unverändert und nicht gelöscht? Dann wäre lokal vorhanden – sollte bei gelöschtem Ordner nicht vorkommen.
                     return local.items[d] != nil
                 }
+                // Die bekannten Kinder bleiben als einzelne, per ETag
+                // geschützte Löschungen im Plan. Ein rekursives WebDAV-DELETE
+                // könnte sonst ein erst nach der Auflistung angelegtes Kind
+                // ohne eigene Vorbedingung mitlöschen.
                 if survivors.isEmpty {
-                    for d in descendants { decisions[d] = nil }
+                    // Den leeren Serverordner bewusst als Tombstone in der
+                    // Baseline behalten. So wird er weder unsicher gelöscht
+                    // noch bei jedem Lauf lokal neu angelegt. Sobald darin ein
+                    // neuer Servereintrag erscheint, greift der andere Zweig.
+                    decisions[dir] = nil
                 } else {
                     // Ordner bleibt; er wird lokal wieder benötigt.
                     decisions[dir] = .createLocalDirectory(path: dir, remote: r)
                 }
-            case .deleteLocal(let dir, let l) where l.kind == .directory:
+            case .deleteLocal(let dir, let localDirectory) where localDirectory.kind == .directory:
                 let descendants = local.items.keys.filter { RelativePath.isDescendant($0, of: dir) }
                 let survivors = descendants.filter { d in
                     if isFrozen(d) { return true }
@@ -351,11 +400,15 @@ public enum SyncPlanner {
                     }
                     return remote.items[d] != nil
                 }
-                if survivors.isEmpty {
-                    for d in descendants { decisions[d] = nil }
-                } else {
+                if !survivors.isEmpty {
                     decisions[dir] = .createRemoteDirectory(path: dir)
                 }
+                // Ist alles unverändert, bleiben die einzelnen Löschaktionen
+                // bestehen. Die Engine verschiebt Dateien separat in den
+                // Papierkorb und entfernt Ordner anschließend ausschließlich
+                // mit einem atomaren „nur wenn leer“-Vorgang. So kann ein
+                // zwischen Scan und Ausführung neu angelegtes Kind niemals
+                // zusammen mit dem Elternordner verschwinden.
             default:
                 break
             }
@@ -378,15 +431,9 @@ public enum SyncPlanner {
             decisions[to] = .moveRemote(from: from, to: to, remote: r, local: l)
         }
 
-        // 5. Löschschutz: nur freigegebene Löschungen ausführen.
-        if let allowed = input.allowedDeletions {
-            for (p, a) in decisions where a.isDeletion && !allowed.contains(p) {
-                decisions[p] = nil
-                plan.skipped.append(.skip(path: p, reason: "Löschung wartet auf Bestätigung"))
-            }
-        }
-
-        // 6. In Phasen einsortieren.
+        // 5. In Phasen einsortieren. Die Engine trennt Löschungen anschließend
+        // zeilenweise in automatisch zulässige, bestätigte und zurückgehaltene
+        // Aktionen. So kann eine alte Freigabe keine späteren Löschungen filtern.
         for p in sortedPaths {
             guard let a = decisions[p] else { continue }
             switch a {
@@ -424,6 +471,7 @@ public enum SyncPlanner {
         }
         plan.directoryCreations.append(contentsOf: extraCreations)
         plan.directoryCreations.sort { $0.path.split(separator: "/").count < $1.path.split(separator: "/").count }
+        plan.collisions = Array(Set(plan.collisions)).sorted()
         return plan
     }
 }

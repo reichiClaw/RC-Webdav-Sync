@@ -12,8 +12,8 @@
 | `GET` (Download-Task) | Streaming in temporäre Datei, ETag aus `ETag`/`OC-ETag` | Fortschritt über `URLSessionTaskDelegate` |
 | `PUT` (Upload-Task aus Datei) | Streaming, `Content-Length`, `X-OC-Mtime` | `If-Match: <etag>` bei starken ETags, `If-None-Match: *` für neue Dateien |
 | `MKCOL` | Ordner anlegen | 405 (existiert bereits) wird toleriert |
-| `DELETE` | Löschen mit `If-Match` (starke ETags) oder vorheriger `PROPFIND`-Prüfung | Ordner werden vor dem Löschen erneut gelistet und mit der Baseline verglichen |
-| `MOVE` | Umbenennungen (`Destination`, `Overwrite: F`, `If-Match`) | Fallback Upload + Löschung |
+| `DELETE` | Dateilöschung nur mit starkem ETag und nachgewiesen atomarem `If-Match` | Rekursive Collection-Löschungen bleiben gesperrt; eine Vorprüfung allein wäre wegen des Race-Fensters kein Schutz |
+| `MOVE` | Umbenennungen (`Destination`, `Overwrite: F`, `If-Match`) nur bei nachgewiesen atomaren Vorbedingungen | Fallback Upload + geschützte Löschung; bleibt ein Teilschritt offen, bleibt die Gesamtaktion ausstehend |
 | `412 Precondition Failed` | Kennzeichen für Änderung seit der Bestandsaufnahme → Aktion zurückstellen, neu planen | Nie als Fehler „durchgedrückt“ |
 | `423 Locked`, `507 Insufficient Storage`, `409 Conflict` | Werden gemeldet, Aktion wird zurückgestellt/fehlgeschlagen markiert | Kein Lock-Management (Klasse 2 wird nicht genutzt) |
 | ETags | Opaque behandelt; schwache ETags (`W/`) werden erkannt und nicht für `If-Match` verwendet | Ohne ETags: Ersatzvalidator `mtime:<HTTP-Date>;size:<n>` |
@@ -24,11 +24,11 @@
 
 | Server | Art des Tests | Ergebnis |
 |---|---|---|
-| `FakeWebDAVServer` (In-Memory-Actor) | Integrationstests für alle Sync-Szenarien (26 Tests) | bestanden auf Linux |
+| `FakeWebDAVServer` (In-Memory-Actor) | Integrationstests für Sync-, Race-, Lösch- und Recovery-Szenarien (42 Tests) | bestanden auf Linux |
 | `Scripts/dev-webdav-server.py` (Python-stdlib, Klasse 1, starke ETags, Basic Auth) | echte HTTP-Tests: Capabilities, 401, If-Match/If-None-Match-Zyklus, kompletter Engine-Lauf | bestanden auf Linux |
 | Nextcloud / ownCloud | **nicht in dieser Umgebung getestet**; 207-Parser mit Nextcloud-Fixture (`Tests/…/Fixtures/nextcloud-propfind.xml`) geprüft; `OC-ETag`, `X-OC-Mtime`, `oc:`-Props, sync-collection-Format berücksichtigt | Verifikation auf einem Mac gegen eine echte Instanz empfohlen |
 | Apache `mod_dav`, Synology, Nginx DAV | nicht getestet; nur Klasse-1-Funktionen vorausgesetzt | sollten funktionieren, da keine Erweiterungen verlangt werden |
-| Cloudreve v4 (Emulation `dev-webdav-server.py --cloudreve`) | Erkennung, Login/2FA/Refresh, WebDAV-Konten, Chunk-Upload inkl. Wiederaufnahme/Ablauf/Versionsprüfung, Freigaben, Engine-Integration (14 Tests) | bestanden auf Linux; **echte Instanz existiert noch nicht** – siehe Abschnitt Cloudreve |
+| Cloudreve v4 (Emulation `dev-webdav-server.py --cloudreve`) | Erkennung, Login/2FA/Refresh, WebDAV-Konten, Upload inkl. Wiederaufnahme/Ablauf/Versionsprüfung, Freigaben, Engine-Integration (18 Tests) | bestanden auf Linux; **echte Instanz existiert noch nicht** – siehe Abschnitt Cloudreve |
 
 ## Bekannte Grenzen
 
@@ -92,10 +92,11 @@ gegen `https://reichi.cloud` bestätigt werden.
 
 | Aufgabe | Weg |
 |---|---|
-| Listing (PROPFIND), Download (GET), Löschen, Verschieben, MKCOL, kleine Uploads (PUT) | WebDAV `https://<site>/dav/…` mit dem von reichi Sync angelegten WebDAV-Konto (Benutzername = E-Mail, generiertes Passwort) |
+| Listing (PROPFIND), Download (GET), MKCOL | WebDAV `https://<site>/dav/…` mit dem von reichi Sync angelegten WebDAV-Konto (Benutzername = E-Mail, generiertes Passwort) |
 | Anmeldung, Token-Erneuerung | `POST /api/v4/session/token`, `…/2fa`, `…/refresh` (JWT-Paar, Access ≈ 1 h, Refresh ≈ 180 d) |
 | WebDAV-Konten lesen/anlegen, Server-Ordner anlegen | `GET/PUT /api/v4/devices/dav`, `POST /api/v4/file/create` |
-| Uploads ab Schwelle (Standard 8 MB) | `PUT /api/v4/file/upload` (Sitzung) + `POST /api/v4/file/upload/{session}/{index}` (Chunks) |
+| Neue und geänderte Uploads | `PUT /api/v4/file/upload` (Sitzung mit Existenz-/`previous`-Schutz) + `POST /api/v4/file/upload/{session}/{index}`; oberhalb der Schwelle fortsetzbar |
+| Löschen und Verschieben | Bleiben ausstehend, solange Cloudreve keine gleichwertige atomare Versionsvorbedingung bereitstellt |
 | Freigaben | `PUT/GET /api/v4/share`, `DELETE /api/v4/share/{id}` |
 
 ### Erkennung
@@ -106,13 +107,13 @@ Dann gilt `serverKind = .cloudreve` und `honorsIfMatch = false`.
 ### `If-Match` wird ignoriert
 
 Cloudreve wertet `If-Match`/`If-None-Match` bei `PUT`, `DELETE` und `MOVE`
-nicht aus (die Header werden im Handler nicht gelesen). Die Engine erkennt das
-über `WebDAVCapabilities.supportsConditionalWrites == false` und prüft vor
-Überschreiben/Löschen per `PROPFIND`, ob der Server-Validator noch dem
-erwarteten entspricht (kleines Zeitfenster, in dem eine parallele Änderung
-nicht erkannt würde). Beim Chunk-Upload schließt `previous` (Entity-ID des
-bekannten ETags) dieses Fenster serverseitig: stimmt die Version nicht, kommt
-Code `40076 Stale version` → Konflikt wie bei `412`.
+nicht atomar aus. Eine getrennte `PROPFIND`-Prüfung würde ein Race-Fenster
+lassen und gilt daher ausdrücklich nicht als Schreibschutz. Die Engine
+verwendet für Uploads die REST-Sitzung: `previous` (Entity-ID des bekannten
+ETags) schützt Ersetzungen, der Existenzmodus schützt Neuanlagen. Stimmt die
+Version nicht, wird Code `40076 Stale version` wie HTTP 412 neu geplant.
+DAV-DELETE und MOVE werden blockiert, bis eine serverseitig atomare
+Alternative existiert.
 
 ### Chunked und fortsetzbare Uploads
 
@@ -137,12 +138,11 @@ Code `40076 Stale version` → Konflikt wie bei `412`.
 5. Nach Abschluss wird die neue Version per `PROPFIND` gelesen (ETag =
    Entity-ID) und in die Baseline übernommen.
 
-**Unterstützte Speicherrichtlinien:** `local` sowie jede Richtlinie mit
-`relay = true` (Chunks gehen an Cloudreve selbst) und `remote` ohne Relay
-(Chunks an `upload_urls[0]?chunk=N` mit `Authorization: <credential>`,
-**Annahme**, nicht emuliert). Richtlinien mit direktem Upload zu S3, OneDrive,
-Qiniu, OSS, COS, Upyun werden **nicht** unterstützt → Rückfall auf WebDAV-PUT
-in einer Anfrage (ohne Fortsetzung).
+**Unterstützte Speicherrichtlinien:** unverschlüsseltes `local` sowie jede
+unverschlüsselte Richtlinie mit `relay = true` (Chunks gehen an Cloudreve
+selbst). Direkte Fremdspeicher-Uploads und Policies mit aktivierter
+Client-Verschlüsselung werden fail-closed abgelehnt; ein ungeschützter
+WebDAV-PUT-Rückfall findet nicht statt.
 
 ### Annahmen, die gegen eine echte Instanz zu bestätigen sind
 
@@ -154,7 +154,7 @@ in einer Anfrage (ohne Fortsetzung).
 - `PUT /api/v4/share` liefert als `data` die vollständige Link-URL
   (`<site>/s/<id>[/<passwort>]`).
 - Fehlercodes entsprechen `pkg/serializer/error.go` (40004, 40011, 40012,
-  40013, 40016, 40020, 40022, 40044, 40051, 40076, 40077).
+  40013, 40016, 40020, 40022, 40044, 40051, 40076, 40077, 40080).
 - WebDAV-Konten mit Wurzel `cloudreve://my/<Ordner>` bilden den Ordner auf
   `/dav/` ab (relativer Root).
 
@@ -165,5 +165,6 @@ in einer Anfrage (ohne Fortsetzung).
 - Keine Ordner-Freigaben mit eigenem Berechtigungsmodell; es werden nur
   Cloudreve-Share-Links erzeugt.
 - Läuft das Refresh-Token ab (≈ 180 Tage ohne Nutzung) oder wird es serverseitig
-  widerrufen, bleibt der WebDAV-Abgleich aktiv; Chunk-Upload und Freigaben
-  benötigen eine erneute Anmeldung in den Einstellungen.
+  widerrufen, bleiben Listing und Download per WebDAV möglich. Uploads,
+  Freigaben und Kontoverwaltung benötigen eine erneute Anmeldung; unsichere
+  WebDAV-Schreibzugriffe werden nicht als Rückfall verwendet.

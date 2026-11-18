@@ -1,7 +1,21 @@
 import Foundation
 
+extension String {
+    /// RFC 9110 `entity-tag`: Nur ein syntaktisch gültiges, nicht mit `W/`
+    /// markiertes Tag darf als atomare Schreibvorbedingung verwendet werden.
+    var isStrongHTTPETag: Bool {
+        let bytes = Array(utf8)
+        guard bytes.count >= 2, bytes.first == 0x22, bytes.last == 0x22 else { return false }
+        return bytes.dropFirst().dropLast().allSatisfy { byte in
+            byte == 0x21 || (0x23...0x7E).contains(byte) || byte >= 0x80
+        }
+    }
+}
+
 /// Eine Ressource aus einer `207 Multi-Status`-Antwort.
 public struct DAVResource: Sendable, Hashable {
+    /// Unverändertes `href` zur Origin-Prüfung.
+    public var rawHref: String?
     /// Dekodierter Pfad aus `href` (ohne Host), z. B. `/remote.php/dav/files/u/Ordner/Datei.txt`.
     public var hrefPath: String
     /// HTTP-Status der Ressource selbst (bei `sync-collection` z. B. 404 für gelöschte Einträge).
@@ -15,10 +29,20 @@ public struct DAVResource: Sendable, Hashable {
     public var properties: [String: String]
     /// `supported-report-set` enthält `sync-collection`.
     public var supportsSyncCollection: Bool
+    /// DAV-Properties aus erfolgreichen beziehungsweise fehlgeschlagenen
+    /// `propstat`-Blöcken. Insbesondere muss `resourcetype` erfolgreich sein,
+    /// bevor Datei/Ordner unterschieden werden dürfen.
+    public var successfulProperties: Set<String>
+    public var failedProperties: Set<String>
+    public var propstatStatuses: [Int]
 
-    public init(hrefPath: String, status: Int? = nil, isCollection: Bool = false, etag: String? = nil, contentLength: Int64? = nil,
-                lastModified: Date? = nil, contentType: String? = nil, properties: [String: String] = [:], supportsSyncCollection: Bool = false) {
+    public init(hrefPath: String, rawHref: String? = nil, status: Int? = nil, isCollection: Bool = false,
+                etag: String? = nil, contentLength: Int64? = nil, lastModified: Date? = nil,
+                contentType: String? = nil, properties: [String: String] = [:],
+                supportsSyncCollection: Bool = false, successfulProperties: Set<String> = [],
+                failedProperties: Set<String> = [], propstatStatuses: [Int] = []) {
         self.hrefPath = hrefPath
+        self.rawHref = rawHref
         self.status = status
         self.isCollection = isCollection
         self.etag = etag
@@ -27,12 +51,14 @@ public struct DAVResource: Sendable, Hashable {
         self.contentType = contentType
         self.properties = properties
         self.supportsSyncCollection = supportsSyncCollection
+        self.successfulProperties = successfulProperties
+        self.failedProperties = failedProperties
+        self.propstatStatuses = propstatStatuses
     }
 
-    /// `true`, wenn der ETag stark ist (kein `W/`-Präfix).
+    /// `true`, wenn ein syntaktisch gültiger starker HTTP-ETag vorliegt.
     public var hasStrongETag: Bool {
-        guard let etag, !etag.isEmpty else { return false }
-        return !etag.hasPrefix("W/")
+        etag?.isStrongHTTPETag == true
     }
 
     /// Validator für die Änderungserkennung: ETag oder Ersatz aus Datum und Größe.
@@ -50,10 +76,14 @@ public struct MultiStatusResponse: Sendable {
     public var resources: [DAVResource]
     /// Sync-Token (RFC 6578), falls vorhanden.
     public var syncToken: String?
+    /// Strukturelle Probleme, bei denen eine Antwort nicht als vollständige
+    /// Bestandsaufnahme verwendet werden darf.
+    public var issues: [String]
 
-    public init(resources: [DAVResource] = [], syncToken: String? = nil) {
+    public init(resources: [DAVResource] = [], syncToken: String? = nil, issues: [String] = []) {
         self.resources = resources
         self.syncToken = syncToken
+        self.issues = issues
     }
 }
 
@@ -81,7 +111,7 @@ public struct WebDAVCapabilities: Sendable, Hashable, Codable {
     public var serverVersion: String?
 
     public init(davClasses: Set<String> = [], supportsSyncCollection: Bool = false, providesETags: Bool = false, strongETags: Bool = false,
-                serverSoftware: String? = nil, likelyHasServerTrash: Bool = false, serverKind: ServerKind = .generic, honorsIfMatch: Bool = true,
+                serverSoftware: String? = nil, likelyHasServerTrash: Bool = false, serverKind: ServerKind = .generic, honorsIfMatch: Bool = false,
                 serverVersion: String? = nil) {
         self.davClasses = davClasses
         self.supportsSyncCollection = supportsSyncCollection
@@ -103,13 +133,13 @@ public struct WebDAVCapabilities: Sendable, Hashable, Codable {
         serverSoftware = try c.decodeIfPresent(String.self, forKey: .serverSoftware)
         likelyHasServerTrash = try c.decodeIfPresent(Bool.self, forKey: .likelyHasServerTrash) ?? false
         serverKind = try c.decodeIfPresent(ServerKind.self, forKey: .serverKind) ?? .generic
-        honorsIfMatch = try c.decodeIfPresent(Bool.self, forKey: .honorsIfMatch) ?? true
+        honorsIfMatch = try c.decodeIfPresent(Bool.self, forKey: .honorsIfMatch) ?? false
         serverVersion = try c.decodeIfPresent(String.self, forKey: .serverVersion)
     }
 
-    /// Bedingte Schreibzugriffe (`If-Match`) sind nur mit starken ETags sinnvoll – und nur,
-    /// wenn der Server den Header auch auswertet.
-    public var supportsConditionalWrites: Bool { strongETags && honorsIfMatch }
+    /// Ob der Server bedingte Schreibzugriffe auswertet. Der konkrete Eintrag
+    /// muss zusätzlich einen starken ETag besitzen.
+    public var supportsConditionalWrites: Bool { honorsIfMatch }
 }
 
 /// Fehler des WebDAV-Clients.
@@ -185,7 +215,7 @@ public enum WebDAVError: Error, Sendable, Equatable {
         switch self {
         case .network: return .checkServer
         case .authenticationRequired: return .checkCredentials
-        case .forbidden: return .checkCredentials
+        case .forbidden: return .checkServer
         case .preconditionFailed: return .retry
         case .insufficientStorage: return .freeDiskSpace
         case .locked, .conflict, .unexpectedStatus, .invalidResponse, .notFound, .invalidSyncToken: return .retry

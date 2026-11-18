@@ -117,13 +117,18 @@ public struct RemoteSnapshot: Sendable {
     /// Verzeichnispräfixe, deren Auflistung fehlgeschlagen ist. Unterhalb dieser
     /// Präfixe dürfen keine Löschungen abgeleitet werden.
     public var failedPrefixes: Set<String>
+    /// Verschiedene Serverpfade, die nach Unicode-Normalisierung denselben
+    /// lokalen Schlüssel ergeben und deshalb nicht verlustfrei abbildbar sind.
+    public var collisions: [String]
     /// Neuer Sync-Token (RFC 6578), falls der Server einen geliefert hat.
     public var syncToken: String?
 
-    public init(items: [String: RemoteItem] = [:], isComplete: Bool = true, failedPrefixes: Set<String> = [], syncToken: String? = nil) {
+    public init(items: [String: RemoteItem] = [:], isComplete: Bool = true, failedPrefixes: Set<String> = [],
+                collisions: [String] = [], syncToken: String? = nil) {
         self.items = items
         self.isComplete = isComplete
         self.failedPrefixes = failedPrefixes
+        self.collisions = collisions
         self.syncToken = syncToken
     }
 
@@ -275,7 +280,7 @@ public struct ConflictRecord: Codable, Sendable, Identifiable, Hashable {
 
 /// Eine geplante Löschung, die auf Bestätigung wartet (Schutz vor großen Löschmengen).
 public struct PendingDeletion: Codable, Sendable, Identifiable, Hashable {
-    public enum Side: String, Codable, Sendable { case local, remote }
+    public enum Side: String, Codable, Sendable, Hashable { case local, remote }
     public var id: String { side.rawValue + ":" + path }
     public var path: String
     public var kind: ItemKind
@@ -287,6 +292,25 @@ public struct PendingDeletion: Codable, Sendable, Identifiable, Hashable {
         self.kind = kind
         self.side = side
         self.plannedAt = plannedAt
+    }
+}
+
+/// Einmalige Freigabe für genau die geplante Seite und Art einer Löschung.
+/// Der Pfad allein reicht nicht: Zwischen Planung und Bestätigung kann sich die
+/// Löschrichtung ändern.
+public struct DeletionAuthorization: Sendable, Hashable {
+    public var path: String
+    public var kind: ItemKind
+    public var side: PendingDeletion.Side
+
+    public init(path: String, kind: ItemKind, side: PendingDeletion.Side) {
+        self.path = path
+        self.kind = kind
+        self.side = side
+    }
+
+    public init(_ pending: PendingDeletion) {
+        self.init(path: pending.path, kind: pending.kind, side: pending.side)
     }
 }
 

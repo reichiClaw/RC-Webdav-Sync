@@ -120,8 +120,10 @@ final class WebDAVClientHTTPTests: XCTestCase {
     func testEngineEndToEndOverHTTP() async throws {
         let client = try makeClient()
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("reichi-http-\(UUID().uuidString)")
-        let root = base.appendingPathComponent("Sync")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let selectedRoot = base.appendingPathComponent("Sync")
+        try FileManager.default.createDirectory(at: selectedRoot, withIntermediateDirectories: true)
+        let fileSystem = LocalFileSystem(root: selectedRoot, prefersTrash: false)
+        let root = fileSystem.root
         defer { try? FileManager.default.removeItem(at: base) }
 
         // Server-Vorbestand
@@ -134,8 +136,14 @@ final class WebDAVClientHTTPTests: XCTestCase {
         let store = try SyncStore(path: base.appendingPathComponent("db.sqlite").path)
         let account = AccountConfiguration(name: "HTTP", serverURL: baseURL, username: "anna", localRootPath: root.path, allowInsecureHTTP: true)
         let mapping = try await store.mapping(for: account)
-        let config = SyncEngineConfiguration(deviceName: "HTTPMac", recoveryDirectory: base.appendingPathComponent("Recovery"), settleTime: 0, minimumFreeSpace: 0)
-        let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root), rules: ExclusionRules(), configuration: config)
+        let config = SyncEngineConfiguration(
+            deviceName: "HTTPMac",
+            recoveryDirectory: base.appendingPathComponent("Recovery"),
+            deletionGuard: DeletionGuard(threshold: 1000, fraction: 1),
+            settleTime: 0,
+            minimumFreeSpace: 0
+        )
+        let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: fileSystem, rules: ExclusionRules(), configuration: config)
         await engine.start()
         await engine.syncAndWait()
         var status = await engine.currentStatus
@@ -144,13 +152,34 @@ final class WebDAVClientHTTPTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: serverRoot.appendingPathComponent("lokal.txt"), encoding: .utf8), "lokal")
 
         // Serveränderung + lokale Löschung
-        try Data("remote v2".utf8).write(to: serverRoot.appendingPathComponent("Vom Server/remote.txt"))
+        let remoteUpdate = base.appendingPathComponent("remote-v2.txt")
+        try Data("remote v2".utf8).write(to: remoteUpdate)
+        let currentRemote = try await client.stat("Vom Server/remote.txt")
+        let previousRemote = try XCTUnwrap(currentRemote)
+        let updatedRemote = try await client.upload(
+            file: remoteUpdate,
+            to: "Vom Server/remote.txt",
+            ifMatch: previousRemote.validator,
+            ifNoneMatchAll: false,
+            progress: nil
+        )
+        XCTAssertNotEqual(updatedRemote.etag, previousRemote.validator)
         try FileManager.default.removeItem(at: root.appendingPathComponent("lokal.txt"))
         try Data("neu".utf8).write(to: root.appendingPathComponent("neu.txt"))
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-30)], ofItemAtPath: root.appendingPathComponent("neu.txt").path)
         await engine.syncAndWait()
         status = await engine.currentStatus
-        XCTAssertEqual(status.health, .synced, status.headline)
+        let transfers = await engine.transfers()
+        let queue = await engine.queue()
+        let pendingDeletions = await engine.pendingDeletions()
+        let diagnostics = [
+            "issue=\(status.lastIssue?.message ?? "keine") [\(status.lastIssue?.detail ?? "keine Details")]",
+            "pending=\(status.pendingCount), deletions=\(status.pendingDeletions)",
+            "queue=\(queue.map(\.path))",
+            "held=\(pendingDeletions.map(\.path))",
+            "transfers=\(transfers.map { "\($0.path):\($0.state.rawValue):\($0.errorMessage ?? "-"):\($0.errorDetail ?? "-")" })",
+        ].joined(separator: "; ")
+        XCTAssertEqual(status.health, .synced, "\(status.headline): \(diagnostics)")
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Vom Server/remote.txt"), encoding: .utf8), "remote v2")
         XCTAssertFalse(FileManager.default.fileExists(atPath: serverRoot.appendingPathComponent("lokal.txt").path))
         XCTAssertEqual(try String(contentsOf: serverRoot.appendingPathComponent("neu.txt"), encoding: .utf8), "neu")

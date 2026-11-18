@@ -37,7 +37,7 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Einstellungen")
-        .onAppear(perform: load)
+        .onAppear { load() }
         .onChange(of: model.account) { _, _ in load(force: true) }
     }
 
@@ -52,10 +52,10 @@ struct SettingsView: View {
                     LabeledContent("WebDAV-Konto", value: account.username)
                     HStack {
                         if model.cloudreveSignedIn {
-                            Label("Angemeldet – Chunk-Upload und Freigaben verfügbar", systemImage: "checkmark.circle.fill")
+                            Label("Angemeldet – sichere Uploads und Freigaben verfügbar", systemImage: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                         } else {
-                            Label("Sitzung abgelaufen – Dateiabgleich läuft weiter, Chunk-Upload und Freigaben benötigen eine neue Anmeldung", systemImage: "exclamationmark.triangle.fill")
+                            Label("Sitzung abgelaufen – Uploads und Freigaben sind pausiert; Downloads laufen weiter", systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.orange)
                         }
                         Spacer()
@@ -121,17 +121,8 @@ struct SettingsView: View {
                 }
                 Stepper("Gleichzeitige Übertragungen: \(maxConcurrent)", value: $maxConcurrent, in: 1...8)
                 if model.isCloudreveAccount {
-                    Toggle("Große Dateien in Teilen hochladen (fortsetzbar)", isOn: $chunkedUploads)
-                    if chunkedUploads {
-                        Picker("Ab Dateigröße", selection: $chunkThresholdMB) {
-                            Text("1 MB").tag(1)
-                            Text("4 MB").tag(4)
-                            Text("8 MB").tag(8)
-                            Text("32 MB").tag(32)
-                            Text("128 MB").tag(128)
-                        }
-                    }
-                    Text("Uploads ab dieser Größe laufen über die Cloudreve-Upload-API in Teilstücken. Bricht die Verbindung ab, wird beim nächsten Versuch an der letzten bestätigten Stelle fortgesetzt.")
+                    LabeledContent("Uploads", value: "Cloudreve-API (versioniert und fortsetzbar)")
+                    Text("Cloudreve wertet WebDAV If-Match nicht aus. Deshalb verwendet reichi Sync für alle Uploads den atomar versionierten API-Pfad.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -254,11 +245,13 @@ struct SettingsView: View {
                 let pw: String
                 if !password.isEmpty {
                     pw = password
-                } else if let account = model.account, let stored = try? KeychainStore().password(accountID: account.id) {
-                    pw = stored
                 } else {
-                    testResult = "Bitte Passwort eingeben."
-                    return
+                    guard let account = model.account,
+                          let stored = try KeychainStore().password(accountID: account.id) else {
+                        testResult = "Bitte Passwort eingeben."
+                        return
+                    }
+                    pw = stored
                 }
                 let result = try await model.testConnection(urlString: serverURL, username: username, password: pw, allowInsecureHTTP: allowInsecureHTTP)
                 testResult = "Verbindung erfolgreich (\(result.capabilities.serverSoftware ?? "WebDAV")\(result.capabilities.supportsSyncCollection ? ", WebDAV-Sync" : ""))."

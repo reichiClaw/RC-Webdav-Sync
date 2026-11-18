@@ -2,9 +2,8 @@ import Foundation
 
 /// Erstellt eine Bestandsaufnahme des lokalen Ordners.
 ///
-/// - Hashes werden nur neu berechnet, wenn Größe oder Änderungszeit vom Cache
-///   abweichen; die Entscheidungen des Abgleichs beruhen damit auf Inhalten,
-///   nicht auf Zeitstempeln.
+/// - Hashes werden nur wiederverwendet, wenn Größe, Änderungszeit,
+///   Dateisystem-Identität und POSIX-Änderungszeit übereinstimmen.
 /// - Symbolische Links werden nicht gefolgt und als übersprungen gemeldet.
 /// - Dateien, die gerade geschrieben werden (Änderung jünger als `settleTime`),
 ///   werden als „beschäftigt“ gemeldet und im aktuellen Lauf nicht übertragen.
@@ -38,14 +37,17 @@ public struct LocalScanner: Sendable {
         var skipped: [String: String] = [:]
         var collisions: [String] = []
         var seenKeys: [String: String] = [:]   // caseInsensitiveKey → path
+        var rawPathsByNormalizedPath: [String: String] = [:]
+        var collisionPrefixes: Set<String> = []
         var complete = true
 
-        var stack: [(url: URL, rel: String, rawRel: String)] = [(fileSystem.root, "", "")]
+        var stack: [(rel: String, rawRel: String)] = [("", "")]
         let fm = FileManager.default
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey, .nameKey, .isRegularFileKey]
 
-        while let (dirURL, rel, rawRel) = stack.popLast() {
+        while let (rel, rawRel) = stack.popLast() {
             if isCancelled() { throw CancellationError() }
+            let dirURL = try fileSystem.url(rawRel)
             let children: [URL]
             do {
                 children = try fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: Array(keys), options: [])
@@ -65,19 +67,36 @@ public struct LocalScanner: Sendable {
                     continue
                 }
                 if values.isSymbolicLink == true {
-                    skipped[childRel] = "Symbolischer Link wird nicht synchronisiert"
+                    skipped[childRel] = "Symbolischer Link wird aus Sicherheitsgründen nicht synchronisiert; der Pfad bleibt unverändert"
                     continue
                 }
+                guard let childPOSIX = try? POSIXFileMetadata.read(atPath: child.path),
+                      !childPOSIX.isSymbolicLink else {
+                    skipped[childRel] = "Eintrag ist während der Bestandsaufnahme verschwunden oder wurde durch einen Link ersetzt"
+                    complete = false
+                    continue
+                }
+                if let existingRawPath = rawPathsByNormalizedPath[childRel],
+                   !existingRawPath.utf8.elementsEqual(childRaw.utf8) {
+                    collisionPrefixes.insert(childRel)
+                    collisions.append(childRel)
+                    skipped[childRel] = "Mehrere lokale Einträge ergeben denselben Unicode-normalisierten Namen"
+                    continue
+                }
+                rawPathsByNormalizedPath[childRel] = childRaw
                 let ciKey = RelativePath.caseInsensitiveKey(childRel)
                 if let other = seenKeys[ciKey], other != childRel {
-                    collisions.append(childRel)
+                    collisionPrefixes.insert(other)
+                    collisionPrefixes.insert(childRel)
+                    collisions.append(contentsOf: [other, childRel])
+                    skipped[other] = "Kollidiert mit „\(childRel)“"
                     skipped[childRel] = "Kollidiert mit „\(other)“"
                     continue
                 }
                 seenKeys[ciKey] = childRel
                 if values.isDirectory == true {
                     items[childRel] = LocalItem(path: childRel, rawPath: childRaw, kind: .directory)
-                    stack.append((child, childRel, childRaw))
+                    stack.append((childRel, childRaw))
                     continue
                 }
                 guard values.isRegularFile == true else {
@@ -86,17 +105,22 @@ public struct LocalScanner: Sendable {
                 }
                 let size = Int64(values.fileSize ?? 0)
                 let modified = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+                let posix = childPOSIX
                 let age = now.timeIntervalSince1970 - modified
                 if age >= 0 && age < settleTime {
                     busy.insert(childRel)
                     continue
                 }
                 let hash: String
-                if let cached = previousIndex[childRel], cached.size == size, cached.mtime == modified {
+                if let cached = previousIndex[childRel],
+                   cached.size == size,
+                   cached.mtime == modified,
+                   cached.fileID == posix.cacheToken,
+                   cached.changeTime == posix.changeTime {
                     hash = cached.hash
                 } else {
                     do {
-                        hash = try SHA256Hasher.hashFile(at: child)
+                        hash = try SHA256Hasher.hashFile(at: child, isCancelled: isCancelled)
                     } catch {
                         skipped[childRel] = "Nicht lesbar: \(error.localizedDescription)"
                         complete = false
@@ -104,15 +128,34 @@ public struct LocalScanner: Sendable {
                     }
                     // Erneut prüfen, ob die Datei während des Hashens verändert wurde.
                     if let after = try? child.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-                       Int64(after.fileSize ?? 0) != size || (after.contentModificationDate?.timeIntervalSince1970 ?? 0) != modified {
+                       let afterPOSIX = try? POSIXFileMetadata.read(atPath: child.path),
+                       Int64(after.fileSize ?? 0) != size
+                        || (after.contentModificationDate?.timeIntervalSince1970 ?? 0) != modified
+                        || afterPOSIX.cacheToken != posix.cacheToken {
                         busy.insert(childRel)
                         continue
                     }
                 }
                 items[childRel] = LocalItem(path: childRel, rawPath: childRaw, kind: .file, size: size, modified: modified, hash: hash)
-                index[childRel] = SyncStore.LocalIndexEntry(size: size, mtime: modified, hash: hash)
+                index[childRel] = SyncStore.LocalIndexEntry(
+                    size: size,
+                    mtime: modified,
+                    hash: hash,
+                    fileID: posix.cacheToken,
+                    changeTime: posix.changeTime
+                )
             }
         }
+        try fileSystem.validateRootIdentity()
+        if !collisionPrefixes.isEmpty {
+            for prefix in collisionPrefixes {
+                for path in items.keys where path == prefix || RelativePath.isDescendant(path, of: prefix) {
+                    items[path] = nil
+                    index[path] = nil
+                }
+            }
+        }
+        collisions = Array(Set(collisions)).sorted()
         let snapshot = LocalSnapshot(items: items, isComplete: complete, busyPaths: busy, skippedPaths: skipped)
         return Result(snapshot: snapshot, hashIndex: index, collisions: collisions)
     }

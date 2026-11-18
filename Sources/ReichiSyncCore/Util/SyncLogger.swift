@@ -48,8 +48,18 @@ public final class SyncLogger: @unchecked Sendable {
     private let capacity = 2000
     private var fileHandle: FileHandle?
     private var secrets: [String] = []
-    public var minimumLevel: LogLevel = .debug
+    private var configuredMinimumLevel: LogLevel = .debug
     private var observers: [UUID: @Sendable (LogEntry) -> Void] = [:]
+
+    public var minimumLevel: LogLevel {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return configuredMinimumLevel
+        }
+        set {
+            lock.lock(); configuredMinimumLevel = newValue; lock.unlock()
+        }
+    }
 
     #if canImport(os)
     private let osLogger = Logger(subsystem: "de.reichi.sync", category: "sync")
@@ -59,7 +69,7 @@ public final class SyncLogger: @unchecked Sendable {
 
     /// Registriert einen geheimen Wert (z. B. Passwort), der aus allen Meldungen entfernt wird.
     public func registerSecret(_ value: String) {
-        guard value.count >= 3 else { return }
+        guard !value.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
         if !secrets.contains(value) { secrets.append(value) }
     }
@@ -69,11 +79,12 @@ public final class SyncLogger: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let fm = FileManager.default
         try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
+        if !fm.fileExists(atPath: url.path) { _ = fm.createFile(atPath: url.path, contents: nil) }
         if let attrs = try? fm.attributesOfItem(atPath: url.path), let size = attrs[.size] as? NSNumber, size.int64Value > 5_000_000 {
             try? fm.removeItem(at: url)
-            fm.createFile(atPath: url.path, contents: nil)
+            _ = fm.createFile(atPath: url.path, contents: nil)
         }
+        try? fileHandle?.close()
         fileHandle = try? FileHandle(forWritingTo: url)
         _ = try? fileHandle?.seekToEnd()
     }
@@ -89,18 +100,19 @@ public final class SyncLogger: @unchecked Sendable {
     }
 
     public func log(_ level: LogLevel, _ category: String, _ message: @autoclosure () -> String) {
-        guard level >= minimumLevel else { return }
+        lock.lock()
+        let shouldLog = level >= configuredMinimumLevel
+        lock.unlock()
+        guard shouldLog else { return }
         let entry = LogEntry(level: level, category: category, message: redact(message()))
+        let line = "\(ISO8601DateFormatter().string(from: entry.date)) [\(level.rawValue.uppercased())] \(category): \(entry.message)\n"
+        let data = line.data(using: .utf8)
         lock.lock()
         entries.append(entry)
         if entries.count > capacity { entries.removeFirst(entries.count - capacity) }
-        let handle = fileHandle
+        if let fileHandle, let data { try? fileHandle.write(contentsOf: data) }
         let obs = Array(observers.values)
         lock.unlock()
-        if let handle {
-            let line = "\(ISO8601DateFormatter().string(from: entry.date)) [\(level.rawValue.uppercased())] \(category): \(entry.message)\n"
-            if let data = line.data(using: .utf8) { try? handle.write(contentsOf: data) }
-        }
         #if canImport(os)
         switch level {
         case .debug: osLogger.debug("\(category, privacy: .public): \(entry.message, privacy: .public)")

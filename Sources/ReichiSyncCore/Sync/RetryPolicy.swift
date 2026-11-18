@@ -31,8 +31,8 @@ public struct DeletionGuard: Sendable {
     public var fraction: Double
 
     public init(threshold: Int = 25, fraction: Double = 0.2) {
-        self.threshold = threshold
-        self.fraction = fraction
+        self.threshold = max(1, threshold)
+        self.fraction = min(1, max(0, fraction))
     }
 
     /// `true`, wenn die Löschungen vor der Ausführung bestätigt werden müssen.
@@ -40,8 +40,9 @@ public struct DeletionGuard: Sendable {
         if deletionImpact == 0 { return false }
         // Lokaler Ordner plötzlich leer, obwohl ein Bestand bekannt war: immer nachfragen.
         if localItemCount == 0 && baselineCount > 0 { return true }
-        if deletionImpact < threshold { return false }
         if baselineCount == 0 { return true }
-        return Double(deletionImpact) / Double(baselineCount) >= fraction
+        // Die beiden Grenzen sind unabhängig: Eine große absolute Anzahl ODER ein
+        // großer Anteil des bekannten Bestands muss bestätigt werden.
+        return deletionImpact >= threshold || Double(deletionImpact) / Double(baselineCount) > fraction
     }
 }
