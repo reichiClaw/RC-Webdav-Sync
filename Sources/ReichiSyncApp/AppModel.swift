@@ -126,7 +126,11 @@ final class AppModel: ObservableObject {
                 // dem Dateisystem ergänzte Root-Identität dauerhaft gebunden.
                 // Sonst könnte ein später ersetzter Ordner am gleichen Pfad
                 // bei jedem Neustart als neue legitime Wurzel erscheinen.
-                try await store.saveAccount(first)
+                do {
+                    try await store.saveAccount(first)
+                } catch {
+                    SyncLogger.shared.warning("app", "Die Root-Identität der Verbindung konnte nicht dauerhaft gespeichert werden: \(error.localizedDescription)")
+                }
                 if first.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
                 await startEngine(for: first)
             }

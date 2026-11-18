@@ -254,8 +254,7 @@ extension AppModel {
                 if !cached.isEmpty, shares.isEmpty { shares = cached }
             } catch {
                 guard lifecycleGeneration == generation else { return }
-                presentedError = "Der Freigabe-Cache konnte nicht gelesen werden: \(error.localizedDescription)"
-                return
+                SyncLogger.shared.warning("app", "Der Freigabe-Cache konnte nicht gelesen werden: \(error.localizedDescription)")
             }
         }
         guard api.isSignedIn else { return }
@@ -271,7 +270,11 @@ extension AppModel {
                   self.account?.id == accountID,
                   cloudreveAPI === api else { return }
             shares = fresh
-            try await store?.replaceShares(fresh, accountID: accountID)
+            do {
+                try await store?.replaceShares(fresh, accountID: accountID)
+            } catch {
+                SyncLogger.shared.warning("app", "Der Freigabe-Cache konnte nicht gespeichert werden: \(error.localizedDescription)")
+            }
         } catch let error as CloudreveError {
             guard lifecycleGeneration == generation,
                   self.account?.id == accountID,
