@@ -83,11 +83,6 @@ final class AppModel: ObservableObject {
     init() {
         showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? false
         SyncLogger.shared.enableFileLogging(at: AppPaths.logFile)
-        do {
-            store = try SyncStore(path: AppPaths.database.path)
-        } catch {
-            storeError = "Die Datenbank konnte nicht geöffnet werden: \(error)"
-        }
         logEntries = SyncLogger.shared.recentEntries(limit: 300)
         logObserver = SyncLogger.shared.addObserver { [weak self] entry in
             Task { @MainActor [weak self] in
@@ -118,6 +113,17 @@ final class AppModel: ObservableObject {
         bootstrapped = true
         NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
         refreshLoginItemState()
+        if store == nil {
+            let databasePath = AppPaths.database.path
+            do {
+                store = try await Task.detached(priority: .utility) {
+                    try SyncStore(path: databasePath)
+                }.value
+            } catch {
+                storeError = "Die Datenbank konnte nicht geöffnet oder aktualisiert werden: \(error.localizedDescription)"
+                presentedError = storeError
+            }
+        }
         guard let store else { isReady = true; return }
         do {
             if let first = (try await store.accounts()).first {
@@ -156,7 +162,14 @@ final class AppModel: ObservableObject {
             }
             password = stored
         } catch {
-            presentedError = error.localizedDescription
+            let message = error.localizedDescription
+            var s = SyncStatus()
+            s.health = .paused
+            s.isPaused = true
+            s.pauseReason = .authenticationRequired
+            s.lastIssue = SyncIssue(message: message, action: .checkCredentials)
+            status = s
+            presentedError = message
             return
         }
         let client: WebDAVClient
@@ -229,8 +242,16 @@ final class AppModel: ObservableObject {
             root.stopAccessingSecurityScopedResource()
             return
         }
-        let candidate = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root),
-                                   rules: ExclusionRules(userPatterns: account.exclusionPatterns), configuration: config, uploadTransport: uploadTransport)
+        let candidate = SyncEngine(
+            account: account,
+            mapping: mapping,
+            client: client,
+            store: store,
+            fileSystem: LocalFileSystem(root: root, expectedRootFileID: account.localRootIdentity),
+            rules: ExclusionRules(userPatterns: account.exclusionPatterns),
+            configuration: config,
+            uploadTransport: uploadTransport
+        )
         await candidate.setStatusHandler { [weak self] status in
             Task { @MainActor [weak self] in
                 guard let self, self.lifecycleGeneration == generation else { return }

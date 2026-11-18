@@ -245,11 +245,13 @@ struct SettingsView: View {
                 let pw: String
                 if !password.isEmpty {
                     pw = password
-                } else if let account = model.account, let stored = try? KeychainStore().password(accountID: account.id) {
-                    pw = stored
                 } else {
-                    testResult = "Bitte Passwort eingeben."
-                    return
+                    guard let account = model.account,
+                          let stored = try KeychainStore().password(accountID: account.id) else {
+                        testResult = "Bitte Passwort eingeben."
+                        return
+                    }
+                    pw = stored
                 }
                 let result = try await model.testConnection(urlString: serverURL, username: username, password: pw, allowInsecureHTTP: allowInsecureHTTP)
                 testResult = "Verbindung erfolgreich (\(result.capabilities.serverSoftware ?? "WebDAV")\(result.capabilities.supportsSyncCollection ? ", WebDAV-Sync" : ""))."
