@@ -15,9 +15,13 @@ public struct SyncEngineConfiguration: Sendable {
     public var settleTime: TimeInterval
     /// Mindestfreiraum, der nach einem Download auf dem Volume verbleiben soll.
     public var minimumFreeSpace: Int64
+    /// Ab dieser Dateigröße wird – falls eine `ResumableUploadTransport` konfiguriert ist – in
+    /// Chunks hochgeladen. `nil` deaktiviert den Chunk-Upload.
+    public var chunkedUploadThreshold: Int64?
 
     public init(deviceName: String, recoveryDirectory: URL? = nil, maxConcurrentTransfers: Int = 3, deletionGuard: DeletionGuard = DeletionGuard(),
-                caseInsensitiveLocalFileSystem: Bool = true, settleTime: TimeInterval = 2.0, minimumFreeSpace: Int64 = 200 * 1024 * 1024) {
+                caseInsensitiveLocalFileSystem: Bool = true, settleTime: TimeInterval = 2.0, minimumFreeSpace: Int64 = 200 * 1024 * 1024,
+                chunkedUploadThreshold: Int64? = AccountConfiguration.defaultChunkedUploadThreshold) {
         self.deviceName = deviceName
         self.recoveryDirectory = recoveryDirectory
         self.maxConcurrentTransfers = max(1, maxConcurrentTransfers)
@@ -25,6 +29,7 @@ public struct SyncEngineConfiguration: Sendable {
         self.caseInsensitiveLocalFileSystem = caseInsensitiveLocalFileSystem
         self.settleTime = settleTime
         self.minimumFreeSpace = minimumFreeSpace
+        self.chunkedUploadThreshold = chunkedUploadThreshold
     }
 }
 
@@ -59,6 +64,7 @@ public actor SyncEngine {
     private let rules: ExclusionRules
     private let config: SyncEngineConfiguration
     private let logger: SyncLogger
+    private let uploadTransport: ResumableUploadTransport?
 
     private var status = SyncStatus()
     private var statusHandler: (@Sendable (SyncStatus) -> Void)?
@@ -75,7 +81,9 @@ public actor SyncEngine {
     private var isShutDown = false
 
     public init(account: AccountConfiguration, mapping: SyncMapping, client: WebDAVClientProtocol, store: SyncStore,
-                fileSystem: LocalFileSystem, rules: ExclusionRules, configuration: SyncEngineConfiguration, logger: SyncLogger = .shared) {
+                fileSystem: LocalFileSystem, rules: ExclusionRules, configuration: SyncEngineConfiguration,
+                uploadTransport: ResumableUploadTransport? = nil, logger: SyncLogger = .shared) {
+        self.uploadTransport = uploadTransport
         self.account = account
         self.mapping = mapping
         self.client = client
@@ -787,16 +795,35 @@ public actor SyncEngine {
         }
         let rawPath = remote?.rawPath ?? path
         let recordID = record?.id
+        let progressHandler: TransferProgress = { [weak self] done, total in
+            guard let self, let recordID else { return }
+            Task { await self.updateProgress(recordID: recordID, done: done, total: total) }
+        }
         let result: UploadResult
         do {
-            result = try await client.upload(file: fileURL, to: rawPath, ifMatch: ifMatch, ifNoneMatchAll: ifNoneMatchAll, progress: { [weak self] done, total in
-                guard let self, let recordID else { return }
-                Task { await self.updateProgress(recordID: recordID, done: done, total: total) }
-            })
+            if let transport = uploadTransport, let threshold = config.chunkedUploadThreshold, version.size >= threshold, await transport.isAvailable() {
+                if version.hash == nil { version.hash = try fileSystem.hash(localPath) }
+                let info = UploadRequestInfo(path: path, rawPath: localPath, fileURL: fileURL, size: version.size, modified: version.modified,
+                                             hash: version.hash ?? "", replacingValidator: remote?.validator)
+                logger.info("engine", "Chunk-Upload für \(path) (\(version.size) Bytes)")
+                result = try await transport.upload(info, progress: progressHandler)
+            } else {
+                result = try await client.upload(file: fileURL, to: rawPath, ifMatch: ifMatch, ifNoneMatchAll: ifNoneMatchAll, progress: progressHandler)
+            }
         } catch let error as WebDAVError where error == .preconditionFailed {
             logger.notice("engine", "412 beim Upload von \(path) – Server hat sich geändert, neuer Abgleich")
             await finishTransfer(record, state: .skipped, note: "Serverversion hat sich zwischenzeitlich geändert – wird neu abgeglichen")
             return .deferred
+        } catch LocalFileError.changedSinceScan {
+            await finishTransfer(record, state: .skipped, note: "Datei wurde während der Übertragung geändert – wird erneut hochgeladen")
+            return .deferred
+        } catch let error as CloudreveError {
+            if case .unsupportedStoragePolicy = error {
+                logger.warning("engine", "\(error.userDescription) – Rückfall auf WebDAV-PUT für \(path)")
+                result = try await client.upload(file: fileURL, to: rawPath, ifMatch: ifMatch, ifNoneMatchAll: ifNoneMatchAll, progress: progressHandler)
+            } else {
+                throw error.asWebDAVError
+            }
         }
         // Validator ermitteln (Antwort-Header oder PROPFIND).
         var validator = result.etag

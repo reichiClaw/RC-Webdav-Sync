@@ -57,6 +57,13 @@ public struct MultiStatusResponse: Sendable {
     }
 }
 
+/// Erkanntes Serverprodukt (beeinflusst Verhaltensdetails).
+public enum ServerKind: String, Sendable, Codable, Hashable {
+    case generic
+    case nextcloud
+    case cloudreve
+}
+
 /// Erkannte Fähigkeiten eines WebDAV-Servers.
 public struct WebDAVCapabilities: Sendable, Hashable, Codable {
     public var davClasses: Set<String>
@@ -66,19 +73,43 @@ public struct WebDAVCapabilities: Sendable, Hashable, Codable {
     public var serverSoftware: String?
     /// Hinweis, ob der Server vermutlich einen Papierkorb bietet (nur für bekannte Produkte).
     public var likelyHasServerTrash: Bool
+    public var serverKind: ServerKind
+    /// Ob der Server `If-Match` bei PUT/DELETE/MOVE tatsächlich auswertet. Cloudreve ignoriert
+    /// den Header (TODO im Quellcode), daher wird dort vor jedem Schreibzugriff per PROPFIND geprüft.
+    public var honorsIfMatch: Bool
+    /// Serverversion, falls bekannt (z. B. Cloudreve-Ping).
+    public var serverVersion: String?
 
     public init(davClasses: Set<String> = [], supportsSyncCollection: Bool = false, providesETags: Bool = false, strongETags: Bool = false,
-                serverSoftware: String? = nil, likelyHasServerTrash: Bool = false) {
+                serverSoftware: String? = nil, likelyHasServerTrash: Bool = false, serverKind: ServerKind = .generic, honorsIfMatch: Bool = true,
+                serverVersion: String? = nil) {
         self.davClasses = davClasses
         self.supportsSyncCollection = supportsSyncCollection
         self.providesETags = providesETags
         self.strongETags = strongETags
         self.serverSoftware = serverSoftware
         self.likelyHasServerTrash = likelyHasServerTrash
+        self.serverKind = serverKind
+        self.honorsIfMatch = honorsIfMatch
+        self.serverVersion = serverVersion
     }
 
-    /// Bedingte Schreibzugriffe (`If-Match`) sind nur mit starken ETags sinnvoll.
-    public var supportsConditionalWrites: Bool { strongETags }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        davClasses = try c.decodeIfPresent(Set<String>.self, forKey: .davClasses) ?? []
+        supportsSyncCollection = try c.decodeIfPresent(Bool.self, forKey: .supportsSyncCollection) ?? false
+        providesETags = try c.decodeIfPresent(Bool.self, forKey: .providesETags) ?? false
+        strongETags = try c.decodeIfPresent(Bool.self, forKey: .strongETags) ?? false
+        serverSoftware = try c.decodeIfPresent(String.self, forKey: .serverSoftware)
+        likelyHasServerTrash = try c.decodeIfPresent(Bool.self, forKey: .likelyHasServerTrash) ?? false
+        serverKind = try c.decodeIfPresent(ServerKind.self, forKey: .serverKind) ?? .generic
+        honorsIfMatch = try c.decodeIfPresent(Bool.self, forKey: .honorsIfMatch) ?? true
+        serverVersion = try c.decodeIfPresent(String.self, forKey: .serverVersion)
+    }
+
+    /// Bedingte Schreibzugriffe (`If-Match`) sind nur mit starken ETags sinnvoll – und nur,
+    /// wenn der Server den Header auch auswertet.
+    public var supportsConditionalWrites: Bool { strongETags && honorsIfMatch }
 }
 
 /// Fehler des WebDAV-Clients.

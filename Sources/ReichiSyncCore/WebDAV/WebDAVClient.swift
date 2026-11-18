@@ -97,8 +97,12 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
     private let logger: SyncLogger
     private let basePathDecoded: String
 
-    public init(baseURL: URL, credentials: WebDAVCredentials, allowInsecureHTTP: Bool = false, logger: SyncLogger = .shared,
-                sessionConfiguration: URLSessionConfiguration? = nil) throws {
+    /// Vorgabe für das Serverprodukt (`nil` = automatisch erkennen).
+    public let serverKindHint: ServerKind?
+
+    public init(baseURL: URL, credentials: WebDAVCredentials, allowInsecureHTTP: Bool = false, serverKindHint: ServerKind? = nil,
+                logger: SyncLogger = .shared, sessionConfiguration: URLSessionConfiguration? = nil) throws {
+        self.serverKindHint = serverKindHint
         guard let scheme = baseURL.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
             throw WebDAVError.invalidResponse("Ungültiges URL-Schema")
         }
@@ -325,8 +329,41 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
             // Diese Server liefern starke ETags für Dateien.
             if caps.providesETags { caps.strongETags = true }
         }
-        logger.info("webdav", "Fähigkeiten: DAV=\(caps.davClasses.sorted()) sync=\(caps.supportsSyncCollection) etags=\(caps.providesETags) strong=\(caps.strongETags) server=\(caps.serverSoftware ?? "?")")
+        if software.contains("nextcloud") || software.contains("owncloud") { caps.serverKind = .nextcloud }
+
+        // Cloudreve: WebDAV unter <Site>/dav/, Ping-Endpunkt unter <Site>/api/v4/site/ping.
+        if serverKindHint != .generic, let version = await cloudreveVersion() {
+            caps.serverKind = .cloudreve
+            caps.serverVersion = version
+            caps.serverSoftware = caps.serverSoftware ?? "Cloudreve \(version)"
+            // Cloudreve-ETags sind die Entity-ID der aktuellen Version (stark), aber
+            // `If-Match` wird vom Server nicht ausgewertet.
+            if caps.providesETags { caps.strongETags = true }
+            caps.honorsIfMatch = false
+        }
+        logger.info("webdav", "Fähigkeiten: DAV=\(caps.davClasses.sorted()) sync=\(caps.supportsSyncCollection) etags=\(caps.providesETags) strong=\(caps.strongETags) ifMatch=\(caps.honorsIfMatch) kind=\(caps.serverKind.rawValue) server=\(caps.serverSoftware ?? "?")")
         return caps
+    }
+
+    /// Site-Wurzel (Scheme + Host [+ Port]) der WebDAV-Adresse.
+    public var siteOrigin: URL? {
+        var components = URLComponents()
+        components.scheme = baseURL.scheme
+        components.host = baseURL.host
+        components.port = baseURL.port
+        return components.url
+    }
+
+    /// Liefert die Cloudreve-Version, wenn hinter der Adresse eine Cloudreve-Instanz steckt.
+    private func cloudreveVersion() async -> String? {
+        guard let origin = siteOrigin else { return nil }
+        var request = URLRequest(url: origin.appendingPathComponent("api/v4/site/ping"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        guard let response = try? await perform(request), response.status == 200,
+              let json = try? JSONSerialization.jsonObject(with: response.data) as? [String: Any],
+              (json["code"] as? Int) == 0, let version = json["data"] as? String else { return nil }
+        return version
     }
 
     public func probe() async throws -> RemoteItem {
@@ -551,7 +588,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
 }
 
 /// Hält die laufende Task für die Abbruchbehandlung.
-private final class TaskHolder: @unchecked Sendable {
+final class TaskHolder: @unchecked Sendable {
     var task: URLSessionTask?
 }
 

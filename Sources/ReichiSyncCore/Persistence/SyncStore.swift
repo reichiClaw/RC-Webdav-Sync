@@ -7,7 +7,7 @@ import Foundation
 /// (z. B. `~/Library/Application Support/reichi Sync/sync.sqlite`).
 public actor SyncStore {
     private let db: SQLiteDatabase
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
     public init(path: String) throws {
         db = try SQLiteDatabase(path: path)
@@ -126,6 +126,22 @@ public actor SyncStore {
                 PRIMARY KEY (mapping_id, path, side)
             )
             """)
+            try db.execute("""
+            CREATE TABLE IF NOT EXISTS upload_sessions (
+                mapping_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                json TEXT NOT NULL,
+                PRIMARY KEY (mapping_id, path)
+            )
+            """)
+            try db.execute("""
+            CREATE TABLE IF NOT EXISTS shares (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """)
             db.userVersion = Self.schemaVersion
         }
     }
@@ -215,7 +231,7 @@ public actor SyncStore {
     }
 
     private func deleteMappingData(_ mappingID: String) throws {
-        for table in ["entries", "local_index", "remote_index", "conflicts", "transfers", "queue", "pending_deletions"] {
+        for table in ["entries", "local_index", "remote_index", "conflicts", "transfers", "queue", "pending_deletions", "upload_sessions"] {
             try db.execute("DELETE FROM \(table) WHERE mapping_id = ?", [.text(mappingID)])
         }
     }
@@ -467,11 +483,88 @@ public actor SyncStore {
         try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
     }
 
+    // MARK: - Unterbrochene Uploads
+
+    public func uploadState(path: String, mappingID: String) throws -> ResumableUploadState? {
+        try db.query("SELECT json FROM upload_sessions WHERE mapping_id = ? AND path = ?", [.text(mappingID), .text(path)]).first
+            .flatMap { $0.string("json") }
+            .flatMap { try? JSONDecoder().decode(ResumableUploadState.self, from: Data($0.utf8)) }
+    }
+
+    public func uploadStates(mappingID: String) throws -> [ResumableUploadState] {
+        try db.query("SELECT json FROM upload_sessions WHERE mapping_id = ?", [.text(mappingID)]).compactMap { row in
+            row.string("json").flatMap { try? JSONDecoder().decode(ResumableUploadState.self, from: Data($0.utf8)) }
+        }
+    }
+
+    public func saveUploadState(_ state: ResumableUploadState, mappingID: String) throws {
+        let json = try String(decoding: JSONEncoder().encode(state), as: UTF8.self)
+        try db.execute("INSERT INTO upload_sessions(mapping_id, path, json) VALUES(?, ?, ?) ON CONFLICT(mapping_id, path) DO UPDATE SET json = excluded.json",
+                       [.text(mappingID), .text(state.path), .text(json)])
+    }
+
+    public func removeUploadState(path: String, mappingID: String) throws {
+        try db.execute("DELETE FROM upload_sessions WHERE mapping_id = ? AND path = ?", [.text(mappingID), .text(path)])
+    }
+
+    // MARK: - Freigaben (lokaler Cache)
+
+    public func saveShare(_ share: CloudreveShare, accountID: String) throws {
+        let json = try String(decoding: JSONEncoder().encode(ShareCacheEntry(share: share)), as: UTF8.self)
+        try db.execute("INSERT INTO shares(id, account_id, json, created_at) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json",
+                       [.text(share.id), .text(accountID), .text(json), .real((share.createdAt ?? Date()).timeIntervalSince1970)])
+    }
+
+    public func replaceShares(_ shares: [CloudreveShare], accountID: String) throws {
+        try db.transaction {
+            try db.execute("DELETE FROM shares WHERE account_id = ?", [.text(accountID)])
+            for share in shares { try saveShare(share, accountID: accountID) }
+        }
+    }
+
+    public func shares(accountID: String) throws -> [CloudreveShare] {
+        try db.query("SELECT json FROM shares WHERE account_id = ? ORDER BY created_at DESC", [.text(accountID)]).compactMap { row in
+            row.string("json").flatMap { try? JSONDecoder().decode(ShareCacheEntry.self, from: Data($0.utf8)) }?.share
+        }
+    }
+
+    public func deleteShare(id: String) throws {
+        try db.execute("DELETE FROM shares WHERE id = ?", [.text(id)])
+    }
+
     /// Setzt den Synchronisierungsstand einer Zuordnung vollständig zurück.
     public func resetMapping(id: String) throws {
         try db.transaction {
             try deleteMappingData(id)
             try db.execute("UPDATE mappings SET last_successful_sync = NULL, sync_token = NULL, remote_index_complete = 0 WHERE id = ?", [.text(id)])
         }
+    }
+}
+
+/// Codable-Hülle für den lokalen Freigabe-Cache.
+struct ShareCacheEntry: Codable {
+    var id: String
+    var name: String
+    var url: URL
+    var sourceURI: String?
+    var isPrivate: Bool
+    var password: String?
+    var expires: Date?
+    var expired: Bool
+    var visited: Int
+    var downloaded: Int
+    var remainDownloads: Int?
+    var isFolder: Bool
+    var createdAt: Date?
+
+    init(share: CloudreveShare) {
+        id = share.id; name = share.name; url = share.url; sourceURI = share.sourceURI; isPrivate = share.isPrivate; password = share.password
+        expires = share.expires; expired = share.expired; visited = share.visited; downloaded = share.downloaded; remainDownloads = share.remainDownloads
+        isFolder = share.isFolder; createdAt = share.createdAt
+    }
+
+    var share: CloudreveShare {
+        CloudreveShare(id: id, name: name, url: url, sourceURI: sourceURI, isPrivate: isPrivate, password: password, expires: expires, expired: expired,
+                       visited: visited, downloaded: downloaded, remainDownloads: remainDownloads, isFolder: isFolder, createdAt: createdAt)
     }
 }

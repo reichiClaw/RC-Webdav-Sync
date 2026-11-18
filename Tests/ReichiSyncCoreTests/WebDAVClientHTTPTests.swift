@@ -5,55 +5,18 @@ import XCTest
 /// echten HTTP-WebDAV-Client inklusive bedingter Schreibzugriffe – sowie einen
 /// vollständigen Engine-Durchlauf über HTTP.
 final class WebDAVClientHTTPTests: XCTestCase {
-    private var process: Process?
-    private var serverRoot: URL!
-    private var baseURL: URL!
-
-    private static func repoRoot() -> URL {
-        // Tests/ReichiSyncCoreTests/WebDAVClientHTTPTests.swift → Repo-Wurzel
-        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    }
+    private var server: DevServerLauncher!
+    private var serverRoot: URL { server.serverRoot }
+    private var baseURL: URL { server.davURL }
 
     override func setUpWithError() throws {
-        let script = Self.repoRoot().appendingPathComponent("Scripts/dev-webdav-server.py")
-        guard FileManager.default.fileExists(atPath: script.path) else { throw XCTSkip("Testserver-Skript nicht gefunden") }
-        let python = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"].first { FileManager.default.isExecutableFile(atPath: $0) }
-        guard let python else { throw XCTSkip("python3 nicht verfügbar") }
-
-        serverRoot = FileManager.default.temporaryDirectory.appendingPathComponent("reichi-dav-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: serverRoot, withIntermediateDirectories: true)
-
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: python)
-        proc.arguments = [script.path, "--root", serverRoot.path, "--port", "0", "--user", "anna", "--password", "geheim", "--quiet"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        try proc.run()
-        process = proc
-
-        // Auf "READY <port>" warten.
-        var buffer = Data()
-        let deadline = Date().addingTimeInterval(10)
-        var port: Int?
-        while Date() < deadline {
-            let chunk = pipe.fileHandleForReading.availableData
-            if chunk.isEmpty { usleep(50_000); continue }
-            buffer.append(chunk)
-            if let text = String(data: buffer, encoding: .utf8), let line = text.split(separator: "\n").first(where: { $0.hasPrefix("READY ") }) {
-                port = Int(line.dropFirst("READY ".count).trimmingCharacters(in: .whitespaces))
-                break
-            }
-        }
-        guard let port else { throw XCTSkip("Testserver konnte nicht gestartet werden") }
-        baseURL = URL(string: "http://127.0.0.1:\(port)/dav/")!
+        server = try DevServerLauncher()
+        try server.start()
     }
 
     override func tearDownWithError() throws {
-        process?.terminate()
-        process?.waitUntilExit()
-        process = nil
-        if let serverRoot { try? FileManager.default.removeItem(at: serverRoot) }
+        server?.stop()
+        server = nil
     }
 
     private func makeClient(password: String = "geheim") throws -> WebDAVClient {
