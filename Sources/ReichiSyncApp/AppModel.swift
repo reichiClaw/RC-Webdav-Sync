@@ -132,7 +132,18 @@ final class AppModel: ObservableObject {
                 // dem Dateisystem ergänzte Root-Identität dauerhaft gebunden.
                 // Sonst könnte ein später ersetzter Ordner am gleichen Pfad
                 // bei jedem Neustart als neue legitime Wurzel erscheinen.
-                try await store.saveAccount(first)
+                do {
+                    try await store.saveAccount(first)
+                } catch {
+                    // Die geladene Verbindung bleibt verwendbar. Ein
+                    // ergänzender Migrations-Write darf den Start nicht als
+                    // vermeintlichen Lesefehler blockieren.
+                    SyncLogger.shared.warning(
+                        "app",
+                        "Ergänzte Ordneridentität konnte nicht gespeichert werden: \(error.localizedDescription)"
+                    )
+                    presentedError = "Die Verbindung wurde geladen, aber eine ergänzte Ordneridentität konnte nicht gespeichert werden: \(error.localizedDescription)"
+                }
                 if first.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
                 await startEngine(for: first)
             }

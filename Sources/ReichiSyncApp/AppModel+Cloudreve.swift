@@ -245,6 +245,7 @@ extension AppModel {
         guard let account, let api = cloudreveAPI else { shares = []; return }
         let generation = lifecycleGeneration
         let accountID = account.id
+        var cacheReadError: Error?
         if let store {
             do {
                 let cached = try await store.shares(accountID: accountID)
@@ -254,24 +255,28 @@ extension AppModel {
                 if !cached.isEmpty, shares.isEmpty { shares = cached }
             } catch {
                 guard lifecycleGeneration == generation else { return }
-                presentedError = "Der Freigabe-Cache konnte nicht gelesen werden: \(error.localizedDescription)"
-                return
+                cacheReadError = error
+                SyncLogger.shared.warning(
+                    "app",
+                    "Freigabe-Cache konnte nicht gelesen werden; Live-Abruf wird trotzdem versucht: \(error.localizedDescription)"
+                )
             }
         }
-        guard api.isSignedIn else { return }
+        guard api.isSignedIn else {
+            if let cacheReadError {
+                presentedError = "Der Freigabe-Cache konnte nicht gelesen werden: \(cacheReadError.localizedDescription)"
+            }
+            return
+        }
         sharesLoading = true
         defer {
             if lifecycleGeneration == generation, self.account?.id == accountID, cloudreveAPI === api {
                 sharesLoading = false
             }
         }
+        let fresh: [CloudreveShare]
         do {
-            let fresh = try await api.listShares()
-            guard lifecycleGeneration == generation,
-                  self.account?.id == accountID,
-                  cloudreveAPI === api else { return }
-            shares = fresh
-            try await store?.replaceShares(fresh, accountID: accountID)
+            fresh = try await api.listShares()
         } catch let error as CloudreveError {
             guard lifecycleGeneration == generation,
                   self.account?.id == accountID,
@@ -279,12 +284,29 @@ extension AppModel {
             if case .authenticationRequired = error { cloudreveSignedIn = false }
             SyncLogger.shared.warning("app", "Freigaben konnten nicht geladen werden: \(error.userDescription)")
             presentedError = error.userDescription
+            return
         } catch {
             guard lifecycleGeneration == generation,
                   self.account?.id == accountID,
                   cloudreveAPI === api else { return }
             SyncLogger.shared.warning("app", "Freigaben konnten nicht geladen werden: \(error.localizedDescription)")
             presentedError = "Freigaben konnten nicht geladen werden: \(error.localizedDescription)"
+            return
+        }
+        guard lifecycleGeneration == generation,
+              self.account?.id == accountID,
+              cloudreveAPI === api else { return }
+        shares = fresh
+        if let store {
+            do {
+                try await store.replaceShares(fresh, accountID: accountID)
+            } catch {
+                guard lifecycleGeneration == generation,
+                      self.account?.id == accountID,
+                      cloudreveAPI === api else { return }
+                SyncLogger.shared.warning("app", "Freigaben wurden geladen, aber der Cache konnte nicht gespeichert werden: \(error.localizedDescription)")
+                presentedError = "Freigaben wurden geladen, konnten aber nicht lokal zwischengespeichert werden: \(error.localizedDescription)"
+            }
         }
     }
 
