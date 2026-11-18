@@ -79,7 +79,9 @@ public actor SyncEngine {
     private var retryTask: Task<Void, Never>?
     private var retryRepresentsOffline = false
     private var capabilities: WebDAVCapabilities?
-    private var allowedDeletions: Set<DeletionAuthorization>?
+    /// Persistent bestätigte Einzelaktionen. Unbestätigte Löschungen werden
+    /// unabhängig davon geplant und separat in der UI angeboten.
+    private var confirmedDeletions: Set<DeletionAuthorization> = []
     private var downloadsPausedForDiskSpace = false
     private var reservedTemporaryBytes: Int64 = 0
     private var resolvingConflictIDs: Set<String> = []
@@ -133,7 +135,7 @@ public actor SyncEngine {
                 status.health = .paused
             }
             let confirmed = try await store.confirmedPendingDeletions(mappingID: mapping.id)
-            allowedDeletions = confirmed.isEmpty ? nil : Set(confirmed.map(DeletionAuthorization.init))
+            confirmedDeletions = Set(confirmed.map(DeletionAuthorization.init))
         } catch {
             reportPersistenceIssue(error)
             return
@@ -249,7 +251,7 @@ public actor SyncEngine {
     public func confirmPendingDeletions() async {
         do {
             let pending = try await store.confirmPendingDeletions(mappingID: mapping.id)
-            allowedDeletions = pending.isEmpty ? nil : Set(pending.map(DeletionAuthorization.init))
+            confirmedDeletions = Set(pending.map(DeletionAuthorization.init))
         } catch {
             reportPersistenceIssue(error)
             return
@@ -265,7 +267,8 @@ public actor SyncEngine {
     public func discardPendingDeletions() async {
         do {
             try await store.discardPendingDeletions(mappingID: mapping.id)
-            allowedDeletions = []
+            let confirmed = try await store.confirmedPendingDeletions(mappingID: mapping.id)
+            confirmedDeletions = Set(confirmed.map(DeletionAuthorization.init))
         } catch {
             reportPersistenceIssue(error)
             return
@@ -497,9 +500,9 @@ public actor SyncEngine {
 
     private func performSync(trigger: SyncTrigger) async -> SyncRunSummary {
         var summary = SyncRunSummary()
-        // Actor-Reentrancy: Eine Bestätigung, die während eines `await` dieses
-        // Durchgangs eintrifft, darf erst für den nächsten Plan gelten.
-        let runAllowedDeletions = allowedDeletions
+        // Actor-Reentrancy: Bestätigungen, die während eines `await` eintreffen,
+        // gelten erst nach einer erneuten Planung.
+        let runConfirmedDeletions = confirmedDeletions
         let wasOffline = status.health == .offline || status.nextRetry != nil
         downloadsPausedForDiskSpace = false
         status.isRunning = true
@@ -630,8 +633,7 @@ public actor SyncEngine {
         }
         let input = PlannerInput(baseline: baseline, local: scanResult.snapshot, remote: remoteSnapshot,
                                  openConflictPaths: Set(openConflicts.map(\.path)),
-                                 caseInsensitiveLocalFileSystem: config.caseInsensitiveLocalFileSystem,
-                                 allowedDeletions: runAllowedDeletions)
+                                 caseInsensitiveLocalFileSystem: config.caseInsensitiveLocalFileSystem)
         var plan = SyncPlanner.plan(input)
         if let reason = plan.deletionsSuppressedReason {
             logger.warning("engine", reason)
@@ -669,19 +671,59 @@ public actor SyncEngine {
         }
 
         // 6. Löschschutz
-        let impact = plan.deletionImpact(baseline: baseline)
+        //
+        // Bestätigungen gelten pro Aktion. Ein dauerhaft nicht sicher
+        // ausführbares DELETE darf dadurch weder neue Löschungen freigeben noch
+        // verhindern, dass diese separat in der Oberfläche erscheinen.
+        var activeConfirmedDeletions = runConfirmedDeletions
+        var confirmationSetChangedDuringRun = confirmedDeletions != runConfirmedDeletions
+        let currentlyPlannedDeletions = Set(plan.deletions.compactMap(\.deletionAuthorization))
+        if !confirmationSetChangedDuringRun,
+           scanResult.snapshot.isComplete,
+           remoteSnapshot.isComplete {
+            let staleConfirmations = activeConfirmedDeletions.subtracting(currentlyPlannedDeletions)
+            if !staleConfirmations.isEmpty {
+                do {
+                    let remaining = try await store.consumeConfirmedPendingDeletions(
+                        staleConfirmations,
+                        mappingID: mapping.id
+                    )
+                    let remainingAuthorizations = Set(remaining.map(DeletionAuthorization.init))
+                    if confirmedDeletions == activeConfirmedDeletions {
+                        confirmedDeletions = remainingAuthorizations
+                        activeConfirmedDeletions = remainingAuthorizations
+                    } else {
+                        confirmationSetChangedDuringRun = true
+                    }
+                } catch {
+                    return handlePersistenceFailure(error, summary: summary)
+                }
+            }
+        }
+
+        let unconfirmedDeletionActions = plan.deletions.filter { action in
+            guard let authorization = action.deletionAuthorization else { return true }
+            return !activeConfirmedDeletions.contains(authorization)
+        }
+        var unconfirmedDeletionPlan = SyncPlan()
+        unconfirmedDeletionPlan.deletions = unconfirmedDeletionActions
+        let impact = unconfirmedDeletionPlan.deletionImpact(baseline: baseline)
         let baselineFileCount = baseline.values.lazy.filter { $0.kind == .file }.count
         let localFileCount = scanResult.snapshot.items.values.lazy.filter { $0.kind == .file }.count
         let guardBaselineCount = baselineFileCount > 0 ? baselineFileCount : baseline.count
         let guardLocalCount = baselineFileCount > 0 ? localFileCount : scanResult.snapshot.items.count
-        if runAllowedDeletions == nil,
-           config.deletionGuard.requiresConfirmation(
+        if confirmationSetChangedDuringRun {
+            // Eine parallel getroffene Benutzerentscheidung darf niemals auf
+            // einen davor erstellten Plan angewendet werden.
+            plan.deletions.removeAll()
+            summary.needsFollowUp = true
+        } else if config.deletionGuard.requiresConfirmation(
                deletionImpact: impact,
                baselineCount: guardBaselineCount,
                localItemCount: guardLocalCount
            ) {
             var held: [PendingDeletion] = []
-            for action in plan.deletions {
+            for action in unconfirmedDeletionActions {
                 switch action {
                 case .deleteRemote(let p, let r) where r.kind == .file:
                     held.append(PendingDeletion(path: p, kind: r.kind, side: .remote))
@@ -696,15 +738,14 @@ public actor SyncEngine {
             }
             summary.deletionsHeld = held.count
             logger.notice("engine", "Löschschutz: \(impact) Einträge betroffen – Bestätigung erforderlich")
-            plan.deletions.removeAll()
+            plan.deletions.removeAll { action in
+                guard let authorization = action.deletionAuthorization else { return true }
+                return !activeConfirmedDeletions.contains(authorization)
+            }
             eventHandler?(.deletionConfirmationRequired(count: held.count))
-        } else if runAllowedDeletions != nil {
-            // Die Freigabe wurde am Anfang dieses Durchgangs atomar verbraucht.
         } else {
-            // Ein früherer Löschplan kann nach neuen Änderungen gegenstandslos
-            // geworden sein und darf dann nicht weiter in der UI stehen.
             do {
-                try await store.clearPendingDeletions(mappingID: mapping.id)
+                try await store.clearPendingDeletionsAwaitingConfirmation(mappingID: mapping.id)
             } catch {
                 return handlePersistenceFailure(error, summary: summary)
             }
@@ -758,41 +799,53 @@ public actor SyncEngine {
         if failures > 0 || summary.needsFollowUp || summary.skipped > plan.skipped.count {
             haltRemainingActions = true
         }
-        if runAllowedDeletions != nil, allowedDeletions != runAllowedDeletions {
-            // Eine während dieses Durchgangs verworfene oder ersetzte
-            // Benutzerentscheidung darf nicht aus einem alten Plan wirken.
+        if confirmedDeletions != activeConfirmedDeletions {
+            // Eine während dieses Durchgangs ergänzte Benutzerentscheidung
+            // darf nicht aus einem älteren Plan wirken.
             haltRemainingActions = true
+            summary.needsFollowUp = true
         }
         if Task.isCancelled { return summary }
-        var authorizedDeletionPhaseCompleted = false
         if !haltRemainingActions {
-            var everyDeletionCompleted = true
             for action in plan.deletions {
                 if Task.isCancelled { return summary }
+                if confirmedDeletions != activeConfirmedDeletions {
+                    haltRemainingActions = true
+                    summary.needsFollowUp = true
+                    break
+                }
+                let authorization = action.deletionAuthorization
+                let wasConfirmed = authorization.map(activeConfirmedDeletions.contains) == true
                 let result = await execute(action, snapshot: remoteSnapshot)
                 tally(result, &transferred, &failures, &summary)
-                switch result {
-                case .succeeded, .noop:
-                    break
-                default:
-                    everyDeletionCompleted = false
+                if wasConfirmed,
+                   let authorization,
+                   result.settlesDeletionConfirmation {
+                    do {
+                        let remaining = try await store.consumeConfirmedPendingDeletions(
+                            [authorization],
+                            mappingID: mapping.id
+                        )
+                        let remainingAuthorizations = Set(remaining.map(DeletionAuthorization.init))
+                        if confirmedDeletions == activeConfirmedDeletions {
+                            confirmedDeletions = remainingAuthorizations
+                            activeConfirmedDeletions = remainingAuthorizations
+                        } else {
+                            haltRemainingActions = true
+                            summary.needsFollowUp = true
+                        }
+                    } catch {
+                        return handlePersistenceFailure(error, summary: summary)
+                    }
+                } else if confirmedDeletions != activeConfirmedDeletions {
+                    haltRemainingActions = true
+                    summary.needsFollowUp = true
                 }
                 status.completedCount += 1
                 if Self.isTerminalFailure(result) {
                     haltRemainingActions = true
                     break
                 }
-            }
-            authorizedDeletionPhaseCompleted = everyDeletionCompleted && !haltRemainingActions
-        }
-        if runAllowedDeletions != nil, authorizedDeletionPhaseCompleted {
-            do {
-                try await store.clearPendingDeletions(mappingID: mapping.id)
-                if allowedDeletions == runAllowedDeletions {
-                    allowedDeletions = nil
-                }
-            } catch {
-                return handlePersistenceFailure(error, summary: summary)
             }
         }
         if !haltRemainingActions {
@@ -994,6 +1047,19 @@ public actor SyncEngine {
         case blocked
         case conflict
         case noop
+
+        /// Eine bestätigte Löschung ist nur nach einem erfolgreichen bzw.
+        /// bereits erledigten Ergebnis verbraucht. Dauerhaft blockierte
+        /// Aktionen behalten ihre pfadgenaue Freigabe, ohne andere Löschungen
+        /// zu beeinflussen.
+        var settlesDeletionConfirmation: Bool {
+            switch self {
+            case .succeeded, .noop:
+                return true
+            case .failed, .deferred, .blocked, .conflict:
+                return false
+            }
+        }
     }
 
     private func executeConcurrently(_ actions: [SyncAction], snapshot: RemoteSnapshot) async -> [ActionResult] {

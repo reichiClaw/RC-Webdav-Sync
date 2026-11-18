@@ -738,6 +738,69 @@ final class SyncEngineIntegrationTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testIncompleteListingDoesNotConsumeConfirmedDeletions() async throws {
+        let guardRule = DeletionGuard(threshold: 2, fraction: 0.5)
+        harness = try await EngineHarness(deletionGuard: guardRule)
+        try harness.write("teil/a.txt", "a")
+        try harness.write("teil/b.txt", "b")
+        try harness.write("bleibt.txt", "bleibt")
+        await harness.sync()
+        try harness.remove("teil")
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 2)
+
+        await harness.server.setFailListing(["teil"])
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+
+        var confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertEqual(Set(confirmed.map(\.path)), ["teil/a.txt", "teil/b.txt"])
+        await harness.assertServerExists("teil/a.txt", true)
+        await harness.assertServerExists("teil/b.txt", true)
+
+        await harness.server.setFailListing([])
+        await harness.sync()
+
+        confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(confirmed.isEmpty)
+        await harness.assertServerExists("teil/a.txt", false)
+        await harness.assertServerExists("teil/b.txt", false)
+    }
+
+    func testBlockedConfirmationDoesNotHideLaterDeletion() async throws {
+        let server = FakeWebDAVServer()
+        let guardRule = DeletionGuard(threshold: 2, fraction: 0.5)
+        harness = try await EngineHarness(server: server, deletionGuard: guardRule)
+        try harness.write("blockiert-a.txt", "a")
+        try harness.write("blockiert-b.txt", "b")
+        try harness.write("spaeter.txt", "c")
+        await harness.sync()
+
+        await harness.engine.shutdown()
+        await server.setHonorsIfMatch(false)
+        harness = try await EngineHarness(restarting: harness, deletionGuard: guardRule)
+        try harness.remove("blockiert-a.txt")
+        try harness.remove("blockiert-b.txt")
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 2)
+
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        var confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertEqual(Set(confirmed.map(\.path)), ["blockiert-a.txt", "blockiert-b.txt"])
+        let awaitingAfterConfirmation = await harness.engine.pendingDeletions()
+        XCTAssertTrue(awaitingAfterConfirmation.isEmpty)
+
+        try harness.remove("spaeter.txt")
+        await harness.sync()
+
+        let awaiting = await harness.engine.pendingDeletions()
+        XCTAssertEqual(awaiting.map(\.path), ["spaeter.txt"])
+        confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertEqual(Set(confirmed.map(\.path)), ["blockiert-a.txt", "blockiert-b.txt"])
+        await harness.assertServerExists("spaeter.txt", true)
+    }
+
     func testConfirmedDeletionsRemainAuthorizedAcrossDeferredUpload() async throws {
         harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
         for i in 0..<4 { try harness.write("hold\(i).txt", "\(i)") }

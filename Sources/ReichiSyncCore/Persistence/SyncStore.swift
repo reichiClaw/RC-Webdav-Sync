@@ -21,7 +21,7 @@ public enum SyncStoreError: LocalizedError, Sendable {
 /// (z. B. `~/Library/Application Support/reichi Sync/sync.sqlite`).
 public actor SyncStore {
     private let db: SQLiteDatabase
-    private static let schemaVersion = 4
+    private static let schemaVersion = 5
 
     public init(path: String) throws {
         db = try SQLiteDatabase(path: path)
@@ -143,6 +143,7 @@ public actor SyncStore {
                 side TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 planned_at REAL NOT NULL,
+                confirmed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (mapping_id, path, side)
             )
             """)
@@ -168,6 +169,26 @@ public actor SyncStore {
             }
             if !localIndexColumns.contains("change_time") {
                 try db.execute("ALTER TABLE local_index ADD COLUMN change_time REAL")
+            }
+            let pendingDeletionColumns = Set(try db.query("PRAGMA table_info(pending_deletions)").compactMap { $0.string("name") })
+            if !pendingDeletionColumns.contains("confirmed") {
+                try db.execute("ALTER TABLE pending_deletions ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
+            }
+            if existingVersion < 5 {
+                // Schema 4 markierte den gesamten Löschplan über einen
+                // Meta-Eintrag als bestätigt. In Schema 5 trägt jede Zeile
+                // ihren Zustand selbst, damit neue Bestätigungen neben einer
+                // bereits freigegebenen, aber blockierten Löschung bestehen.
+                try db.execute("""
+                UPDATE pending_deletions
+                SET confirmed = 1
+                WHERE EXISTS (
+                    SELECT 1 FROM meta
+                    WHERE meta.key = 'confirmed-deletions.' || pending_deletions.mapping_id
+                      AND meta.value = '1'
+                )
+                """)
+                try db.execute("DELETE FROM meta WHERE key LIKE 'confirmed-deletions.%'")
             }
 
             if existingVersion < 4 {
@@ -767,17 +788,40 @@ public actor SyncStore {
 
     public func replacePendingDeletions(_ items: [PendingDeletion], mappingID: String) throws {
         try db.transaction {
-            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
-            try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
+            // Bereits freigegebene Einträge gehören zu einem älteren Plan und
+            // bleiben bestehen. Nur der noch unbestätigte Vorschlag wird durch
+            // die aktuelle Bestandsaufnahme ersetzt.
+            try db.execute(
+                "DELETE FROM pending_deletions WHERE mapping_id = ? AND confirmed = 0",
+                [.text(mappingID)]
+            )
             for item in items {
-                try db.execute("INSERT OR REPLACE INTO pending_deletions(mapping_id, path, side, kind, planned_at) VALUES(?, ?, ?, ?, ?)",
-                               [.text(mappingID), .text(item.path), .text(item.side.rawValue), .text(item.kind.rawValue), .real(item.plannedAt.timeIntervalSince1970)])
+                try db.execute(
+                    """
+                    INSERT OR IGNORE INTO pending_deletions(
+                        mapping_id, path, side, kind, planned_at, confirmed
+                    ) VALUES(?, ?, ?, ?, ?, 0)
+                    """,
+                    [.text(mappingID), .text(item.path), .text(item.side.rawValue),
+                     .text(item.kind.rawValue), .real(item.plannedAt.timeIntervalSince1970)]
+                )
             }
         }
     }
 
     public func pendingDeletions(mappingID: String) throws -> [PendingDeletion] {
-        try db.query("SELECT * FROM pending_deletions WHERE mapping_id = ? ORDER BY path", [.text(mappingID)]).map { row in
+        try pendingDeletions(mappingID: mappingID, confirmed: nil)
+    }
+
+    private func pendingDeletions(mappingID: String, confirmed: Bool?) throws -> [PendingDeletion] {
+        var sql = "SELECT * FROM pending_deletions WHERE mapping_id = ?"
+        var arguments: [SQLValue] = [.text(mappingID)]
+        if let confirmed {
+            sql += " AND confirmed = ?"
+            arguments.append(.integer(confirmed ? 1 : 0))
+        }
+        sql += " ORDER BY path"
+        return try db.query(sql, arguments).map { row in
             guard let path = row.string("path"), let side = row.string("side").flatMap(PendingDeletion.Side.init(rawValue:)),
                   let kind = row.string("kind").flatMap(ItemKind.init(rawValue:)),
                   let plannedAt = row.date("planned_at") else {
@@ -793,47 +837,72 @@ public actor SyncStore {
 
     /// Liefert nur Pläne, die noch eine Benutzerentscheidung benötigen.
     public func pendingDeletionsAwaitingConfirmation(mappingID: String) throws -> [PendingDeletion] {
-        guard try meta(Self.deletionConfirmationKey(mappingID)) != "1" else { return [] }
-        return try pendingDeletions(mappingID: mappingID)
+        try pendingDeletions(mappingID: mappingID, confirmed: false)
     }
 
-    /// Liefert die persistent freigegebenen Löschungen. Die Freigabe bleibt bis
-    /// zum vollständig erfolgreichen Löschdurchgang bestehen.
+    /// Liefert die persistent freigegebenen Löschungen. Jede Freigabe bleibt
+    /// bestehen, bis genau diese Aktion erfolgreich abgeschlossen wurde oder
+    /// nach einer vollständigen Bestandsaufnahme nicht mehr anwendbar ist.
     public func confirmedPendingDeletions(mappingID: String) throws -> [PendingDeletion] {
-        guard try meta(Self.deletionConfirmationKey(mappingID)) == "1" else { return [] }
-        return try pendingDeletions(mappingID: mappingID)
+        try pendingDeletions(mappingID: mappingID, confirmed: true)
     }
 
     @discardableResult
     public func confirmPendingDeletions(mappingID: String) throws -> [PendingDeletion] {
         try db.transaction {
-            let pending = try pendingDeletions(mappingID: mappingID)
-            if pending.isEmpty {
-                try setMeta(Self.deletionConfirmationKey(mappingID), nil)
-            } else {
-                try setMeta(Self.deletionConfirmationKey(mappingID), "1")
-            }
-            return pending
+            try db.execute(
+                "UPDATE pending_deletions SET confirmed = 1 WHERE mapping_id = ? AND confirmed = 0",
+                [.text(mappingID)]
+            )
+            return try pendingDeletions(mappingID: mappingID, confirmed: true)
         }
     }
 
-    public func clearPendingDeletions(mappingID: String) throws {
+    /// Entfernt ausschließlich erledigte oder gegenstandslos gewordene
+    /// Freigaben und liefert den danach verbleibenden bestätigten Satz.
+    @discardableResult
+    public func consumeConfirmedPendingDeletions(
+        _ authorizations: Set<DeletionAuthorization>,
+        mappingID: String
+    ) throws -> [PendingDeletion] {
         try db.transaction {
-            try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
-            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
+            for authorization in authorizations {
+                try db.execute(
+                    """
+                    DELETE FROM pending_deletions
+                    WHERE mapping_id = ? AND path = ? AND side = ? AND kind = ? AND confirmed = 1
+                    """,
+                    [.text(mappingID), .text(authorization.path), .text(authorization.side.rawValue),
+                     .text(authorization.kind.rawValue)]
+                )
+            }
+            return try pendingDeletions(mappingID: mappingID, confirmed: true)
         }
+    }
+
+    public func clearPendingDeletionsAwaitingConfirmation(mappingID: String) throws {
+        try db.execute(
+            "DELETE FROM pending_deletions WHERE mapping_id = ? AND confirmed = 0",
+            [.text(mappingID)]
+        )
+    }
+
+    public func clearPendingDeletions(mappingID: String) throws {
+        try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
     }
 
     /// Verwirft einen bestätigungsbedürftigen Löschplan atomar: Entweder werden
     /// alle zugehörigen Baseline-Teilbäume und der Plan entfernt oder gar nichts.
     public func discardPendingDeletions(mappingID: String) throws {
-        let pending = try pendingDeletions(mappingID: mappingID)
+        let pending = try pendingDeletions(mappingID: mappingID, confirmed: false)
         try db.transaction {
             for item in pending {
                 try removeBaselineSubtree(path: item.path, mappingID: mappingID)
             }
-            try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
-            try setMeta(Self.deletionConfirmationKey(mappingID), nil)
+            try db.execute(
+                "DELETE FROM pending_deletions WHERE mapping_id = ? AND confirmed = 0",
+                [.text(mappingID)]
+            )
         }
     }
 

@@ -147,17 +147,14 @@ public struct PlannerInput: Sendable {
     public var openConflictPaths: Set<String>
     /// Lokales Dateisystem unterscheidet keine Groß-/Kleinschreibung (APFS-Standard).
     public var caseInsensitiveLocalFileSystem: Bool
-    /// Vom Benutzer bestätigte Löschungen (siehe Löschschutz). `nil` = keine Einschränkung.
-    public var allowedDeletions: Set<DeletionAuthorization>?
 
     public init(baseline: [String: BaselineEntry], local: LocalSnapshot, remote: RemoteSnapshot, openConflictPaths: Set<String> = [],
-                caseInsensitiveLocalFileSystem: Bool = true, allowedDeletions: Set<DeletionAuthorization>? = nil) {
+                caseInsensitiveLocalFileSystem: Bool = true) {
         self.baseline = baseline
         self.local = local
         self.remote = remote
         self.openConflictPaths = openConflictPaths
         self.caseInsensitiveLocalFileSystem = caseInsensitiveLocalFileSystem
-        self.allowedDeletions = allowedDeletions
     }
 }
 
@@ -434,15 +431,9 @@ public enum SyncPlanner {
             decisions[to] = .moveRemote(from: from, to: to, remote: r, local: l)
         }
 
-        // 5. Löschschutz: nur freigegebene Löschungen ausführen.
-        if let allowed = input.allowedDeletions {
-            for (p, a) in decisions where a.isDeletion && a.deletionAuthorization.map({ !allowed.contains($0) }) != false {
-                decisions[p] = nil
-                plan.skipped.append(.skip(path: p, reason: "Löschung wartet auf Bestätigung"))
-            }
-        }
-
-        // 6. In Phasen einsortieren.
+        // 5. In Phasen einsortieren. Die Engine trennt Löschungen anschließend
+        // zeilenweise in automatisch zulässige, bestätigte und zurückgehaltene
+        // Aktionen. So kann eine alte Freigabe keine späteren Löschungen filtern.
         for p in sortedPaths {
             guard let a = decisions[p] else { continue }
             switch a {

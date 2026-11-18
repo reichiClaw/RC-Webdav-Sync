@@ -68,9 +68,10 @@ Weitere Regeln:
 - **Eingefrorene Pfade**: offene Konflikte, gerade geschriebene Dateien,
   Case-Kollisionen und Pfade unter unvollständigen Server-Teilbäumen werden
   im Durchgang nicht angefasst.
-- **Bestätigte Löschungen** (`allowedDeletions`) begrenzen Löschaktionen nach
-  einer Nachfrage auf exakt die bestätigte Menge. Die Freigabe wird persistent
-  markiert und erst nach einer vollständig erfolgreichen Löschphase entfernt.
+- **Bestätigte Löschungen** (`confirmedDeletions`) gelten jeweils nur für die
+  bestätigte Kombination aus Pfad, Seite und Objektart. Erfolgreiche Aktionen
+  verbrauchen ihre Freigabe einzeln; neue Löschungen werden unabhängig davon
+  bewertet und gegebenenfalls separat angezeigt.
 
 ### Ausführungsreihenfolge
 
@@ -105,12 +106,16 @@ Bestätigung erforderlich, wenn eine der Bedingungen gilt:
   umbenannt/ausgehängt)
 
 Zurückgehaltene Löschungen landen in `pending_deletions`, überleben Neustarts
-und werden in der Übersicht mit Vorschau gezeigt. „Ausführen“ markiert die
-exakte Menge persistent als freigegeben; Verbindungsfehler, ein App-Neustart
-oder eine vorher zurückgestellte Übertragung verbrauchen diese Entscheidung
-nicht. Erst die vollständig erfolgreiche Löschphase entfernt Plan und
-Freigabe. „Verwerfen“ entfernt die Baseline der betroffenen Pfade, sodass die
-noch vorhandene Seite beim nächsten Durchgang als neu übertragen wird.
+und werden in der Übersicht mit Vorschau gezeigt. „Ausführen“ markiert jede
+Aktion über Pfad, Seite und Objektart persistent als freigegeben.
+Verbindungsfehler, ein App-Neustart oder eine vorher zurückgestellte Übertragung
+verbrauchen diese Entscheidung nicht. Erfolgreiche Aktionen werden einzeln
+entfernt; eine mangels atomarer Servergarantie blockierte Freigabe bleibt nur
+für genau diese Aktion bestehen. Neue Löschungen werden daneben separat
+angezeigt, und nach einer vollständigen Bestandsaufnahme gegenstandslos
+gewordene Freigaben werden verworfen. „Verwerfen“ entfernt die Baseline der
+noch unbestätigten Pfade, sodass die vorhandene Seite beim nächsten Durchgang
+als neu übertragen wird.
 
 Zusätzlich gilt unabhängig vom Guard: fehlender lokaler Stammordner → Pause;
 verlorene Datenbank → leere Baseline → keine Löschungen (alles wird als neu
@@ -135,7 +140,7 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 
 | Tabelle | Inhalt |
 |---|---|
-| `meta` | Schlüssel/Wert (z. B. Benutzerpause und persistente Löschfreigabe) |
+| `meta` | Schlüssel/Wert (z. B. Benutzerpause) |
 | `accounts` | Verbindungen (JSON-kodierte `AccountConfiguration`, ohne Passwort) |
 | `mappings` | Zuordnung Server-URL + lokaler Pfad → Baseline-Satz; `sync_token`, `last_successful_sync`, `remote_index_complete` |
 | `entries` | Baseline pro Mapping und Pfad |
@@ -144,7 +149,7 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 | `conflicts` | offene/erledigte Konflikte inkl. Konfliktkopie-Pfad |
 | `transfers` | Aktivitätsprotokoll (Zustand, Bytes, Fehler, Empfehlung) |
 | `queue` | geplante, noch nicht ausgeführte Aktionen (für Offline-Anzeige) |
-| `pending_deletions` | zurückgehaltene Löschungen |
+| `pending_deletions` | zurückgehaltene Löschungen mit Bestätigungsstatus pro Pfad, Seite und Objektart |
 | `upload_sessions` | Zustand unterbrochener Chunk-Uploads pro Mapping und Pfad; kurzlebige Zugangsdaten und signierte Upload-URLs werden nicht persistiert |
 | `shares` | Bereinigter lokaler Cache der Cloudreve-Freigaben; private Passwörter werden weder separat noch als URL-Pfadsegment gespeichert |
 
@@ -154,6 +159,8 @@ Geräte-/Inode-Identität und Ausschlussregeln. Ändert sich einer dieser Werte,
 entsteht ein leerer, sicher zusammenzuführender Stand; eine fremde oder alte
 Baseline wird nicht wiederverwendet. Schema 4 entfernt außerdem potenziell
 geheime Altwerte mit `secure_delete`, WAL-Checkpoint und `VACUUM`.
+Schema 5 trennt bestätigte und noch offene Löschungen zeilenweise, damit eine
+nicht ausführbare Freigabe keine späteren Löschungen verdeckt.
 
 ## 6. Dateisystem-Details
 

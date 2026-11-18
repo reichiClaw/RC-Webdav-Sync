@@ -19,21 +19,9 @@ final class SyncPlannerTests: XCTestCase {
 
     private func plan(baseline: [BaselineEntry] = [], local: [LocalItem] = [], remote: [RemoteItem] = [],
                       localComplete: Bool = true, remoteComplete: Bool = true, failedPrefixes: Set<String> = [],
-                      remoteCollisions: [String] = [], busy: Set<String> = [], openConflicts: Set<String> = [],
-                      allowedDeletions: Set<String>? = nil) -> SyncPlan {
+                      remoteCollisions: [String] = [], busy: Set<String> = [], openConflicts: Set<String> = []) -> SyncPlan {
         let localItems = Dictionary(uniqueKeysWithValues: local.map { ($0.path, $0) })
         let remoteItems = Dictionary(uniqueKeysWithValues: remote.map { ($0.path, $0) })
-        let authorizations = allowedDeletions.map { paths in
-            Set(paths.compactMap { path -> DeletionAuthorization? in
-                if let item = remoteItems[path], localItems[path] == nil {
-                    return DeletionAuthorization(path: path, kind: item.kind, side: .remote)
-                }
-                if let item = localItems[path], remoteItems[path] == nil {
-                    return DeletionAuthorization(path: path, kind: item.kind, side: .local)
-                }
-                return nil
-            })
-        }
         let input = PlannerInput(
             baseline: Dictionary(uniqueKeysWithValues: baseline.map { ($0.path, $0) }),
             local: LocalSnapshot(items: localItems, isComplete: localComplete, busyPaths: busy),
@@ -43,8 +31,7 @@ final class SyncPlannerTests: XCTestCase {
                 failedPrefixes: failedPrefixes,
                 collisions: remoteCollisions
             ),
-            openConflictPaths: openConflicts,
-            allowedDeletions: authorizations
+            openConflictPaths: openConflicts
         )
         return SyncPlanner.plan(input)
     }
@@ -188,22 +175,31 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertTrue(p.skipped.contains { $0.path == "über" })
     }
 
-    func testDeletionGuardFilter() {
-        let p = plan(baseline: [base("a.txt"), base("b.txt")], local: [], remote: [remote("a.txt"), remote("b.txt")], allowedDeletions: ["a.txt"])
-        XCTAssertEqual(p.deletions.count, 1)
-        XCTAssertEqual(p.deletions.first?.path, "a.txt")
+    func testDeletionActionsExposeScopedAuthorizations() {
+        let p = plan(
+            baseline: [base("a.txt"), base("b.txt")],
+            local: [],
+            remote: [remote("a.txt"), remote("b.txt")]
+        )
+        XCTAssertEqual(
+            Set(p.deletions.compactMap(\.deletionAuthorization)),
+            [
+                DeletionAuthorization(path: "a.txt", kind: .file, side: .remote),
+                DeletionAuthorization(path: "b.txt", kind: .file, side: .remote)
+            ]
+        )
     }
 
     func testDeletionApprovalCannotFlipFromLocalToRemoteSide() {
-        let input = PlannerInput(
-            baseline: ["a.txt": base("a.txt")],
-            local: LocalSnapshot(),
-            remote: RemoteSnapshot(items: ["a.txt": remote("a.txt")]),
-            allowedDeletions: [DeletionAuthorization(path: "a.txt", kind: .file, side: .local)]
+        let p = plan(baseline: [base("a.txt")], local: [], remote: [remote("a.txt")])
+        XCTAssertEqual(
+            p.deletions.first?.deletionAuthorization,
+            DeletionAuthorization(path: "a.txt", kind: .file, side: .remote)
         )
-        let p = SyncPlanner.plan(input)
-        XCTAssertTrue(p.deletions.isEmpty)
-        XCTAssertTrue(p.skipped.contains { $0.path == "a.txt" })
+        XCTAssertNotEqual(
+            p.deletions.first?.deletionAuthorization,
+            DeletionAuthorization(path: "a.txt", kind: .file, side: .local)
+        )
     }
 
     // MARK: Ordner

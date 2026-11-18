@@ -112,6 +112,31 @@ final class SyncStoreTests: XCTestCase {
         XCTAssertEqual(transfers.first?.state, .cancelled)
     }
 
+    func testConfirmedAndAwaitingDeletionPlansCoexist() async throws {
+        let store = try SyncStore.inMemory()
+        let mapping = try await store.mapping(for: account())
+        let confirmed = PendingDeletion(path: "alt.txt", kind: .file, side: .remote)
+        let awaiting = PendingDeletion(path: "neu.txt", kind: .file, side: .local)
+
+        try await store.replacePendingDeletions([confirmed], mappingID: mapping.id)
+        _ = try await store.confirmPendingDeletions(mappingID: mapping.id)
+        try await store.replacePendingDeletions([awaiting], mappingID: mapping.id)
+
+        var confirmedPaths = try await store.confirmedPendingDeletions(mappingID: mapping.id).map(\.path)
+        var awaitingPaths = try await store.pendingDeletionsAwaitingConfirmation(mappingID: mapping.id).map(\.path)
+        XCTAssertEqual(confirmedPaths, ["alt.txt"])
+        XCTAssertEqual(awaitingPaths, ["neu.txt"])
+
+        _ = try await store.consumeConfirmedPendingDeletions(
+            [DeletionAuthorization(confirmed)],
+            mappingID: mapping.id
+        )
+        confirmedPaths = try await store.confirmedPendingDeletions(mappingID: mapping.id).map(\.path)
+        awaitingPaths = try await store.pendingDeletionsAwaitingConfirmation(mappingID: mapping.id).map(\.path)
+        XCTAssertTrue(confirmedPaths.isEmpty)
+        XCTAssertEqual(awaitingPaths, ["neu.txt"])
+    }
+
     func testConflictAndBaselinePersistAtomically() async throws {
         let store = try SyncStore.inMemory()
         let mapping = try await store.mapping(for: account())
@@ -198,11 +223,46 @@ final class SyncStoreTests: XCTestCase {
         _ = try SyncStore(path: path)
 
         let verify = try SQLiteDatabase(path: path)
-        XCTAssertEqual(try verify.userVersion(), 4)
+        XCTAssertEqual(try verify.userVersion(), 5)
         XCTAssertEqual(try verify.query("SELECT COUNT(*) AS c FROM upload_sessions").first?.int("c"), 0)
         XCTAssertEqual(try verify.query("SELECT COUNT(*) AS c FROM shares").first?.int("c"), 0)
         let columns = Set(try verify.query("PRAGMA table_info(local_index)").compactMap { $0.string("name") })
         XCTAssertTrue(columns.isSuperset(of: ["file_id", "change_time"]))
+    }
+
+    func testSchemaFourDeletionConfirmationMigratesPerEntry() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("deletion-upgrade.sqlite").path
+        let legacy = try SQLiteDatabase(path: path)
+        try legacy.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        try legacy.execute("""
+        CREATE TABLE pending_deletions (
+            mapping_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            side TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            planned_at REAL NOT NULL,
+            PRIMARY KEY (mapping_id, path, side)
+        )
+        """)
+        try legacy.execute("INSERT INTO meta VALUES('confirmed-deletions.map', '1')")
+        try legacy.execute("INSERT INTO pending_deletions VALUES('map', 'alt.txt', 'remote', 'file', 1)")
+        try legacy.setUserVersion(4)
+
+        let store = try SyncStore(path: path)
+        let confirmed = try await store.confirmedPendingDeletions(mappingID: "map")
+        let awaiting = try await store.pendingDeletionsAwaitingConfirmation(mappingID: "map")
+
+        XCTAssertEqual(confirmed.map(\.path), ["alt.txt"])
+        XCTAssertTrue(awaiting.isEmpty)
+        let verify = try SQLiteDatabase(path: path)
+        XCTAssertEqual(try verify.userVersion(), 5)
+        XCTAssertEqual(
+            try verify.query("SELECT confirmed FROM pending_deletions").first?.int("confirmed"),
+            1
+        )
     }
 
     func testSchemaTwoMappingStartsSafeInitialMergeAfterKeyUpgrade() async throws {
