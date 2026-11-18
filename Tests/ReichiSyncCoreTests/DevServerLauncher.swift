@@ -13,7 +13,11 @@ import XCTest
 final class DevServerLauncher {
     let serverRoot: URL
     private(set) var port: Int = 0
+    #if os(Linux)
+    private var processID: pid_t?
+    #else
     private var process: Process?
+    #endif
 
     var davURL: URL { URL(string: "http://127.0.0.1:\(port)/dav/")! }
     var siteURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
@@ -34,8 +38,6 @@ final class DevServerLauncher {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"].first { FileManager.default.isExecutableFile(atPath: $0) }
         guard let python else { throw XCTSkip("python3 nicht verfügbar") }
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: python)
         var arguments = [script.path, "--root", serverRoot.path, "--port", "0", "--user", user, "--password", password] + extraArguments
         let readinessURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("reichi-devserver-ready-\(UUID().uuidString).log")
@@ -51,6 +53,54 @@ final class DevServerLauncher {
             try? readinessHandle.close()
             try? FileManager.default.removeItem(at: readinessURL)
         }
+
+        #if os(Linux)
+        // Foundation.Process verwendet unter swift-corelibs-foundation eine
+        // Dispatch-Source, deren Beenden sporadisch synchron auf ihre eigene
+        // Queue wartet. POSIX spawn/waitpid vermeidet diesen Laufzeitfehler.
+        var errorHandle: FileHandle?
+        let standardErrorFD: Int32
+        if let logPath = ProcessInfo.processInfo.environment["REICHI_DEVSERVER_LOG"] {
+            if !FileManager.default.fileExists(atPath: logPath) {
+                _ = FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            guard let handle = FileHandle(forWritingAtPath: logPath) else {
+                throw NSError(
+                    domain: "de.reichi.sync.tests",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Testserver-Protokoll konnte nicht geöffnet werden"]
+                )
+            }
+            handle.seekToEndOfFile()
+            errorHandle = handle
+            standardErrorFD = handle.fileDescriptor
+        } else {
+            arguments.append("--quiet")
+            standardErrorFD = open("/dev/null", O_WRONLY)
+            guard standardErrorFD >= 0 else {
+                throw NSError(
+                    domain: "de.reichi.sync.tests",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Null-Ausgabe für den Testserver konnte nicht geöffnet werden"]
+                )
+            }
+        }
+        defer {
+            if let errorHandle {
+                try? errorHandle.close()
+            } else {
+                _ = close(standardErrorFD)
+            }
+        }
+        processID = try Self.spawn(
+            executable: python,
+            arguments: arguments,
+            standardOutputFD: readinessHandle.fileDescriptor,
+            standardErrorFD: standardErrorFD
+        )
+        #else
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: python)
         proc.standardOutput = readinessHandle
         // REICHI_DEVSERVER_LOG=/pfad/datei.log protokolliert die Serveranfragen (Fehlersuche).
         if let logPath = ProcessInfo.processInfo.environment["REICHI_DEVSERVER_LOG"] {
@@ -66,6 +116,7 @@ final class DevServerLauncher {
         proc.arguments = arguments
         try proc.run()
         process = proc
+        #endif
 
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
@@ -75,7 +126,11 @@ final class DevServerLauncher {
                 port = p
                 return
             }
+            #if os(Linux)
+            if !linuxProcessIsRunning() { break }
+            #else
             if !proc.isRunning { break }
+            #endif
             usleep(50_000)
         }
         stop()
@@ -86,7 +141,94 @@ final class DevServerLauncher {
         )
     }
 
+    #if os(Linux)
+    private static func spawn(
+        executable: String,
+        arguments: [String],
+        standardOutputFD: Int32,
+        standardErrorFD: Int32
+    ) throws -> pid_t {
+        var actions = posix_spawn_file_actions_t()
+        var code = posix_spawn_file_actions_init(&actions)
+        guard code == 0 else { throw spawnError(code) }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+
+        code = posix_spawn_file_actions_adddup2(&actions, standardOutputFD, STDOUT_FILENO)
+        guard code == 0 else { throw spawnError(code) }
+        code = posix_spawn_file_actions_adddup2(&actions, standardErrorFD, STDERR_FILENO)
+        guard code == 0 else { throw spawnError(code) }
+        if standardOutputFD != STDOUT_FILENO {
+            code = posix_spawn_file_actions_addclose(&actions, standardOutputFD)
+            guard code == 0 else { throw spawnError(code) }
+        }
+        if standardErrorFD != STDERR_FILENO, standardErrorFD != standardOutputFD {
+            code = posix_spawn_file_actions_addclose(&actions, standardErrorFD)
+            guard code == 0 else { throw spawnError(code) }
+        }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = ([executable] + arguments).map { strdup($0) }
+        guard !argv.contains(where: { $0 == nil }) else {
+            for case let value? in argv { free(value) }
+            throw spawnError(ENOMEM)
+        }
+        argv.append(nil)
+        defer {
+            for case let value? in argv { free(value) }
+        }
+
+        var pid: pid_t = 0
+        code = executable.withCString { executablePath in
+            argv.withUnsafeMutableBufferPointer { buffer in
+                posix_spawn(&pid, executablePath, &actions, nil, buffer.baseAddress!, environ)
+            }
+        }
+        guard code == 0 else { throw spawnError(code) }
+        return pid
+    }
+
+    private static func spawnError(_ code: Int32) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(code))]
+        )
+    }
+
+    private func linuxProcessIsRunning() -> Bool {
+        guard let processID else { return false }
+        var status: Int32 = 0
+        let result = waitpid(processID, &status, WNOHANG)
+        if result == 0 { return true }
+        if result == -1, errno == EINTR { return true }
+        self.processID = nil
+        return false
+    }
+    #endif
+
     func stop() {
+        #if os(Linux)
+        if let processID {
+            _ = kill(processID, SIGTERM)
+            let deadline = Date().addingTimeInterval(2)
+            var reaped = false
+            while Date() < deadline {
+                var status: Int32 = 0
+                let result = waitpid(processID, &status, WNOHANG)
+                if result == processID || (result == -1 && errno == ECHILD) {
+                    reaped = true
+                    break
+                }
+                if result == -1, errno != EINTR { break }
+                usleep(20_000)
+            }
+            if !reaped {
+                _ = kill(processID, SIGKILL)
+                var status: Int32 = 0
+                while waitpid(processID, &status, 0) == -1, errno == EINTR {}
+            }
+            self.processID = nil
+        }
+        #else
         if let process {
             let pid = process.processIdentifier
             if pid > 0 {
@@ -99,17 +241,8 @@ final class DevServerLauncher {
                 if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
             }
         }
-        // `Process.waitUntilExit()` kann in swift-corelibs-foundation von
-        // dessen eigener Dispatch-Source aus synchron auf dieselbe Queue
-        // warten und sporadisch mit __DISPATCH_WAIT_FOR_QUEUE__ abbrechen.
-        // Foundation erntet den signalisierten Kindprozess asynchron.
-        #if os(Linux)
-        // Auch `Process.deinit` enthält dort denselben synchronen Queue-Wait.
-        // Das kleine Testobjekt bleibt deshalb bis zum Ende des Testprozesses
-        // absichtlich erhalten; der bereits signalisierte Python-Prozess nicht.
-        if let process { _ = Unmanaged.passRetained(process) }
-        #endif
         process = nil
+        #endif
         try? FileManager.default.removeItem(at: serverRoot)
     }
 
