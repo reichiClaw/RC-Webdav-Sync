@@ -11,6 +11,8 @@ Zuständen, Datenmodell und Sicherheitsmaßnahmen.
 | `SyncEngine` | `actor` | eigener Actor; genau ein Durchgang zur Zeit, weitere Anfragen werden zusammengefasst (`rerunRequested`) |
 | `SyncStore` | `actor` über `SQLiteDatabase` | serialisiert alle DB-Zugriffe; WAL-Modus |
 | `WebDAVClient` | `final class, Sendable` | zustandslos bis auf URLSession; alle Aufrufe `async` |
+| `CloudreveAPIClient` | `final class, @unchecked Sendable` | hält Token-Paar hinter `NSLock`; genau ein Refresh zur Zeit; 401 → einmaliger Refresh + Wiederholung |
+| `CloudreveUploadTransport` | `final class` (`ResumableUploadTransport`) | wird von der Engine für Uploads ≥ Schwelle aufgerufen; persistiert den Chunk-Fortschritt im `SyncStore` |
 | `LocalScanner`, `SyncPlanner` | `struct`, reine Funktionen | laufen in `Task.detached` bzw. im Engine-Actor |
 | `FolderWatcher`, `ConnectivityMonitor` | Klassen mit eigener Dispatch-Queue | melden nur „es gibt Änderungen“ an die Engine |
 
@@ -126,7 +128,7 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 
 „Synchronisiert“ wird also nur angezeigt, wenn tatsächlich nichts offen ist.
 
-## 5. Datenbankschema (SQLite, `user_version = 1`)
+## 5. Datenbankschema (SQLite, `user_version = 2`)
 
 | Tabelle | Inhalt |
 |---|---|
@@ -140,6 +142,8 @@ zusammengeführt); unvollständige Server-Listings → betroffene Teilbäume
 | `transfers` | Aktivitätsprotokoll (Zustand, Bytes, Fehler, Empfehlung) |
 | `queue` | geplante, noch nicht ausgeführte Aktionen (für Offline-Anzeige) |
 | `pending_deletions` | zurückgehaltene Löschungen |
+| `upload_sessions` | (v2) Zustand unterbrochener Chunk-Uploads pro Mapping und Pfad (JSON `ResumableUploadState`: Sitzung, Chunk-Größe, bestätigte Chunks, Größe/mtime/Hash, Ablauf, Richtlinie) |
+| `shares` | (v2) lokaler Cache der Cloudreve-Freigaben pro Verbindung (Anzeige auch ohne gültige API-Sitzung) |
 
 Ändert sich Server-URL oder lokaler Ordner, entsteht ein neues Mapping; die
 alte Baseline wird nicht wiederverwendet (keine fehlerhaften Löschungen).
@@ -178,3 +182,12 @@ alte Baseline wird nicht wiederverwendet (keine fehlerhaften Löschungen).
 - App Sandbox mit `files.user-selected.read-write` + Security-Scoped Bookmarks
   für den Sync-Ordner; Datenbank/Logs/Wiederherstellung im Container.
 - Cookies/Cache deaktiviert; ephemerale `URLSession`.
+- Cloudreve: Das Konto-Passwort wird nach der Anmeldung verworfen. Im
+  Schlüsselbund liegen nur die JWT-Tokens (Eintrag `<account>.cloudreve`,
+  JSON) und das Passwort des von der App angelegten WebDAV-Kontos. Tokens
+  werden im `SyncLogger` als Secrets registriert. API-Aufrufe gehen nur an
+  den konfigurierten Site-Host; Umleitungen werden abgelehnt.
+- Chunk-Upload: Vor jedem Chunk wird geprüft, dass die lokale Datei
+  (Größe/mtime) unverändert ist; sonst wird die Sitzung serverseitig
+  gelöscht. Server-URIs werden aus validierten relativen Pfaden erzeugt
+  (`CloudreveURI.fileURI` → `RelativePath.segments`), nie umgekehrt.

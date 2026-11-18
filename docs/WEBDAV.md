@@ -28,6 +28,7 @@
 | `Scripts/dev-webdav-server.py` (Python-stdlib, Klasse 1, starke ETags, Basic Auth) | echte HTTP-Tests: Capabilities, 401, If-Match/If-None-Match-Zyklus, kompletter Engine-Lauf | bestanden auf Linux |
 | Nextcloud / ownCloud | **nicht in dieser Umgebung getestet**; 207-Parser mit Nextcloud-Fixture (`Tests/…/Fixtures/nextcloud-propfind.xml`) geprüft; `OC-ETag`, `X-OC-Mtime`, `oc:`-Props, sync-collection-Format berücksichtigt | Verifikation auf einem Mac gegen eine echte Instanz empfohlen |
 | Apache `mod_dav`, Synology, Nginx DAV | nicht getestet; nur Klasse-1-Funktionen vorausgesetzt | sollten funktionieren, da keine Erweiterungen verlangt werden |
+| Cloudreve v4 (Emulation `dev-webdav-server.py --cloudreve`) | Erkennung, Login/2FA/Refresh, WebDAV-Konten, Chunk-Upload inkl. Wiederaufnahme/Ablauf/Versionsprüfung, Freigaben, Engine-Integration (14 Tests) | bestanden auf Linux; **echte Instanz existiert noch nicht** – siehe Abschnitt Cloudreve |
 
 ## Bekannte Grenzen
 
@@ -77,3 +78,92 @@
 - `X-OC-Mtime` setzt das Modifikationsdatum serverseitig.
 - `sync-collection` liefert `sync-token` als `http://sabre.io/ns/sync/<n>`;
   gelöschte Einträge kommen als `404`-Responses.
+
+## Cloudreve (Standardserver reichi.cloud)
+
+reichi Sync behandelt Cloudreve als WebDAV-Server mit Zusatzfunktionen. Die
+Implementierung folgt dem Quellcode von Cloudreve v4 (`pkg/webdav`,
+`service/explorer`, `pkg/serializer/error.go`) und der API-Dokumentation
+(`docs.cloudreve.org`), da zum Zeitpunkt der Entwicklung keine Instanz zum
+Testen verfügbar war. Alle Punkte mit **Annahme** sollten beim ersten Lauf
+gegen `https://reichi.cloud` bestätigt werden.
+
+### Was läuft über WebDAV, was über die REST-API
+
+| Aufgabe | Weg |
+|---|---|
+| Listing (PROPFIND), Download (GET), Löschen, Verschieben, MKCOL, kleine Uploads (PUT) | WebDAV `https://<site>/dav/…` mit dem von reichi Sync angelegten WebDAV-Konto (Benutzername = E-Mail, generiertes Passwort) |
+| Anmeldung, Token-Erneuerung | `POST /api/v4/session/token`, `…/2fa`, `…/refresh` (JWT-Paar, Access ≈ 1 h, Refresh ≈ 180 d) |
+| WebDAV-Konten lesen/anlegen, Server-Ordner anlegen | `GET/PUT /api/v4/devices/dav`, `POST /api/v4/file/create` |
+| Uploads ab Schwelle (Standard 8 MB) | `PUT /api/v4/file/upload` (Sitzung) + `POST /api/v4/file/upload/{session}/{index}` (Chunks) |
+| Freigaben | `PUT/GET /api/v4/share`, `DELETE /api/v4/share/{id}` |
+
+### Erkennung
+
+`GET <site>/api/v4/site/ping` antwortet mit `{"code":0,"data":"<version>"}`.
+Dann gilt `serverKind = .cloudreve` und `honorsIfMatch = false`.
+
+### `If-Match` wird ignoriert
+
+Cloudreve wertet `If-Match`/`If-None-Match` bei `PUT`, `DELETE` und `MOVE`
+nicht aus (die Header werden im Handler nicht gelesen). Die Engine erkennt das
+über `WebDAVCapabilities.supportsConditionalWrites == false` und prüft vor
+Überschreiben/Löschen per `PROPFIND`, ob der Server-Validator noch dem
+erwarteten entspricht (kleines Zeitfenster, in dem eine parallele Änderung
+nicht erkannt würde). Beim Chunk-Upload schließt `previous` (Entity-ID des
+bekannten ETags) dieses Fenster serverseitig: stimmt die Version nicht, kommt
+Code `40076 Stale version` → Konflikt wie bei `412`.
+
+### Chunked und fortsetzbare Uploads
+
+1. `PUT /api/v4/file/upload` mit `{uri, size, last_modified, entity_type:
+   "version" (beim Überschreiben), previous}` → `session_id`, `chunk_size`
+   (0 = alles in einer Anfrage), `expires`, `storage_policy{type, relay}`.
+2. Chunks werden sequenziell als `application/octet-stream` an
+   `POST /api/v4/file/upload/{session}/{index}` gesendet; `Content-Length` muss
+   `chunk_size` entsprechen (letzter Chunk kürzer). Cloudreve schreibt jeden
+   Chunk am Offset `index × chunk_size`; ein wiederholter Index ist idempotent.
+   Nach dem letzten Chunk ist die Datei fertig (kein eigener Abschluss-Aufruf).
+3. Nach jedem bestätigten Chunk speichert reichi Sync den Zustand
+   (`upload_sessions`: Sitzung, Chunks, Größe, mtime, Hash, Ablauf). Bricht die
+   Übertragung ab, setzt der nächste Durchgang **am ersten unbestätigten Chunk**
+   fort – sofern die Datei unverändert ist und die Sitzung noch > 2 min gültig
+   ist. Sonst wird die Sitzung verworfen (`DELETE /api/v4/file/upload`) und neu
+   begonnen. `40011` (Sitzung abgelaufen), `40012`/`40013` (Chunk-Fehler) führen
+   zu genau einem Neustart.
+4. Ändert sich die lokale Datei zwischen zwei Chunks, wird die Sitzung
+   gelöscht und die Datei im nächsten Durchgang neu bewertet (kein
+   Mischzustand auf dem Server).
+5. Nach Abschluss wird die neue Version per `PROPFIND` gelesen (ETag =
+   Entity-ID) und in die Baseline übernommen.
+
+**Unterstützte Speicherrichtlinien:** `local` sowie jede Richtlinie mit
+`relay = true` (Chunks gehen an Cloudreve selbst) und `remote` ohne Relay
+(Chunks an `upload_urls[0]?chunk=N` mit `Authorization: <credential>`,
+**Annahme**, nicht emuliert). Richtlinien mit direktem Upload zu S3, OneDrive,
+Qiniu, OSS, COS, Upyun werden **nicht** unterstützt → Rückfall auf WebDAV-PUT
+in einer Anfrage (ohne Fortsetzung).
+
+### Annahmen, die gegen eine echte Instanz zu bestätigen sind
+
+- ETag der WebDAV-Antworten ist `"<hashid(entity)>"` und ändert sich mit jeder
+  neuen Version (laut Quellcode).
+- `GET /api/v4/devices/dav` liefert `password` im Klartext für bestehende
+  Konten (laut API-Beschreibung); sonst muss der Assistent immer ein neues
+  Konto anlegen.
+- `PUT /api/v4/share` liefert als `data` die vollständige Link-URL
+  (`<site>/s/<id>[/<passwort>]`).
+- Fehlercodes entsprechen `pkg/serializer/error.go` (40004, 40011, 40012,
+  40013, 40016, 40020, 40022, 40044, 40051, 40076, 40077).
+- WebDAV-Konten mit Wurzel `cloudreve://my/<Ordner>` bilden den Ordner auf
+  `/dav/` ab (relativer Root).
+
+### Grenzen
+
+- Kein paralleler Chunk-Versand (`chunk_concurrency` wird ignoriert;
+  sequenziell ist für die Wiederaufnahme am einfachsten und robust).
+- Keine Ordner-Freigaben mit eigenem Berechtigungsmodell; es werden nur
+  Cloudreve-Share-Links erzeugt.
+- Läuft das Refresh-Token ab (≈ 180 Tage ohne Nutzung) oder wird es serverseitig
+  widerrufen, bleibt der WebDAV-Abgleich aktiv; Chunk-Upload und Freigaben
+  benötigen eine erneute Anmeldung in den Einstellungen.

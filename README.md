@@ -1,9 +1,15 @@
 # reichi Sync
 
 Native macOS-App (macOS 14+, Apple Silicon und Intel), die einen lokalen Ordner
-bidirektional mit einem WebDAV-Server (z. B. Nextcloud, ownCloud, Apache mod_dav,
-Synology) synchronisiert. Die App läuft als Menüleisten-Programm; das Hauptfenster
-zeigt Übersicht, Aktivität, Konflikte und Einstellungen.
+bidirektional mit **Cloudreve** (Standardserver `https://reichi.cloud`) oder einem
+beliebigen WebDAV-Server (Nextcloud, ownCloud, Apache mod_dav, Synology …)
+synchronisiert. Die App läuft als Menüleisten-Programm; das Hauptfenster zeigt
+Übersicht, Aktivität, Konflikte, Freigaben und Einstellungen.
+
+Mit Cloudreve kommen hinzu: **Chunked und fortsetzbare Uploads** über die
+Cloudreve-Upload-API (Abbrüche werden an der letzten bestätigten Stelle
+fortgesetzt), automatische Bereitstellung eines WebDAV-Kontos pro Gerät und
+**Freigabelinks** (mit Passwort, Ablauf, Download-Limit) direkt aus der App.
 
 Oberste Regeln der Implementierung:
 
@@ -103,8 +109,9 @@ Deshalb gilt:
 
 | Bereich | Status |
 |---|---|
-| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **84 Tests, 0 Fehler** |
+| `ReichiSyncCore` (Engine, Planner, WebDAV-Client, Parser, SQLite-Store, Scanner, Cloudreve-Client, Chunk-Upload) | **Gebaut und getestet auf Linux**: `swift build`, `swift test` → **98 Tests, 0 Fehler** |
 | Integrationstests gegen WebDAV-Testumgebung | **Ausgeführt**: Fake-Server-Actor (alle 13 Sync-Szenarien aus der Anforderung) **und** echter HTTP-Server (`Scripts/dev-webdav-server.py`) inkl. 401-Behandlung, If-Match/If-None-Match, kompletter Engine-Lauf über HTTP |
+| Cloudreve-Integration | **Gegen Emulation getestet** (`dev-webdav-server.py --cloudreve`, gebaut nach Cloudreve-v4-Quellcode und API-Dokumentation): Login/2FA/Token-Refresh, WebDAV-Konten, Chunk-Upload, **Wiederaufnahme ohne erneutes Senden bestätigter Chunks**, abgelaufene Sitzung, lokale Änderung während des Uploads, Versionsprüfung (`previous`), Freigaben, Engine-Schwelle. **Eine echte Cloudreve-Instanz existiert noch nicht** – der erste Lauf gegen reichi.cloud muss die Annahmen in `docs/WEBDAV.md` (Abschnitt Cloudreve) bestätigen. |
 | `ReichiSync` (SwiftUI/AppKit-App, Menüleiste, Services) | **Geschrieben, auf Linux nur syntaktisch geprüft (`swiftc -parse`)**. Typprüfung, Build und manueller Test müssen auf einem Mac erfolgen (Schritte unten). |
 | `project.yml` (XcodeGen), `Scripts/build-app.sh`, Entitlements, Info.plist, Icon | Erstellt; App-Icon-PNGs generiert und geprüft. Nicht auf macOS ausgeführt. |
 | Szenario 14 (Fenster schließen → App läuft in Menüleiste weiter) | Implementiert in `AppDelegate.applicationShouldTerminateAfterLastWindowClosed` + `LSUIElement`; nur auf macOS prüfbar. |
@@ -129,7 +136,12 @@ open ReichiSync.xcodeproj      # Schema „ReichiSync“, ⌘R; Tests mit ⌘U
 
 # 4) Lokalen WebDAV-Testserver starten (Python 3, keine Abhängigkeiten)
 python3 Scripts/dev-webdav-server.py --root /tmp/dav --prefix /dav --port 8080 --user test --password test
-# In der App: http://127.0.0.1:8080/dav/  (localhost darf ohne TLS verwendet werden)
+# In der App (Modus „Anderer WebDAV-Server“): http://127.0.0.1:8080/dav/
+
+# 5) Cloudreve-Emulation starten (API unter /api/v4, WebDAV unter /dav, Chunks à 1 MB)
+python3 Scripts/dev-webdav-server.py --cloudreve --chunk-size 1048576 --root /tmp/cr --port 8080 \
+    --user test@example.org --password test          # optional: --twofa 123456
+# In der App (Modus „reichi.cloud / Cloudreve“): Server http://127.0.0.1:8080, E-Mail test@example.org
 ```
 
 Manuelle Prüfpunkte in der App (Erwartung in Klammern):
@@ -156,6 +168,15 @@ Manuelle Prüfpunkte in der App (Erwartung in Klammern):
    *Systemeinstellungen › Allgemein › Anmeldeobjekte*.
 9. „Beenden“ aus dem Menü → App wartet auf laufende Aktion, speichert Zustand,
    beendet sich; Neustart zeigt vorherige Listen und offene Konflikte.
+10. **Cloudreve**: Einrichtung mit E-Mail/Passwort (ggf. 2FA-Code), Server-Ordner
+    wählen → WebDAV-Konto „reichi Sync (<Mac>)“ erscheint in Cloudreve unter
+    *Verbinden & Zugriff*. Datei > 8 MB in den Ordner legen → „Aktivität“ zeigt
+    Upload mit Fortschritt; während des Uploads WLAN trennen → Fehler, nach
+    Wiederverbindung setzt der nächste Durchgang ab dem letzten Chunk fort
+    (Protokoll: „Upload von … wird fortgesetzt (Chunk n/m)“).
+11. **Freigaben**: Bereich „Freigaben“ → „+“ → Datei wählen, optional Passwort/
+    Ablauf/Limit → Link wird angezeigt und kopiert; Kontextmenü in „Aktivität“
+    („Link teilen …“) und Menüleiste („Link teilen …“) führen zum gleichen Dialog.
 
 ---
 
@@ -205,10 +226,15 @@ swift test --filter WebDAVClientHTTPTests   # echter HTTP-Server (Python 3 nöti
 
 ## Benutzung
 
-1. **Einrichtung**: Beim ersten Start erscheint der Assistent (Server-URL,
-   Benutzer/Passwort, lokaler Ordner, Verbindungstest, Zusammenfassung). Das
-   Passwort wandert in den Schlüsselbund (Service `de.reichi.sync`), der
-   Ordnerzugriff wird als Security-Scoped Bookmark gespeichert.
+1. **Einrichtung**: Beim ersten Start erscheint der Assistent. Standard ist
+   **reichi.cloud / Cloudreve**: Server (vorbelegt `https://reichi.cloud`),
+   E-Mail und Passwort, ggf. 2FA-Code, Server-Ordner (neu anlegen oder
+   vorhandenes WebDAV-Konto), lokaler Ordner. reichi Sync legt über die
+   Cloudreve-API ein eigenes WebDAV-Konto für dieses Gerät an; das
+   Cloudreve-Passwort wird **nicht** gespeichert, im Schlüsselbund liegen nur
+   die Sitzungs-Tokens und das WebDAV-Passwort. Alternativ „Anderer
+   WebDAV-Server“ (URL, Benutzer/Passwort, Verbindungstest). Der Ordnerzugriff
+   wird als Security-Scoped Bookmark gespeichert.
 2. **Menüleiste**: Symbol je Zustand
    – ✓ synchronisiert, ⟳ läuft, Wi-Fi-durchgestrichen offline, ‖ pausiert,
    ⚠ Konflikte, ! Aufmerksamkeit (Fehler/Anmeldung/Bestätigung).
@@ -218,8 +244,10 @@ swift test --filter WebDAVClientHTTPTests   # echter HTTP-Server (Python 3 nöti
 3. **Hauptfenster**: Übersicht (Status, Kennzahlen, Verbindung, Diagnose),
    Aktivität (Transfers mit Filter, Fehlerdetails, Wiederholen), Konflikte
    (beide Versionen, „Beide behalten / Lokale Version verwenden /
-   Serverversion verwenden“), Einstellungen (Verbindung, Ordner, Intervall,
-   Ausschlüsse, Login-Item, Benachrichtigungen, Dock-Symbol).
+   Serverversion verwenden“), Freigaben (nur Cloudreve: Links erstellen,
+   kopieren, löschen), Einstellungen (Verbindung, Ordner, Intervall,
+   Chunk-Upload-Schwelle, Ausschlüsse, Login-Item, Benachrichtigungen,
+   Dock-Symbol, erneute Cloudreve-Anmeldung).
 4. **Wiederherstellung gelöschter Dateien**: Lokale Löschungen durch die App
    landen im macOS-Papierkorb. Falls das nicht möglich ist, im
    Wiederherstellungsbereich `~/Library/Containers/de.reichi.sync/Data/Library/Application Support/reichi Sync/Wiederherstellung/<Zeitstempel>/…`
@@ -256,6 +284,11 @@ Punkte, die die Anforderung offen ließ, wurden so entschieden:
 | Abfrageintervall | 60 s Standard, 30 s bis 15 min wählbar; zusätzlich Trigger bei Start, Aufwachen, Netzwerkrückkehr, FSEvents, manuell. |
 | Dock-Symbol | Standardmäßig reines Menüleisten-Programm (`LSUIElement`), optional Dock-Symbol in den Einstellungen. |
 | Speicherplatz | Downloads werden vor dem Start gegen freien Platz (+200 MB Reserve) geprüft; bei Platzmangel Pause mit Hinweis. |
+| Cloudreve-Anbindung | Hybrid: Listing/Download/Löschen/Verschieben über WebDAV (`/dav/`), nur Login, WebDAV-Konto-Anlage, Chunk-Upload und Freigaben über die REST-API (`/api/v4`). Fällt die API aus (Sitzung abgelaufen), läuft der Abgleich per WebDAV-PUT weiter. |
+| Chunk-Upload-Schwelle | Standard 8 MB (1–128 MB wählbar, abschaltbar). Zustand pro Datei in `upload_sessions` (Sitzung, bestätigte Chunks, Größe/mtime/Hash); Fortsetzung nur bei unveränderter Datei und > 2 min Restlaufzeit der Sitzung, sonst Neustart. |
+| Cloudreve `If-Match` | Cloudreve wertet `If-Match` beim PUT nicht aus (Quellcode `pkg/webdav`). Erkannt per `GET /api/v4/site/ping` → `honorsIfMatch = false`; die Engine prüft dann vor Überschreiben/Löschen per PROPFIND und nutzt beim Chunk-Upload `previous` (Entity-ID = ETag) als serverseitige Versionsprüfung. |
+| Freigaben | Nur Einträge innerhalb des Sync-Ordners; Passwort alphanumerisch ≤ 32 Zeichen (Cloudreve-Vorgabe), Ablauf 1 h–30 d, Download-Limit; Link inkl. Passwort-Teil `…/s/<id>/<pw>` wird kopiert. Lokaler Cache der Freigaben in `shares`. |
+| App-Icon | Vorlage `Design/logo.png` (256 px) auf heller macOS-Kachel mit Verlauf/Schatten (`Scripts/generate-icon.py`). Für gestochen scharfe 1024-px-Varianten sollte eine höher aufgelöste Vorlage nachgereicht werden. |
 
 ---
 
@@ -270,11 +303,13 @@ Sources/ReichiSyncCore/
   Util/                        RelativePath, ExclusionRules, SHA256, SyncLogger
   Persistence/                 SQLiteDatabase, SyncStore (actor)
   WebDAV/                      WebDAVClient, MultiStatusParser, Modelle/Fehler
+  Cloudreve/                   CloudreveAPIClient (Login, Tokens, DAV-Konten, Upload-API, Freigaben), ResumableUpload
   Local/                       LocalFileSystem, LocalScanner
   Sync/                        SyncPlanner, SyncEngine, RemoteEnumerator, RetryPolicy, SyncStatus
 Sources/ReichiSyncApp/         macOS-App (SwiftUI/AppKit), Services, Views, Ressourcen
 Tests/ReichiSyncCoreTests/     Unit-, Integrations- und HTTP-Tests, Fixtures, FakeWebDAVServer
-Scripts/dev-webdav-server.py   WebDAV-Testserver (Python 3, stdlib)
+Scripts/dev-webdav-server.py   WebDAV-Testserver (Python 3, stdlib); --cloudreve emuliert die Cloudreve-API
+Design/                        Icon-Vorlage (logo.png) und 1024-px-Master
 Scripts/build-app.sh           .app-Bundle aus SwiftPM-Build
 Scripts/generate-icon.py       App-Icon-PNGs erzeugen
 docs/ARCHITECTURE.md           Entscheidungstabelle, Zustände, Datenmodell
@@ -287,5 +322,5 @@ docs/SIGNING.md                Signierung, Notarisierung, Sandbox
 ## Weitere Dokumente
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) – Drei-Wege-Entscheidungstabelle, Zustandsmodell, Datenbankschema, Sicherheitsmaßnahmen
-- [`docs/WEBDAV.md`](docs/WEBDAV.md) – unterstützte WebDAV-Funktionen, getestete Server, bekannte Grenzen
+- [`docs/WEBDAV.md`](docs/WEBDAV.md) – unterstützte WebDAV-Funktionen, getestete Server, bekannte Grenzen, **Cloudreve-Abschnitt** (Upload-API, Annahmen, Grenzen)
 - [`docs/SIGNING.md`](docs/SIGNING.md) – Signierung, Notarisierung, Hinweise zur Sandbox
