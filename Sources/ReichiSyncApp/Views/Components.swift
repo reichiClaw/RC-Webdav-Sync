@@ -166,7 +166,7 @@ struct DiagnosticsView: View {
                         ForEach(model.logEntries.suffix(200).reversed()) { entry in
                             Text("\(entry.date.formatted(date: .omitted, time: .standard)) [\(entry.level.rawValue)] \(entry.category): \(entry.message)")
                                 .font(.caption.monospaced())
-                                .foregroundStyle(entry.level >= .warning ? .orange : .secondary)
+                                .foregroundStyle(entry.level >= .warning ? Color.orange : Color.secondary)
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }

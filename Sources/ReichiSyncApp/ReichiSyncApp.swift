@@ -6,6 +6,7 @@ import ReichiSyncCore
 struct ReichiSyncApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("reichi Sync", id: "main") {
@@ -14,6 +15,7 @@ struct ReichiSyncApp: App {
                 .frame(minWidth: 760, minHeight: 500)
                 .task {
                     appDelegate.model = model
+                    model.openMainWindowHandler = { openWindow(id: "main") }
                     await model.bootstrap()
                 }
         }
@@ -63,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            NotificationCenter.default.post(name: .reichiOpenMainWindow, object: nil)
+            model?.showMainWindow()
         }
         return true
     }

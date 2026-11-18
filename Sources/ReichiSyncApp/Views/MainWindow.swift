@@ -55,10 +55,6 @@ struct MainWindow: View {
         } message: {
             Text(model.presentedError ?? "")
         }
-        .onReceive(NotificationCenter.default.publisher(for: .reichiOpenMainWindow)) { _ in
-            NSApp.activate(ignoringOtherApps: true)
-            NSApp.windows.first(where: { $0.title == "reichi Sync" })?.makeKeyAndOrderFront(nil)
-        }
     }
 
     private func badge(for section: AppModel.Section) -> Int? {
@@ -361,7 +357,7 @@ struct TransferRow: View {
                 if !compact, let message = transfer.errorMessage {
                     Text(message)
                         .font(.caption)
-                        .foregroundStyle(transfer.state == .failed ? .red : .secondary)
+                        .foregroundStyle(transfer.state == .failed ? Color.red : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     if let detail = transfer.errorDetail {
                         Text(detail)

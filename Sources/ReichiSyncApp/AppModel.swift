@@ -403,23 +403,22 @@ final class AppModel: ObservableObject {
 
     // MARK: - Fenster
 
+    /// Wird von der App-Struktur gesetzt (`openWindow(id: "main")`).
+    var openMainWindowHandler: (() -> Void)?
+
     func showMainWindow(section: Section? = nil) {
         if let section { selectedSection = section }
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true || $0.title == "reichi Sync" }) {
+        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("main") == true || $0.title == "reichi Sync" }), window.isVisible {
             window.makeKeyAndOrderFront(nil)
         } else {
-            NotificationCenter.default.post(name: .reichiOpenMainWindow, object: nil)
+            openMainWindowHandler?()
         }
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func quit() {
         NSApp.terminate(nil)
     }
-}
-
-extension Notification.Name {
-    static let reichiOpenMainWindow = Notification.Name("de.reichi.sync.openMainWindow")
 }
 
 extension SyncStatus {

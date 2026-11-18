@@ -188,7 +188,7 @@ struct SettingsView: View {
         account.deletionGuardThreshold = deletionThreshold
         account.maxConcurrentTransfers = maxConcurrent
         saving = true
-        Task {
+        Task { @MainActor in
             await model.updateAccount(account, newPassword: newPassword.isEmpty ? nil : newPassword, newFolder: folderURL)
             saving = false
             load(force: true)
@@ -199,7 +199,7 @@ struct SettingsView: View {
         testing = true
         testResult = nil
         let password = newPassword
-        Task {
+        Task { @MainActor in
             defer { testing = false }
             do {
                 let pw: String

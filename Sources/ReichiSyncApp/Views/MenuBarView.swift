@@ -85,7 +85,7 @@ struct MenuBarView: View {
     private func open(_ section: AppModel.Section) {
         model.selectedSection = section
         openWindow(id: "main")
-        NSApp.activate(ignoringOtherApps: true)
+        model.showMainWindow()
     }
 }
 
@@ -102,7 +102,7 @@ struct MenuRowButtonStyle: ButtonStyle {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(hovering && isEnabled ? Color.accentColor.opacity(configuration.isPressed ? 0.3 : 0.18) : Color.clear)
             )
-            .foregroundStyle(isEnabled ? .primary : .secondary)
+            .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
             .onHover { hovering = $0 }
     }
 }

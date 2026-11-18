@@ -249,7 +249,7 @@ struct SetupAssistantView: View {
     private func runCheck() {
         checking = true
         let (u, user, pw, insecure) = (serverURL, username, password, allowInsecureHTTP)
-        Task {
+        Task { @MainActor in
             do {
                 let result = try await model.testConnection(urlString: u, username: user, password: pw, allowInsecureHTTP: insecure)
                 checkResult = .success(result)
@@ -263,7 +263,7 @@ struct SetupAssistantView: View {
     private func finish() {
         guard let folder else { return }
         finishing = true
-        Task {
+        Task { @MainActor in
             do {
                 try await model.completeSetup(name: name, urlString: serverURL, username: username, password: password, folder: folder, allowInsecureHTTP: allowInsecureHTTP)
             } catch {
