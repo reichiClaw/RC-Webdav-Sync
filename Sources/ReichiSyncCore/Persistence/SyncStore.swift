@@ -798,7 +798,7 @@ public actor SyncStore {
     }
 
     /// Liefert die persistent freigegebenen Löschungen. Die Freigabe bleibt bis
-    /// zum vollständig erfolgreichen Löschdurchgang bestehen.
+    /// zum abgeschlossenen Löschdurchgang bestehen.
     public func confirmedPendingDeletions(mappingID: String) throws -> [PendingDeletion] {
         guard try meta(Self.deletionConfirmationKey(mappingID)) == "1" else { return [] }
         return try pendingDeletions(mappingID: mappingID)

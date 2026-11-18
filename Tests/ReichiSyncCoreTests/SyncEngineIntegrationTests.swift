@@ -765,6 +765,108 @@ final class SyncEngineIntegrationTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testConfirmedDeletionsSurviveIncompleteListing() async throws {
+        harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
+        for dir in ["a", "b"] {
+            for i in 0..<3 { try harness.write("\(dir)/\(i).txt", "\(dir)\(i)") }
+        }
+        try harness.write("bleibt.txt", "bleibt")
+        await harness.sync()
+        for dir in ["a", "b"] {
+            for i in 0..<2 { try harness.remove("\(dir)/\(i).txt") }
+        }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 4)
+
+        // Leerer Plan: Alle bestätigten Pfade sind unbekannt.
+        await harness.server.setFailListing(["a", "b"])
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        var confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertEqual(confirmed.count, 4, "Eine unvollständige Auflistung darf die Freigabe nicht verbrauchen")
+        for path in ["a/0.txt", "a/1.txt", "b/0.txt", "b/1.txt"] { await harness.assertServerExists(path, true) }
+
+        // Teilplan: Nur ein Teil der bestätigten Pfade ist bekannt.
+        await harness.server.setFailListing(["a"])
+        await harness.engine.syncAndWait()
+        await harness.assertServerExists("b/0.txt", false)
+        await harness.assertServerExists("b/1.txt", false)
+        for path in ["a/0.txt", "a/1.txt"] { await harness.assertServerExists(path, true) }
+        confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertFalse(confirmed.isEmpty, "Nicht ausgeführte bestätigte Löschungen dürfen nicht verfallen")
+
+        await harness.server.setFailListing([])
+        await harness.engine.syncAndWait()
+        for path in ["a/0.txt", "a/1.txt"] { await harness.assertServerExists(path, false) }
+        for path in ["a/2.txt", "b/2.txt", "bleibt.txt"] { await harness.assertServerExists(path, true) }
+        confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(confirmed.isEmpty)
+        let status = await harness.engine.currentStatus
+        XCTAssertEqual(status.pendingDeletions, 0)
+        XCTAssertEqual(status.health, .synced, status.headline)
+    }
+
+    func testBlockedConfirmedDeletionsDoNotKeepGrantForever() async throws {
+        let server = FakeWebDAVServer()
+        let deletionGuard = DeletionGuard(threshold: 2, fraction: 0.5)
+        harness = try await EngineHarness(server: server, deletionGuard: deletionGuard)
+        for i in 0..<4 { try harness.write("blockiert\(i).txt", "\(i)") }
+        await harness.sync()
+        await harness.engine.shutdown()
+        await server.setHonorsIfMatch(false)
+        harness = try await EngineHarness(restarting: harness, deletionGuard: deletionGuard)
+        for i in 0..<3 { try harness.remove("blockiert\(i).txt") }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 3)
+
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        for i in 0..<3 { await harness.assertServerExists("blockiert\(i).txt", true, "Ohne atomaren Schutz wird serverseitig nichts gelöscht") }
+        let confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(confirmed.isEmpty, "Eine dauerhaft blockierte Löschung darf die Freigabe nicht für immer festhalten")
+
+        try harness.remove("blockiert3.txt")
+        let next = await harness.sync()
+        XCTAssertEqual(next.pendingDeletions, 4, "Spätere Löschungen müssen wieder zur Bestätigung vorgelegt werden")
+        let visible = await harness.engine.pendingDeletions()
+        XCTAssertEqual(visible.count, 4)
+    }
+
+    func testObsoleteConfirmedDeletionDoesNotKeepGrantAfterCompleteListing() async throws {
+        harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
+        for i in 0..<5 { try harness.write("obsolet\(i).txt", "\(i)") }
+        await harness.sync()
+        for i in 0..<3 { try harness.remove("obsolet\(i).txt") }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 3)
+
+        try harness.write("obsolet0.txt", "0")
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        await harness.assertServerExists("obsolet0.txt", true)
+        await harness.assertServerExists("obsolet1.txt", false)
+        await harness.assertServerExists("obsolet2.txt", false)
+        let confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(confirmed.isEmpty, "Eine gegenstandslos gewordene Freigabe darf nicht bestehen bleiben")
+    }
+
+    func testFullyHandledGrantIsConsumedDespiteIncompleteListingElsewhere() async throws {
+        harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
+        for i in 0..<3 { try harness.write("a/\(i).txt", "\(i)") }
+        try harness.write("z/x.txt", "z")
+        await harness.sync()
+        for i in 0..<3 { try harness.remove("a/\(i).txt") }
+        let held = await harness.sync()
+        XCTAssertEqual(held.pendingDeletions, 3)
+
+        await harness.server.setFailListing(["z"])
+        await harness.engine.confirmPendingDeletions()
+        await harness.engine.syncAndWait()
+        for i in 0..<3 { await harness.assertServerExists("a/\(i).txt", false) }
+        let confirmed = try await harness.store.confirmedPendingDeletions(mappingID: harness.mapping.id)
+        XCTAssertTrue(confirmed.isEmpty, "Alle bestätigten Löschungen wurden ausgeführt")
+    }
+
     func testDiscardingHeldDeletionsRestoresFiles() async throws {
         harness = try await EngineHarness(deletionGuard: DeletionGuard(threshold: 2, fraction: 0.5))
         for i in 0..<4 { try harness.write("g\(i).txt", "\(i)") }

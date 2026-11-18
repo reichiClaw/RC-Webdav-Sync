@@ -70,7 +70,9 @@ Weitere Regeln:
   im Durchgang nicht angefasst.
 - **Bestätigte Löschungen** (`allowedDeletions`) begrenzen Löschaktionen nach
   einer Nachfrage auf exakt die bestätigte Menge. Die Freigabe wird persistent
-  markiert und erst nach einer vollständig erfolgreichen Löschphase entfernt.
+  markiert und erst nach einer abgeschlossenen Löschphase entfernt (jede
+  geplante Löschung ausgeführt oder endgültig blockiert; bei unvollständiger
+  Bestandsaufnahme nur, wenn alle bestätigten Löschungen im Plan standen).
 
 ### Ausführungsreihenfolge
 
@@ -106,11 +108,13 @@ Bestätigung erforderlich, wenn eine der Bedingungen gilt:
 
 Zurückgehaltene Löschungen landen in `pending_deletions`, überleben Neustarts
 und werden in der Übersicht mit Vorschau gezeigt. „Ausführen“ markiert die
-exakte Menge persistent als freigegeben; Verbindungsfehler, ein App-Neustart
-oder eine vorher zurückgestellte Übertragung verbrauchen diese Entscheidung
-nicht. Erst die vollständig erfolgreiche Löschphase entfernt Plan und
-Freigabe. „Verwerfen“ entfernt die Baseline der betroffenen Pfade, sodass die
-noch vorhandene Seite beim nächsten Durchgang als neu übertragen wird.
+exakte Menge persistent als freigegeben; Verbindungsfehler, ein App-Neustart,
+eine vorher zurückgestellte Übertragung oder eine unvollständige Auflistung
+verbrauchen diese Entscheidung nicht. Erst die abgeschlossene Löschphase
+entfernt Plan und Freigabe; eine dauerhaft blockierte Löschung (z. B. auf
+Cloudreve) hält sie nicht fest. „Verwerfen“ entfernt die Baseline der
+betroffenen Pfade, sodass die noch vorhandene Seite beim nächsten Durchgang als
+neu übertragen wird.
 
 Zusätzlich gilt unabhängig vom Guard: fehlender lokaler Stammordner → Pause;
 verlorene Datenbank → leere Baseline → keine Löschungen (alles wird als neu

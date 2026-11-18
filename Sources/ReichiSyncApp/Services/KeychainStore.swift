@@ -7,7 +7,6 @@ struct KeychainStore: Sendable {
     enum KeychainError: Error, LocalizedError {
         case unexpectedStatus(OSStatus)
         case invalidData
-        case inaccessibleDataProtectionEntry
 
         var errorDescription: String? {
             switch self {
@@ -16,8 +15,6 @@ struct KeychainStore: Sendable {
                 return "Schlüsselbund-Fehler: \(message)"
             case .invalidData:
                 return "Der Schlüsselbund-Eintrag enthält keine gültigen Textdaten."
-            case .inaccessibleDataProtectionEntry:
-                return "Das gespeicherte Passwort gehört zu einer anders signierten App-Version und kann mit der aktuellen Signatur nicht gelesen werden. Bitte das Passwort in den Einstellungen erneut eingeben."
             }
         }
     }
@@ -79,10 +76,9 @@ struct KeychainStore: Sendable {
             protected[kSecMatchLimit as String] = kSecMatchLimitOne
             var protectedItem: CFTypeRef?
             let protectedStatus = SecItemCopyMatching(protected as CFDictionary, &protectedItem)
-            if protectedStatus == errSecItemNotFound { return nil }
-            if protectedStatus == errSecMissingEntitlement {
-                throw KeychainError.inaccessibleDataProtectionEntry
-            }
+            // Ohne Access-Group-Entitlement lehnt der Data-Protection-Keychain
+            // jede Abfrage ab, unabhängig davon, ob ein Eintrag existiert.
+            if protectedStatus == errSecItemNotFound || protectedStatus == errSecMissingEntitlement { return nil }
             guard protectedStatus == errSecSuccess, let protectedData = protectedItem as? Data else {
                 throw KeychainError.unexpectedStatus(protectedStatus)
             }

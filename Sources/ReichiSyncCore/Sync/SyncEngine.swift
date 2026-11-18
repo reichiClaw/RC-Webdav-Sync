@@ -699,7 +699,8 @@ public actor SyncEngine {
             plan.deletions.removeAll()
             eventHandler?(.deletionConfirmationRequired(count: held.count))
         } else if runAllowedDeletions != nil {
-            // Die Freigabe wurde am Anfang dieses Durchgangs atomar verbraucht.
+            // Die Freigabe ersetzt die Nachfrage; verbraucht wird sie erst nach
+            // der Löschphase dieses Durchgangs.
         } else {
             // Ein früherer Löschplan kann nach neuen Änderungen gegenstandslos
             // geworden sein und darf dann nicht weiter in der UI stehen.
@@ -772,7 +773,9 @@ public actor SyncEngine {
                 let result = await execute(action, snapshot: remoteSnapshot)
                 tally(result, &transferred, &failures, &summary)
                 switch result {
-                case .succeeded, .noop:
+                case .succeeded, .noop, .blocked:
+                    // `.blocked` ist für diesen Server endgültig. Eine dauerhaft
+                    // ausstehende Löschung darf die Freigabe nicht festhalten.
                     break
                 default:
                     everyDeletionCompleted = false
@@ -783,7 +786,13 @@ public actor SyncEngine {
                     break
                 }
             }
+            // Bei unvollständiger Bestandsaufnahme ist eine nicht geplante,
+            // bestätigte Löschung womöglich nur unbekannt statt gegenstandslos;
+            // die Freigabe bleibt dann bestehen.
+            let confirmedDeletionsPlanned = (runAllowedDeletions ?? [])
+                .isSubset(of: plan.deletions.compactMap(\.deletionAuthorization))
             authorizedDeletionPhaseCompleted = everyDeletionCompleted && !haltRemainingActions
+                && (!plan.deletionsSuppressed || confirmedDeletionsPlanned)
         }
         if runAllowedDeletions != nil, authorizedDeletionPhaseCompleted {
             do {
