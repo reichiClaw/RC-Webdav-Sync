@@ -37,7 +37,7 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Einstellungen")
-        .onAppear(perform: load)
+        .onAppear { load() }
         .onChange(of: model.account) { _, _ in load(force: true) }
     }
 

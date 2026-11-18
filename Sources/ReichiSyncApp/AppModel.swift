@@ -62,6 +62,11 @@ final class AppModel: ObservableObject {
     /// `true`, wenn die aktuelle Verbindung eine Cloudreve-Instanz ist (Freigaben möglich).
     var isCloudreveAccount: Bool { account?.isCloudreve ?? false }
 
+    /// Veröffentlicht ein bereits persistiertes Konto aus einer AppModel-Erweiterung.
+    func setActiveAccount(_ newAccount: AccountConfiguration) {
+        account = newAccount
+    }
+
     var store: SyncStore?
     private var engine: SyncEngine?
     /// Cloudreve-REST-Client (nur bei Cloudreve-Verbindungen).

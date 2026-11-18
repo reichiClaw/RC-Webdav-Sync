@@ -120,7 +120,7 @@ extension AppModel {
             throw error
         }
         bookmarks.save(data: bookmarkData, accountID: newAccount.id)
-        account = newAccount
+        setActiveAccount(newAccount)
         if newAccount.notificationsEnabled { await notifications.requestAuthorizationIfNeeded() }
         await startEngine(for: newAccount)
         } catch {
