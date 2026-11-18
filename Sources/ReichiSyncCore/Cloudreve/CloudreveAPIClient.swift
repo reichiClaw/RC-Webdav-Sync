@@ -69,6 +69,8 @@ public enum CloudreveError: Error, Sendable, Equatable {
         public static let lockConflict = 40073
         public static let staleVersion = 40076
         public static let entityNotExist = 40077
+        public static let invalidPassword = 40080
+        public static let accessTokenExpired = 40080
     }
 
     public var userDescription: String {
@@ -80,7 +82,7 @@ public enum CloudreveError: Error, Sendable, Equatable {
         case .invalidChunk(let detail): return "Der Server hat einen Upload-Teil abgelehnt (\(detail)); der Upload wird neu gestartet."
         case .versionConflict: return "Die Datei wurde auf dem Server zwischenzeitlich geändert – wird neu abgeglichen."
         case .insufficientCapacity: return "Der Speicherplatz des Cloudreve-Kontos ist erschöpft."
-        case .unsupportedStoragePolicy(let type): return "Die Speicherrichtlinie „\(type)“ verlangt direkte Uploads an einen Drittanbieter, die nicht unterstützt werden. Es wird per WebDAV hochgeladen."
+        case .unsupportedStoragePolicy(let type): return "Die Speicherrichtlinie „\(type)“ kann von der App nicht sicher für diesen Upload verwendet werden."
         case .network(let detail): return "Cloudreve ist nicht erreichbar: \(detail)"
         case .invalidResponse(let detail): return "Unerwartete Antwort von Cloudreve: \(detail)"
         case .cancelled: return "Abgebrochen"
@@ -169,6 +171,9 @@ public struct CloudreveStoragePolicy: Sendable, Hashable {
     public var relay: Bool
     public var chunkConcurrency: Int
     public var maxSize: Int64
+    /// Verschlüsselte Policies benötigen das Cloudreve-Client-
+    /// Verschlüsselungsprotokoll und dürfen nicht als Klartext-Chunks bedient werden.
+    public var encryption: Bool = false
 }
 
 /// Upload-Sitzung (Antwort von `PUT /api/v4/file/upload`).
@@ -198,11 +203,18 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     private let lock = NSLock()
     private var tokens: CloudreveTokens?
     private var refreshTask: Task<CloudreveTokens, Error>?
+    private var tokenGeneration: UInt64 = 0
+    private var refreshGeneration: UInt64?
     private let onTokensChanged: (@Sendable (CloudreveTokens?) -> Void)?
 
     public init(siteURL: URL, tokens: CloudreveTokens? = nil, allowInsecureHTTP: Bool = false, logger: SyncLogger = .shared,
                 sessionConfiguration: URLSessionConfiguration? = nil, onTokensChanged: (@Sendable (CloudreveTokens?) -> Void)? = nil) throws {
-        guard let scheme = siteURL.scheme?.lowercased(), scheme == "https" || scheme == "http", siteURL.host != nil else {
+        guard let scheme = siteURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = siteURL.host, !host.isEmpty,
+              siteURL.user == nil, siteURL.password == nil,
+              siteURL.query == nil, siteURL.fragment == nil,
+              siteURL.path.isEmpty || siteURL.path == "/" else {
             throw CloudreveError.invalidResponse("Ungültige Server-Adresse")
         }
         if scheme == "http" && !allowInsecureHTTP && !WebDAVClient.isLoopback(siteURL) {
@@ -233,7 +245,7 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpAdditionalHeaders = ["User-Agent": "reichi-Sync/1.0 (macOS)", "Accept": "application/json"]
-        let delegate = TransportDelegate(allowedHost: self.siteURL.host ?? "", logger: logger)
+        let delegate = TransportDelegate(allowedOrigin: self.siteURL, logger: logger)
         self.delegate = delegate
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
     }
@@ -254,12 +266,37 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     }
 
     private func setTokens(_ new: CloudreveTokens?) {
-        lock.lock(); tokens = new; lock.unlock()
+        lock.lock()
+        let obsoleteRefresh = refreshTask
+        refreshTask = nil
+        refreshGeneration = nil
+        tokenGeneration &+= 1
+        tokens = new
+        lock.unlock()
+        obsoleteRefresh?.cancel()
         if let new {
             logger.registerSecret(new.accessToken)
             logger.registerSecret(new.refreshToken)
         }
         onTokensChanged?(new)
+    }
+
+    @discardableResult
+    private func clearTokens(ifMatching expected: CloudreveTokens) -> Bool {
+        lock.lock()
+        guard tokens == expected else {
+            lock.unlock()
+            return false
+        }
+        let obsoleteRefresh = refreshTask
+        refreshTask = nil
+        refreshGeneration = nil
+        tokenGeneration &+= 1
+        tokens = nil
+        lock.unlock()
+        obsoleteRefresh?.cancel()
+        onTokensChanged?(nil)
+        return true
     }
 
     // MARK: - HTTP
@@ -302,16 +339,32 @@ public final class CloudreveAPIClient: @unchecked Sendable {
             request.setValue(String(body?.count ?? 0), forHTTPHeaderField: "Content-Length")
         }
         let response = try await send(request, body: body, progress: progress)
-        guard response.code == CloudreveError.Code.checkLogin || response.status == 401 else { return response }
+        guard response.code == CloudreveError.Code.checkLogin
+                || response.code == CloudreveError.Code.accessTokenExpired
+                || response.status == 401 else { return response }
         let (current, _) = snapshotTokenState()
         guard let current, !current.refreshTokenExpired else {
-            setTokens(nil)
+            if let current { clearTokens(ifMatching: current) }
             throw CloudreveError.authenticationRequired(response.message.isEmpty ? "Anmeldung erforderlich" : response.message)
         }
         logger.notice("cloudreve", "401 bei \(path) – Token wird erneuert")
-        let refreshed = try await refresh(using: current.refreshToken)
-        request.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
-        return try await send(request, body: body, progress: progress)
+        let rejectedAccessToken = request.value(forHTTPHeaderField: "Authorization")?
+            .replacingOccurrences(of: "Bearer ", with: "")
+        let refreshedAccessToken = try await refreshAccessToken(rejectedAccessToken: rejectedAccessToken)
+        request.setValue("Bearer \(refreshedAccessToken)", forHTTPHeaderField: "Authorization")
+        let retried = try await send(request, body: body, progress: progress)
+        if retried.code == CloudreveError.Code.checkLogin
+            || retried.code == CloudreveError.Code.accessTokenExpired
+            || retried.status == 401 {
+            let (latest, _) = snapshotTokenState()
+            if let latest, latest.accessToken == refreshedAccessToken {
+                clearTokens(ifMatching: latest)
+            }
+            throw CloudreveError.authenticationRequired(
+                retried.message.isEmpty ? "Anmeldung erforderlich" : retried.message
+            )
+        }
+        return retried
     }
 
     /// Führt eine Anfrage aus und interpretiert die JSON-Hülle `{code, msg, data}`.
@@ -324,36 +377,20 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<APIResponse, Error>) in
                 let completion: @Sendable (Data?, URLResponse?, Error?) -> Void = { data, response, error in
-                    defer { if let id = holder.task?.taskIdentifier { delegate.removeProgress(taskIdentifier: id) } }
+                    defer { if let id = holder.taskIdentifier { delegate.finishTask(taskIdentifier: id) } }
                     if let error {
                         continuation.resume(throwing: Self.mapTransportError(error))
-                        return
-                    }
-                    guard let http = response as? HTTPURLResponse else {
-                        continuation.resume(throwing: CloudreveError.invalidResponse("Keine HTTP-Antwort"))
                         return
                     }
                     if let id = holder.task?.taskIdentifier, delegate.wasRedirectRefused(taskIdentifier: id) {
                         continuation.resume(throwing: CloudreveError.network("Umleitung auf fremden Host abgelehnt"))
                         return
                     }
-                    var headers: [String: String] = [:]
-                    for (k, v) in http.allHeaderFields {
-                        if let ks = k as? String, let vs = v as? String { headers[ks] = vs }
+                    do {
+                        continuation.resume(returning: try Self.parseResponse(data, response: response, path: path))
+                    } catch {
+                        continuation.resume(throwing: error)
                     }
-                    let data = data ?? Data()
-                    var code = http.statusCode == 200 ? 0 : http.statusCode
-                    var message = ""
-                    var payload: Any?
-                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        if let c = json["code"] as? Int { code = c }
-                        message = (json["msg"] as? String) ?? ""
-                        payload = json["data"]
-                    } else if http.statusCode == 200 {
-                        continuation.resume(throwing: CloudreveError.invalidResponse("Antwort ist kein JSON (\(path))"))
-                        return
-                    }
-                    continuation.resume(returning: APIResponse(status: http.statusCode, code: code, message: message, data: payload, headers: headers))
                 }
                 let task: URLSessionTask
                 if let body {
@@ -366,8 +403,65 @@ public final class CloudreveAPIClient: @unchecked Sendable {
                 task.resume()
             }
         } onCancel: {
-            holder.task?.cancel()
+            holder.cancel()
         }
+    }
+
+    /// Variante für einen einzelnen, vom Server verlangten ungeteilten Upload.
+    /// `uploadTask(fromFile:)` hält auch große Dateien aus dem Arbeitsspeicher.
+    private func sendFile(_ request: URLRequest, file: URL, progress: TransferProgress?) async throws -> APIResponse {
+        let path = request.url?.path ?? "?"
+        logger.debug("cloudreve", "\(request.httpMethod ?? "?") \(path)")
+        let session = self.session
+        let delegate = self.delegate
+        let holder = TaskHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<APIResponse, Error>) in
+                let task = session.uploadTask(with: request, fromFile: file) { data, response, error in
+                    defer { if let id = holder.taskIdentifier { delegate.finishTask(taskIdentifier: id) } }
+                    if let error {
+                        continuation.resume(throwing: Self.mapTransportError(error))
+                        return
+                    }
+                    if let id = holder.task?.taskIdentifier, delegate.wasRedirectRefused(taskIdentifier: id) {
+                        continuation.resume(throwing: CloudreveError.network("Umleitung auf fremden Host abgelehnt"))
+                        return
+                    }
+                    do {
+                        continuation.resume(returning: try Self.parseResponse(data, response: response, path: path))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+                holder.task = task
+                if let progress { delegate.setProgress(progress, taskIdentifier: task.taskIdentifier) }
+                task.resume()
+            }
+        } onCancel: {
+            holder.cancel()
+        }
+    }
+
+    private static func parseResponse(_ responseData: Data?, response: URLResponse?, path: String) throws -> APIResponse {
+        guard let http = response as? HTTPURLResponse else {
+            throw CloudreveError.invalidResponse("Keine HTTP-Antwort")
+        }
+        var headers: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            if let key = key as? String, let value = value as? String { headers[key] = value }
+        }
+        let data = responseData ?? Data()
+        var code = http.statusCode == 200 ? 0 : http.statusCode
+        var message = ""
+        var payload: Any?
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let parsedCode = json["code"] as? Int { code = parsedCode }
+            message = (json["msg"] as? String) ?? ""
+            payload = json["data"]
+        } else if http.statusCode == 200 {
+            throw CloudreveError.invalidResponse("Antwort ist kein JSON (\(path))")
+        }
+        return APIResponse(status: http.statusCode, code: code, message: message, data: payload, headers: headers)
     }
 
     static func mapTransportError(_ error: Error) -> CloudreveError {
@@ -380,8 +474,12 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         return .network(error.localizedDescription)
     }
 
-    /// Wirft bei `code != 0` den passenden Fehler.
+    /// Wirft bei einem HTTP-Fehler oder `code != 0` den passenden Fehler.
     private func check(_ response: APIResponse, context: String) throws {
+        guard (200..<300).contains(response.status) else {
+            let effectiveCode = response.code == CloudreveError.Code.success ? response.status : response.code
+            throw Self.error(code: effectiveCode, message: response.message, status: response.status, context: context)
+        }
         guard response.code != CloudreveError.Code.success else { return }
         throw Self.error(code: response.code, message: response.message, status: response.status, context: context)
     }
@@ -389,7 +487,10 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     static func error(code: Int, message: String, status: Int, context: String) -> CloudreveError {
         let text = message.isEmpty ? context : message
         switch code {
-        case CloudreveError.Code.checkLogin, CloudreveError.Code.credentialInvalid: return .authenticationRequired(text)
+        case CloudreveError.Code.checkLogin, CloudreveError.Code.credentialInvalid,
+             CloudreveError.Code.invalidPassword,
+             CloudreveError.Code.accessTokenExpired:
+            return .authenticationRequired(text)
         case CloudreveError.Code.uploadSessionExpired: return .uploadSessionExpired
         case CloudreveError.Code.invalidChunkIndex, CloudreveError.Code.invalidContentLength: return .invalidChunk(text)
         case CloudreveError.Code.objectExist, CloudreveError.Code.staleVersion, CloudreveError.Code.versionMismatch,
@@ -473,21 +574,14 @@ public final class CloudreveAPIClient: @unchecked Sendable {
 
     /// Liefert ein gültiges Access-Token, erneuert es bei Bedarf (einmalig, auch bei parallelen Aufrufen).
     private func validAccessToken() async throws -> String {
-        let (current, running) = snapshotTokenState()
+        let (current, _) = snapshotTokenState()
         guard let current else { throw CloudreveError.authenticationRequired("Nicht angemeldet") }
         if !current.accessTokenNeedsRefresh { return current.accessToken }
         if current.refreshTokenExpired {
-            setTokens(nil)
+            clearTokens(ifMatching: current)
             throw CloudreveError.authenticationRequired("Sitzung abgelaufen")
         }
-        if let running { return try await running.value.accessToken }
-        let task = Task<CloudreveTokens, Error> { [weak self] in
-            guard let self else { throw CloudreveError.cancelled }
-            return try await self.refresh(using: current.refreshToken)
-        }
-        setRefreshTask(task)
-        defer { setRefreshTask(nil) }
-        return try await task.value.accessToken
+        return try await refreshAccessToken()
     }
 
     private func snapshotTokenState() -> (CloudreveTokens?, Task<CloudreveTokens, Error>?) {
@@ -495,21 +589,128 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         return (tokens, refreshTask)
     }
 
-    private func setRefreshTask(_ task: Task<CloudreveTokens, Error>?) {
-        lock.lock(); refreshTask = task; lock.unlock()
+    /// Teilt genau einen Refresh zwischen proaktiver Erneuerung und parallelen
+    /// 401-Antworten. Hat eine andere Anfrage das abgelehnte Access-Token bereits
+    /// ersetzt, wird dessen Ergebnis direkt verwendet.
+    private func refreshAccessToken(rejectedAccessToken: String? = nil) async throws -> String {
+        let decision = prepareRefresh(rejectedAccessToken: rejectedAccessToken)
+        switch decision {
+        case .useAccessToken(let access):
+            return access
+        case .unavailable(let message, let didClear):
+            if didClear { onTokensChanged?(nil) }
+            throw CloudreveError.authenticationRequired(message)
+        case .run(let task, let refreshToken, let generation):
+            do {
+                let refreshed = try await task.value
+                let completion = completeRefresh(refreshed, replacing: refreshToken, generation: generation)
+                if completion.installed {
+                    logger.registerSecret(refreshed.accessToken)
+                    logger.registerSecret(refreshed.refreshToken)
+                    onTokensChanged?(refreshed)
+                    logger.info("cloudreve", "Access-Token erneuert (gültig bis \(refreshed.accessExpires))")
+                }
+                guard let access = completion.currentAccess else {
+                    throw CloudreveError.authenticationRequired("Sitzung wurde beendet")
+                }
+                return access
+            } catch {
+                let invalidCredentials: Bool
+                if let cloudreve = error as? CloudreveError,
+                   case .authenticationRequired = cloudreve {
+                    invalidCredentials = true
+                } else {
+                    invalidCredentials = false
+                }
+                if failRefresh(replacing: refreshToken, generation: generation, clearTokens: invalidCredentials) {
+                    onTokensChanged?(nil)
+                }
+                if let cloudreve = error as? CloudreveError { throw cloudreve }
+                throw CloudreveError.network(error.localizedDescription)
+            }
+        }
     }
 
-    /// `POST /api/v4/session/token/refresh`.
-    private func refresh(using refreshToken: String) async throws -> CloudreveTokens {
+    private enum RefreshDecision {
+        case useAccessToken(String)
+        case unavailable(message: String, didClear: Bool)
+        case run(task: Task<CloudreveTokens, Error>, refreshToken: String, generation: UInt64)
+    }
+
+    private func prepareRefresh(rejectedAccessToken: String?) -> RefreshDecision {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = tokens else {
+            return .unavailable(message: "Nicht angemeldet", didClear: false)
+        }
+        if let rejectedAccessToken, current.accessToken != rejectedAccessToken {
+            return .useAccessToken(current.accessToken)
+        }
+        if rejectedAccessToken == nil, !current.accessTokenNeedsRefresh {
+            return .useAccessToken(current.accessToken)
+        }
+        guard !current.refreshTokenExpired else {
+            tokens = nil
+            return .unavailable(message: "Sitzung abgelaufen", didClear: true)
+        }
+        if let refreshTask {
+            guard let refreshGeneration else {
+                return .unavailable(message: "Token-Erneuerung hat einen ungültigen Zustand", didClear: false)
+            }
+            return .run(task: refreshTask, refreshToken: current.refreshToken, generation: refreshGeneration)
+        }
+        let refreshToken = current.refreshToken
+        let generation = tokenGeneration
+        let task = Task<CloudreveTokens, Error> { [weak self] in
+            guard let self else { throw CloudreveError.cancelled }
+            return try await self.performRefresh(using: refreshToken)
+        }
+        refreshTask = task
+        refreshGeneration = generation
+        return .run(task: task, refreshToken: refreshToken, generation: generation)
+    }
+
+    private func completeRefresh(_ refreshed: CloudreveTokens, replacing refreshToken: String, generation: UInt64)
+        -> (currentAccess: String?, installed: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let shouldInstall = tokenGeneration == generation
+            && refreshGeneration == generation
+            && tokens?.refreshToken == refreshToken
+        if shouldInstall {
+            refreshTask = nil
+            refreshGeneration = nil
+            tokens = refreshed
+            tokenGeneration &+= 1
+        }
+        return (tokens?.accessToken, shouldInstall)
+    }
+
+    private func failRefresh(replacing refreshToken: String, generation: UInt64, clearTokens: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard tokenGeneration == generation,
+              refreshGeneration == generation,
+              tokens?.refreshToken == refreshToken else { return false }
+        refreshTask = nil
+        refreshGeneration = nil
+        if clearTokens {
+            tokens = nil
+            tokenGeneration &+= 1
+        }
+        return clearTokens
+    }
+
+    /// `POST /api/v4/session/token/refresh`, ohne gemeinsam genutzten Zustand
+    /// selbst zu überschreiben.
+    private func performRefresh(using refreshToken: String) async throws -> CloudreveTokens {
         let response = try await send(request("POST", "session/token/refresh", json: ["refresh_token": refreshToken], authorized: false))
         if response.code != 0 {
-            setTokens(nil)
-            throw CloudreveError.authenticationRequired(response.message.isEmpty ? "Token-Erneuerung fehlgeschlagen" : response.message)
+            throw Self.error(
+                code: response.code,
+                message: response.message,
+                status: response.status,
+                context: "Token-Erneuerung"
+            )
         }
-        let tokens = try Self.parseTokens(from: response.data, nested: false)
-        setTokens(tokens)
-        logger.info("cloudreve", "Access-Token erneuert (gültig bis \(tokens.accessExpires))")
-        return tokens
+        return try Self.parseTokens(from: response.data, nested: false)
     }
 
     // MARK: - WebDAV-Konten
@@ -518,18 +719,45 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     public func listDavAccounts() async throws -> [CloudreveDavAccount] {
         var accounts: [CloudreveDavAccount] = []
         var nextToken: String?
+        var seenTokens: Set<String> = []
+        var pages = 0
         repeat {
+            pages += 1
+            guard pages <= 10_000 else { throw CloudreveError.invalidResponse("WebDAV-Konten: zu viele Seiten") }
             var query = [URLQueryItem(name: "page_size", value: "100")]
             if let nextToken { query.append(URLQueryItem(name: "next_page_token", value: nextToken)) }
             let response = try await sendAuthorized("GET", "devices/dav", query: query)
             try check(response, context: "WebDAV-Konten")
-            guard let data = response.data as? [String: Any] else { break }
-            for raw in data["accounts"] as? [[String: Any]] ?? [] {
-                if let account = Self.parseDavAccount(raw) { accounts.append(account) }
+            guard let data = response.data as? [String: Any],
+                  let rawAccounts = data["accounts"] as? [[String: Any]],
+                  let pagination = data["pagination"] as? [String: Any],
+                  let isCursor = pagination["is_cursor"] as? Bool else {
+                throw CloudreveError.invalidResponse("WebDAV-Konten: Seite unvollständig")
             }
-            let pagination = data["pagination"] as? [String: Any]
-            let token = pagination?["next_token"] as? String
-            nextToken = (token?.isEmpty == false && (pagination?["is_cursor"] as? Bool ?? true)) ? token : nil
+            let token: String
+            if let rawToken = pagination["next_token"] {
+                guard let value = rawToken as? String else {
+                    throw CloudreveError.invalidResponse("WebDAV-Konten: ungültiges next_token")
+                }
+                token = value
+            } else {
+                // Cloudreve lässt next_token auf der letzten Seite weg.
+                token = ""
+            }
+            for raw in rawAccounts {
+                guard let account = Self.parseDavAccount(raw) else {
+                    throw CloudreveError.invalidResponse("WebDAV-Konten: ungültiger Eintrag")
+                }
+                accounts.append(account)
+            }
+            if !token.isEmpty {
+                guard isCursor, seenTokens.insert(token).inserted else {
+                    throw CloudreveError.invalidResponse("WebDAV-Konten: zyklische oder ungültige Seitennavigation")
+                }
+                nextToken = token
+            } else {
+                nextToken = nil
+            }
         } while nextToken != nil
         return accounts
     }
@@ -542,6 +770,18 @@ public final class CloudreveAPIClient: @unchecked Sendable {
             throw CloudreveError.invalidResponse("WebDAV-Konto ohne Daten")
         }
         return account
+    }
+
+    /// Widerruft ein WebDAV-Konto, das während einer fehlgeschlagenen
+    /// Einrichtung bereits auf dem Server angelegt wurde.
+    public func deleteDavAccount(id: String) async throws {
+        guard !id.isEmpty, id.unicodeScalars.allSatisfy({
+            CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+        }) else {
+            throw CloudreveError.invalidResponse("Ungültige WebDAV-Konto-ID")
+        }
+        let response = try await sendAuthorized("DELETE", "devices/dav/\(id)")
+        try check(response, context: "WebDAV-Konto löschen")
     }
 
     static func parseDavAccount(_ raw: [String: Any]) -> CloudreveDavAccount? {
@@ -588,7 +828,7 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         if let limit = options.downloadLimit, limit > 0 { body["downloads"] = limit }
         let response = try await sendAuthorized("PUT", "share", json: body)
         try check(response, context: "Freigabe erstellen")
-        guard let link = response.data as? String, let url = URL(string: link) else {
+        guard let link = response.data as? String, let url = Self.validatedShareURL(link) else {
             throw CloudreveError.invalidResponse("Freigabe ohne Link")
         }
         return url
@@ -598,19 +838,44 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     public func listShares() async throws -> [CloudreveShare] {
         var shares: [CloudreveShare] = []
         var nextToken: String?
+        var seenTokens: Set<String> = []
+        var pages = 0
         repeat {
+            pages += 1
+            guard pages <= 10_000 else { throw CloudreveError.invalidResponse("Freigaben: zu viele Seiten") }
             var query = [URLQueryItem(name: "page_size", value: "100"), URLQueryItem(name: "order_by", value: "created_at"),
                          URLQueryItem(name: "order_direction", value: "desc")]
             if let nextToken { query.append(URLQueryItem(name: "next_page_token", value: nextToken)) }
             let response = try await sendAuthorized("GET", "share", query: query)
             try check(response, context: "Freigaben")
-            guard let data = response.data as? [String: Any] else { break }
-            for raw in data["shares"] as? [[String: Any]] ?? [] {
-                if let share = Self.parseShare(raw) { shares.append(share) }
+            guard let data = response.data as? [String: Any],
+                  let rawShares = data["shares"] as? [[String: Any]],
+                  let pagination = data["pagination"] as? [String: Any] else {
+                throw CloudreveError.invalidResponse("Freigaben: Seite unvollständig")
             }
-            let pagination = data["pagination"] as? [String: Any]
-            let token = pagination?["next_token"] as? String
-            nextToken = (token?.isEmpty == false) ? token : nil
+            let token: String
+            if let rawToken = pagination["next_token"] {
+                guard let value = rawToken as? String else {
+                    throw CloudreveError.invalidResponse("Freigaben: ungültiges next_token")
+                }
+                token = value
+            } else {
+                token = ""
+            }
+            for raw in rawShares {
+                guard let share = Self.parseShare(raw) else {
+                    throw CloudreveError.invalidResponse("Freigaben: ungültiger Eintrag")
+                }
+                shares.append(share)
+            }
+            if !token.isEmpty {
+                guard seenTokens.insert(token).inserted else {
+                    throw CloudreveError.invalidResponse("Freigaben: zyklische Seitennavigation")
+                }
+                nextToken = token
+            } else {
+                nextToken = nil
+            }
         } while nextToken != nil
         return shares
     }
@@ -623,13 +888,24 @@ public final class CloudreveAPIClient: @unchecked Sendable {
     }
 
     static func parseShare(_ raw: [String: Any]) -> CloudreveShare? {
-        guard let id = raw["id"] as? String, let link = raw["url"] as? String, let url = URL(string: link) else { return nil }
+        guard let id = raw["id"] as? String,
+              let link = raw["url"] as? String,
+              let url = validatedShareURL(link) else { return nil }
         return CloudreveShare(id: id, name: raw["name"] as? String ?? "", url: url, sourceURI: raw["source_uri"] as? String,
                               isPrivate: raw["is_private"] as? Bool ?? (raw["password_protected"] as? Bool ?? false),
                               password: raw["password"] as? String, expires: parseDate(raw["expires"]), expired: raw["expired"] as? Bool ?? false,
                               visited: raw["visited"] as? Int ?? 0, downloaded: raw["downloaded"] as? Int ?? 0,
                               remainDownloads: raw["remain_downloads"] as? Int, isFolder: (raw["source_type"] as? Int) == 1,
                               createdAt: parseDate(raw["created_at"]))
+    }
+
+    private static func validatedShareURL(_ text: String) -> URL? {
+        guard let url = URL(string: text),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil else { return nil }
+        return url
     }
 
     // MARK: - Ordner
@@ -667,7 +943,8 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         let policy = CloudreveStoragePolicy(id: policyID, name: policyRaw["name"] as? String ?? "", type: policyType,
                                             relay: policyRaw["relay"] as? Bool ?? false,
                                             chunkConcurrency: max(1, policyRaw["chunk_concurrency"] as? Int ?? 1),
-                                            maxSize: (policyRaw["max_size"] as? NSNumber)?.int64Value ?? 0)
+                                            maxSize: (policyRaw["max_size"] as? NSNumber)?.int64Value ?? 0,
+                                            encryption: policyRaw["encryption"] as? Bool ?? false)
         let chunkSize = (data["chunk_size"] as? NSNumber)?.int64Value ?? 0
         let expires = Self.parseDate(data["expires"]) ?? Date().addingTimeInterval(3600)
         return CloudreveUploadSession(sessionID: sessionID, chunkSize: chunkSize, expires: expires,
@@ -699,11 +976,57 @@ public final class CloudreveAPIClient: @unchecked Sendable {
         try check(response, context: "Chunk \(index)")
     }
 
+    /// Lädt bei einer Cloudreve-Sitzung mit `chunk_size == 0` die vollständige
+    /// Datei als genau einen Chunk, ohne sie in den Arbeitsspeicher einzulesen.
+    public func uploadSingleFile(_ file: URL, size: Int64, session uploadSession: CloudreveUploadSession,
+                                 progress: TransferProgress?) async throws {
+        guard uploadSession.usesLocalChunkAPI else {
+            throw CloudreveError.unsupportedStoragePolicy(uploadSession.policy.type)
+        }
+        var uploadRequest = try await request(
+            "POST",
+            "file/upload/\(uploadSession.sessionID)/0",
+            authorized: true
+        )
+        uploadRequest.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        uploadRequest.setValue(String(size), forHTTPHeaderField: "Content-Length")
+
+        var response = try await sendFile(uploadRequest, file: file, progress: progress)
+        if response.code == CloudreveError.Code.checkLogin
+            || response.code == CloudreveError.Code.accessTokenExpired
+            || response.status == 401 {
+            let (current, _) = snapshotTokenState()
+            guard let current, !current.refreshTokenExpired else {
+                if let current { clearTokens(ifMatching: current) }
+                throw CloudreveError.authenticationRequired(
+                    response.message.isEmpty ? "Anmeldung erforderlich" : response.message
+                )
+            }
+            let rejectedAccessToken = uploadRequest.value(forHTTPHeaderField: "Authorization")?
+                .replacingOccurrences(of: "Bearer ", with: "")
+            let refreshedAccessToken = try await refreshAccessToken(rejectedAccessToken: rejectedAccessToken)
+            uploadRequest.setValue("Bearer \(refreshedAccessToken)", forHTTPHeaderField: "Authorization")
+            response = try await sendFile(uploadRequest, file: file, progress: progress)
+            if response.code == CloudreveError.Code.checkLogin
+                || response.code == CloudreveError.Code.accessTokenExpired
+                || response.status == 401 {
+                let (latest, _) = snapshotTokenState()
+                if let latest, latest.accessToken == refreshedAccessToken {
+                    clearTokens(ifMatching: latest)
+                }
+                throw CloudreveError.authenticationRequired(
+                    response.message.isEmpty ? "Anmeldung erforderlich" : response.message
+                )
+            }
+        }
+        try check(response, context: "Ungeteilter Upload")
+    }
+
     /// `DELETE /api/v4/file/upload` – verwirft eine Upload-Sitzung (Fehler werden nur protokolliert).
     public func deleteUploadSession(id: String, uri: String) async {
         do {
             let response = try await sendAuthorized("DELETE", "file/upload", json: ["id": id, "uri": uri])
-            if response.code != 0 { logger.debug("cloudreve", "Upload-Sitzung \(id) konnte nicht gelöscht werden: \(response.message)") }
+            try check(response, context: "Upload-Sitzung löschen")
         } catch {
             logger.debug("cloudreve", "Upload-Sitzung \(id) konnte nicht gelöscht werden: \(error)")
         }
@@ -717,23 +1040,38 @@ public enum CloudreveURI {
     /// relativen Pfad. Jedes Segment wird einzeln URL-kodiert.
     public static func fileURI(root: String, relativePath: String) throws -> String {
         let segments = try RelativePath.segments(of: relativePath)
-        var base = root.trimmingCharacters(in: .whitespaces)
-        if base.isEmpty { base = "cloudreve://my" }
-        while base.hasSuffix("/") { base.removeLast() }
-        if segments.isEmpty { return base.hasPrefix("cloudreve://") && !base.dropFirst("cloudreve://".count).contains("/") ? base + "/" : base }
+        let rootText = root.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: rootText.isEmpty ? "cloudreve://my/" : rootText),
+              components.scheme?.lowercased() == "cloudreve",
+              components.host?.lowercased() == "my",
+              components.user == nil, components.password == nil, components.port == nil,
+              components.query == nil, components.fragment == nil else {
+            throw CloudreveError.invalidResponse("Ungültige Cloudreve-Wurzel-URI")
+        }
+        let decodedRootPath = components.percentEncodedPath.removingPercentEncoding ?? components.path
+        let rootSegments = try RelativePath.segments(of: decodedRootPath)
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/;?#+%")
-        let encoded = segments.map { $0.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0 }
-        return base + "/" + encoded.joined(separator: "/")
+        let encodedRoot = rootSegments.map { $0.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0 }
+        let encodedPath = segments.map { $0.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0 }
+        let allSegments = encodedRoot + encodedPath
+        return "cloudreve://my/" + allSegments.joined(separator: "/")
     }
 
     /// Erzeugt die Konto-Wurzel-URI aus einem Ordnerpfad wie `/Sync/Projekte` (leer = alle Dateien).
     public static func rootURI(folderPath: String) -> String {
-        let trimmed = folderPath.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
-        if trimmed.isEmpty { return "cloudreve://my/" }
+        (try? validatedRootURI(folderPath: folderPath)) ?? "cloudreve://my/"
+    }
+
+    /// Prüfende Variante für Eingaben, die anschließend an den Server gesendet
+    /// werden. Traversal und leere Zwischensegmente werden abgelehnt.
+    public static func validatedRootURI(folderPath: String) throws -> String {
+        let trimmed = folderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let segments = try RelativePath.segments(of: trimmed)
+        if segments.isEmpty { return "cloudreve://my/" }
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/;?#+%")
-        let encoded = trimmed.split(separator: "/").map { String($0).addingPercentEncoding(withAllowedCharacters: allowed) ?? String($0) }
+        let encoded = segments.map { $0.addingPercentEncoding(withAllowedCharacters: allowed) ?? $0 }
         return "cloudreve://my/" + encoded.joined(separator: "/")
     }
 

@@ -78,12 +78,12 @@ final class CloudreveTests: XCTestCase {
         XCTAssertFalse(caps.supportsConditionalWrites, "Cloudreve wertet If-Match nicht aus → Engine muss PROPFIND-Vorprüfung nutzen")
     }
 
-    func testGenericHintSkipsCloudreveDetection() async throws {
+    func testGenericHintStillRecognisesCloudreveSafely() async throws {
         let client = try WebDAVClient(baseURL: server.davURL, credentials: WebDAVCredentials(username: "anna@example.org", password: "dav-geheim"),
                                       allowInsecureHTTP: true, serverKindHint: .generic)
         let caps = try await client.detectCapabilities()
-        XCTAssertEqual(caps.serverKind, .generic)
-        XCTAssertTrue(caps.honorsIfMatch)
+        XCTAssertEqual(caps.serverKind, .cloudreve)
+        XCTAssertFalse(caps.honorsIfMatch)
     }
 
     func testLoginRefreshAndDavAccounts() async throws {
@@ -131,6 +131,26 @@ final class CloudreveTests: XCTestCase {
         XCTAssertNotEqual(refreshed.refreshToken, tokens.refreshToken)
         XCTAssertEqual(changes.values.count, 2, "Login + Refresh müssen gemeldet werden")
 
+        // Mehrere gleichzeitige 401-Antworten dürfen einen rotierenden
+        // Refresh-Token nur genau einmal verwenden.
+        try await server.hook("reset-log", json: [:])
+        try await server.hook("expire-tokens", json: [:])
+        let counts = try await withThrowingTaskGroup(of: Int.self) { group in
+            for _ in 0..<8 {
+                group.addTask { try await api.listDavAccounts().count }
+            }
+            var values: [Int] = []
+            for try await value in group { values.append(value) }
+            return values
+        }
+        XCTAssertEqual(counts, Array(repeating: 2, count: 8))
+        let refreshRequests = (try await server.requestLog()).filter { $0 == "POST /api/v4/session/token/refresh" }
+        XCTAssertEqual(refreshRequests.count, 1)
+
+        try await api.deleteDavAccount(id: created.id)
+        let remainingAccounts = try await api.listDavAccounts()
+        XCTAssertEqual(remainingAccounts.map(\.id), [accounts[0].id])
+
         api.signOut()
         XCTAssertFalse(api.isSignedIn)
         do {
@@ -139,6 +159,70 @@ final class CloudreveTests: XCTestCase {
         } catch let error as CloudreveError {
             guard case .authenticationRequired = error else { return XCTFail("Unerwarteter Fehler \(error)") }
         }
+    }
+
+    func testTransientRefreshFailureKeepsTokensForRetry() async throws {
+        let loginAPI = try await signedInAPI()
+        var tokens = try XCTUnwrap(loginAPI.currentTokens)
+        tokens.accessExpires = Date().addingTimeInterval(-1)
+        let changes = Recorder<CloudreveTokens?>()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 1
+        let api = try CloudreveAPIClient(
+            siteURL: server.siteURL,
+            tokens: tokens,
+            allowInsecureHTTP: true,
+            sessionConfiguration: configuration,
+            onTokensChanged: { changes.append($0) }
+        )
+
+        server.stop()
+        do {
+            _ = try await api.listDavAccounts()
+            XCTFail("Ohne Server muss die Token-Erneuerung scheitern")
+        } catch let error as CloudreveError {
+            guard case .network = error else { return XCTFail("Netzwerkfehler erwartet, nicht \(error)") }
+        }
+
+        XCTAssertEqual(api.currentTokens, tokens, "Ein vorübergehender Netzfehler darf die erneuerbare Sitzung nicht löschen")
+        XCTAssertTrue(api.isSignedIn)
+        XCTAssertTrue(changes.values.isEmpty)
+    }
+
+    func testSignOutDuringRefreshCannotRestoreTokens() async throws {
+        let loginAPI = try await signedInAPI()
+        var tokens = try XCTUnwrap(loginAPI.currentTokens)
+        tokens.accessExpires = Date().addingTimeInterval(-1)
+        let changes = Recorder<CloudreveTokens?>()
+        let api = try CloudreveAPIClient(
+            siteURL: server.siteURL,
+            tokens: tokens,
+            allowInsecureHTTP: true,
+            onTokensChanged: { changes.append($0) }
+        )
+        try await server.hook("delay-refresh", json: ["seconds": 1.0])
+
+        let request = Task { try await api.listDavAccounts() }
+        var refreshStarted = false
+        for _ in 0..<100 {
+            if try await server.requestLog().contains("POST /api/v4/session/token/refresh") {
+                refreshStarted = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(refreshStarted, "Der Test muss während eines laufenden Refreshs abmelden")
+
+        api.signOut()
+        do {
+            _ = try await request.value
+            XCTFail("Die Anfrage darf nach der Abmeldung nicht erfolgreich werden")
+        } catch {
+            // Abmeldung bricht die laufende Anfrage ab.
+        }
+        XCTAssertNil(api.currentTokens)
+        XCTAssertFalse(api.isSignedIn)
+        XCTAssertEqual(changes.values, [nil])
     }
 
     func testTwoFactorFlow() async throws {
@@ -176,14 +260,13 @@ final class CloudreveTests: XCTestCase {
         let progress = Recorder<Int64>()
         let result = try await transport.upload(info) { done, _ in progress.append(done) }
         XCTAssertEqual(result.status, 201)
-        let etag = try XCTUnwrap(result.etag)
-        XCTAssertFalse(etag.hasPrefix("W/"))
+        XCTAssertNil(result.etag, "Ein nachträgliches PROPFIND darf nicht als kausaler Upload-Validator gelten")
 
         let remote = server.serverRoot.appendingPathComponent("Ordner/gross ä.bin")
         XCTAssertEqual(try Data(contentsOf: remote), try Data(contentsOf: file))
         let stat = try await davClient().stat("Ordner/gross ä.bin")
         XCTAssertEqual(stat?.size, Int64(size))
-        XCTAssertEqual(stat?.validator, etag)
+        let etag = try XCTUnwrap(stat?.validator)
         XCTAssertEqual(progress.values.last, Int64(size))
         let remaining = try await store.uploadState(path: "Ordner/gross ä.bin", mappingID: "m1")
         XCTAssertNil(remaining, "Status muss nach Abschluss entfernt sein")
@@ -195,7 +278,10 @@ final class CloudreveTests: XCTestCase {
         let file2 = try randomFile(name: "gross2.bin", size: size + 7)
         let info2 = try requestInfo(for: file2, path: "Ordner/gross ä.bin", replacing: etag)
         let result2 = try await transport.upload(info2, progress: nil)
-        XCTAssertNotEqual(result2.etag, etag)
+        XCTAssertNil(result2.etag)
+        let secondStat = try await davClient().stat("Ordner/gross ä.bin")
+        let secondETag = try XCTUnwrap(secondStat?.validator)
+        XCTAssertNotEqual(secondETag, etag)
         XCTAssertEqual(try Data(contentsOf: remote), try Data(contentsOf: file2))
 
         // Veralteter Validator → Versionskonflikt (wie 412 beim WebDAV-PUT).
@@ -205,6 +291,52 @@ final class CloudreveTests: XCTestCase {
         } catch let error as WebDAVError {
             XCTAssertEqual(error, .preconditionFailed)
         }
+    }
+
+    func testUnchunkedCloudreveSessionStreamsWholeFile() async throws {
+        server.stop()
+        server = try DevServerLauncher()
+        try server.start(
+            user: "anna@example.org",
+            password: "dav-geheim",
+            extraArguments: ["--cloudreve", "--chunk-size", "0"]
+        )
+        let api = try await signedInAPI()
+        let store = try makeStore()
+        let file = try randomFile(name: "ungeteilt.bin", size: 200_123)
+        let info = try requestInfo(for: file, path: "ungeteilt.bin")
+        let transport = try transport(api: api, store: store, mappingID: "m1")
+
+        _ = try await transport.upload(info, progress: nil)
+
+        XCTAssertEqual(
+            try Data(contentsOf: server.serverRoot.appendingPathComponent("ungeteilt.bin")),
+            try Data(contentsOf: file)
+        )
+        let log = try await server.requestLog()
+        XCTAssertEqual(log.filter { $0.hasPrefix("POST /api/v4/file/upload/") }.count, 1)
+    }
+
+    func testOverwriteRequiresCloudreveEntityIDInsteadOfSyntheticValidator() async throws {
+        let api = try await signedInAPI()
+        let store = try makeStore()
+        let file = try randomFile(name: "synthetic.bin", size: 1024)
+        let info = try requestInfo(
+            for: file,
+            path: "synthetic.bin",
+            replacing: "mtime:1700000000;size:1024"
+        )
+        let transport = try transport(api: api, store: store, mappingID: "m1")
+        try await server.hook("reset-log", json: [:])
+
+        do {
+            _ = try await transport.upload(info, progress: nil)
+            XCTFail("Ein Ersatzvalidator darf nicht als Cloudreve-Entity-ID verwendet werden")
+        } catch let error as CloudreveError {
+            guard case .unsupportedStoragePolicy = error else { return XCTFail("Unerwarteter Fehler: \(error)") }
+        }
+        let log = try await server.requestLog()
+        XCTAssertFalse(log.contains("PUT /api/v4/file/upload"))
     }
 
     func testInterruptedUploadResumesWithoutResendingChunks() async throws {
@@ -239,6 +371,35 @@ final class CloudreveTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: server.serverRoot.appendingPathComponent("resume.bin")), try Data(contentsOf: file))
         let afterResume = try await store.uploadState(path: "resume.bin", mappingID: "m1")
         XCTAssertNil(afterResume)
+    }
+
+    func testLostFinalChunkResponseIsRecognisedWithoutRestartingSession() async throws {
+        let api = try await signedInAPI()
+        let store = try makeStore()
+        let size = Int(chunkSize) * 3
+        let file = try randomFile(name: "committed.bin", size: size)
+        let info = try requestInfo(for: file, path: "committed.bin")
+        let transport = try transport(api: api, store: store, mappingID: "m1")
+
+        try await server.hook("drop-after-commit", json: ["indexes": [2]])
+        do {
+            _ = try await transport.upload(info, progress: nil)
+            XCTFail("Verlorene Abschlussantwort muss zunächst als Netzwerkfehler erscheinen")
+        } catch let error as WebDAVError {
+            guard case .network = error else { return XCTFail("Netzwerkfehler erwartet, nicht \(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: server.serverRoot.appendingPathComponent("committed.bin")), try Data(contentsOf: file))
+        let pending = try await store.uploadState(path: "committed.bin", mappingID: "m1")
+        XCTAssertEqual(pending?.uploadedChunks, 2)
+
+        try await server.hook("reset-log", json: [:])
+        let result = try await transport.upload(info, progress: nil)
+        XCTAssertEqual(result.status, 201)
+        let log = try await server.requestLog()
+        XCTAssertFalse(log.contains("PUT /api/v4/file/upload"), "Eine bereits vollständig gespeicherte Datei darf keine neue Sitzung erzeugen")
+        XCTAssertFalse(log.contains { $0.hasPrefix("POST /api/v4/file/upload/") })
+        let remaining = try await store.uploadState(path: "committed.bin", mappingID: "m1")
+        XCTAssertNil(remaining)
     }
 
     func testExpiredSessionRestartsUpload() async throws {
@@ -292,24 +453,6 @@ final class CloudreveTests: XCTestCase {
         XCTAssertEqual((try JSONSerialization.jsonObject(with: sessions) as? [Any])?.count, 0, "Sitzung muss serverseitig gelöscht sein")
     }
 
-    func testSingleRequestUploadWhenServerDisablesChunking() async throws {
-        server.stop()
-        server = try DevServerLauncher()
-        try server.start(user: "anna@example.org", password: "dav-geheim", extraArguments: ["--cloudreve", "--chunk-size", "0"])
-        let api = try await signedInAPI()
-        let store = try makeStore()
-        let file = try randomFile(name: "single.bin", size: 300_000)
-        let info = try requestInfo(for: file, path: "single.bin")
-        let transport = try transport(api: api, store: store, mappingID: "m1")
-        let result = try await transport.upload(info, progress: nil)
-        XCTAssertEqual(result.status, 201)
-        let log = try await server.requestLog()
-        let chunkPosts = log.filter { $0.hasPrefix("POST /api/v4/file/upload/") }
-        XCTAssertEqual(chunkPosts.count, 1)
-        XCTAssertTrue(chunkPosts.first?.hasSuffix("/0") ?? false)
-        XCTAssertEqual(try Data(contentsOf: server.serverRoot.appendingPathComponent("single.bin")), try Data(contentsOf: file))
-    }
-
     // MARK: - Engine-Integration
 
     func testEngineUsesChunkTransportAboveThreshold() async throws {
@@ -342,8 +485,9 @@ final class CloudreveTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: server.serverRoot.appendingPathComponent("klein.txt"), encoding: .utf8), "klein")
 
         let log = try await server.requestLog()
-        XCTAssertEqual(log.filter { $0 == "PUT /api/v4/file/upload" }.count, 1, "Nur die große Datei geht über die Upload-API")
-        XCTAssertEqual(log.filter { $0.hasPrefix("POST /api/v4/file/upload/") }.count, 3)
+        XCTAssertEqual(log.filter { $0 == "PUT /api/v4/file/upload" }.count, 2,
+                       "Cloudreve-Uploads nutzen den versionierten API-Pfad, da WebDAV If-Match ignoriert")
+        XCTAssertEqual(log.filter { $0.hasPrefix("POST /api/v4/file/upload/") }.count, 4)
 
         // Baseline muss den Server-ETag der großen Datei kennen (sonst würde sie erneut übertragen).
         let remoteStat = try await client.stat("gross.bin")
@@ -389,7 +533,19 @@ final class CloudreveTests: XCTestCase {
         try await store.replaceShares(shares, accountID: "acc")
         let cached = try await store.shares(accountID: "acc")
         XCTAssertEqual(cached.count, 2)
-        XCTAssertEqual(cached.first { $0.id == folder.id }?.password, "abc123")
+        XCTAssertNil(cached.first { $0.id == folder.id }?.password, "Freigabe-Passwörter dürfen nicht in SQLite zwischengespeichert werden")
+        let unusualPrivate = CloudreveShare(
+            id: "andere-id",
+            name: "Privat",
+            url: URL(string: "https://example.org/custom/secret-passwort/weiter")!,
+            isPrivate: true,
+            password: "secret-passwort"
+        )
+        try await store.saveShare(unusualPrivate, accountID: "acc")
+        let cachedWithUnusual = try await store.shares(accountID: "acc")
+        let scrubbed = try XCTUnwrap(cachedWithUnusual.first { $0.id == unusualPrivate.id })
+        XCTAssertFalse(scrubbed.url.absoluteString.contains("secret-passwort"))
+        try await store.deleteShare(id: unusualPrivate.id)
 
         try await api.deleteShare(id: folder.id)
         let remainingShares = try await api.listShares()
@@ -417,25 +573,48 @@ final class CloudreveTests: XCTestCase {
         XCTAssertEqual(CloudreveURI.folderPath(from: "cloudreve://my/Sync/Projekte%20A"), "/Sync/Projekte A")
         XCTAssertEqual(CloudreveURI.folderPath(from: "cloudreve://my/"), "/")
         XCTAssertThrowsError(try CloudreveURI.fileURI(root: "cloudreve://my/", relativePath: "../ausbruch"))
+        XCTAssertThrowsError(try CloudreveURI.fileURI(root: "cloudreve://other/Sync", relativePath: "datei"))
+        XCTAssertThrowsError(try CloudreveURI.fileURI(root: "cloudreve://my/../fremd", relativePath: "datei"))
+        XCTAssertThrowsError(try CloudreveURI.validatedRootURI(folderPath: "/Sync/../fremd"))
+        XCTAssertThrowsError(try CloudreveURI.validatedRootURI(folderPath: "/Sync//fremd"))
+        XCTAssertNil(CloudreveAPIClient.parseShare(["id": "s", "url": "javascript:alert(1)"]))
+        XCTAssertNil(CloudreveAPIClient.parseShare(["id": "s", "url": "https://user:pass@example.org/s/s"]))
     }
 
     func testUploadStatePersistence() async throws {
         let store = try makeStore()
-        let session = CloudreveUploadSession(sessionID: "s1", chunkSize: 1024, expires: Date().addingTimeInterval(3600), uploadURLs: [], credential: nil,
+        let session = CloudreveUploadSession(sessionID: "s1", chunkSize: 1024, expires: Date().addingTimeInterval(3600),
+                                             uploadURLs: ["https://storage.example/signed"], credential: "secret-credential",
                                              policy: CloudreveStoragePolicy(id: "p", name: "local", type: "local", relay: false, chunkConcurrency: 1, maxSize: 0),
                                              uri: "cloudreve://my/a.bin")
-        let info = UploadRequestInfo(path: "a.bin", rawPath: "a.bin", fileURL: URL(fileURLWithPath: "/tmp/a.bin"), size: 2500, modified: 1_700_000_000, hash: "h", replacingValidator: nil)
+        let info = UploadRequestInfo(path: "a.bin", rawPath: "a.bin", fileURL: URL(fileURLWithPath: "/tmp/a.bin"), size: 2500, modified: 1_700_000_000, hash: "h", replacingValidator: "\"entity-a\"")
         var state = ResumableUploadState(path: "a.bin", uri: "cloudreve://my/a.bin", session: session, info: info)
+        XCTAssertTrue(state.uploadURLs.isEmpty)
+        XCTAssertNil(state.credential)
         XCTAssertEqual(state.totalChunks, 3)
         state.uploadedChunks = 2
+        state.uploadURLs = ["https://storage.example/signed?token=secret"]
+        state.credential = "secret-credential"
         try await store.saveUploadState(state, mappingID: "m")
         let loadedState = try await store.uploadState(path: "a.bin", mappingID: "m")
         let loaded = try XCTUnwrap(loadedState)
-        XCTAssertEqual(loaded, state)
+        XCTAssertEqual(loaded.uploadedChunks, state.uploadedChunks)
+        XCTAssertTrue(loaded.uploadURLs.isEmpty)
+        XCTAssertNil(loaded.credential)
+        XCTAssertEqual(loaded.replacingValidator, "\"entity-a\"")
         XCTAssertTrue(loaded.matches(info, uri: "cloudreve://my/a.bin"))
         var other = info
         other.modified += 1
         XCTAssertFalse(loaded.matches(other, uri: "cloudreve://my/a.bin"))
+        other = info
+        other.replacingValidator = "\"entity-b\""
+        XCTAssertFalse(loaded.matches(other, uri: "cloudreve://my/a.bin"), "Eine Sitzung darf nicht gegen eine andere Serverversion fortgesetzt werden")
+        var malformed = loaded
+        malformed.uploadedChunks = -1
+        XCTAssertFalse(malformed.matches(info, uri: "cloudreve://my/a.bin"))
+        malformed = loaded
+        malformed.chunkSize = ResumableUploadState.maximumChunkSize + 1
+        XCTAssertFalse(malformed.matches(info, uri: "cloudreve://my/a.bin"))
         XCTAssertFalse(loaded.matches(info, uri: "cloudreve://my/b.bin"))
         XCTAssertFalse(loaded.matches(info, uri: "cloudreve://my/a.bin", now: Date().addingTimeInterval(3500)), "Kurz vor Ablauf nicht fortsetzen")
         let all = try await store.uploadStates(mappingID: "m")

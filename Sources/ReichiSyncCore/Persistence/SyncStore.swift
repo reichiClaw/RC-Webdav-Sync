@@ -1,5 +1,19 @@
 import Foundation
 
+public enum SyncStoreError: LocalizedError, Sendable {
+    case unsupportedSchema(existing: Int, supported: Int)
+    case corruptRecord(table: String, identifier: String, details: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSchema(let existing, let supported):
+            return "Die Synchronisierungsdatenbank hat Schema-Version \(existing), diese App unterstützt höchstens Version \(supported)."
+        case .corruptRecord(let table, let identifier, let details):
+            return "Beschädigter Datensatz in „\(table)“ (\(identifier)): \(details)"
+        }
+    }
+}
+
 /// Persistente Ablage für Synchronisierungsstände, Hash-Cache, Warteschlange,
 /// Konflikte, Aktivitätsprotokoll und ausstehende Löschbestätigungen.
 ///
@@ -7,7 +21,7 @@ import Foundation
 /// (z. B. `~/Library/Application Support/reichi Sync/sync.sqlite`).
 public actor SyncStore {
     private let db: SQLiteDatabase
-    private static let schemaVersion = 2
+    private static let schemaVersion = 4
 
     public init(path: String) throws {
         db = try SQLiteDatabase(path: path)
@@ -20,7 +34,12 @@ public actor SyncStore {
     }
 
     private static func migrate(_ db: SQLiteDatabase) throws {
-        if db.userVersion >= Self.schemaVersion { return }
+        let existingVersion = try db.userVersion()
+        guard existingVersion <= Self.schemaVersion else {
+            throw SyncStoreError.unsupportedSchema(existing: existingVersion, supported: Self.schemaVersion)
+        }
+        if existingVersion == Self.schemaVersion { return }
+        let needsSecretScrub = existingVersion > 0 && existingVersion < 4
         try db.transaction {
             try db.execute("""
             CREATE TABLE IF NOT EXISTS meta (
@@ -45,7 +64,6 @@ public actor SyncStore {
                 remote_index_complete INTEGER NOT NULL DEFAULT 0
             )
             """)
-            try db.execute("CREATE INDEX IF NOT EXISTS idx_mappings_key ON mappings(account_id, mapping_key)")
             try db.execute("""
             CREATE TABLE IF NOT EXISTS entries (
                 mapping_id TEXT NOT NULL,
@@ -69,6 +87,8 @@ public actor SyncStore {
                 size INTEGER NOT NULL,
                 mtime REAL NOT NULL,
                 hash TEXT NOT NULL,
+                file_id TEXT,
+                change_time REAL,
                 PRIMARY KEY (mapping_id, path)
             )
             """)
@@ -142,14 +162,140 @@ public actor SyncStore {
                 created_at REAL NOT NULL
             )
             """)
-            db.userVersion = Self.schemaVersion
+            let localIndexColumns = Set(try db.query("PRAGMA table_info(local_index)").compactMap { $0.string("name") })
+            if !localIndexColumns.contains("file_id") {
+                try db.execute("ALTER TABLE local_index ADD COLUMN file_id TEXT")
+            }
+            if !localIndexColumns.contains("change_time") {
+                try db.execute("ALTER TABLE local_index ADD COLUMN change_time REAL")
+            }
+
+            if existingVersion < 4 {
+                // Ältere Versionen speicherten bei Cloudreve kurzlebige
+                // Upload-Zugangsdaten und Freigabe-Passwörter in SQLite.
+                // Diese Daten werden beim Upgrade vollständig entfernt.
+                try db.execute("DELETE FROM upload_sessions")
+                try db.execute("DELETE FROM shares")
+            }
+
+            // Schema 1/2 band den gemeinsamen Stand weder an den Benutzernamen
+            // noch an die Cloudreve-Kontoidentität oder Ausschlussregeln.
+            // Eine automatische Übernahme könnte deshalb den Stand eines
+            // anderen Kontos als Baseline verwenden und dessen Dateien lokal
+            // überschreiben. Alte Zuordnungen bleiben zur Diagnose erhalten;
+            // `mapping(for:)` legt für den identitätsgebundenen Schlüssel einen
+            // leeren Stand an, sodass der nächste Lauf sicher zusammenführt.
+
+            // Der Constraint ist Teil der Korrektheit: Zwei Store-Instanzen
+            // dürfen nie getrennte Baselines für dieselbe Zuordnung anlegen.
+            try deduplicateMappings(db)
+            try db.execute("DROP INDEX IF EXISTS idx_mappings_key")
+            try db.execute("CREATE UNIQUE INDEX idx_mappings_key ON mappings(account_id, mapping_key)")
+            try db.setUserVersion(Self.schemaVersion)
+        }
+        if needsSecretScrub {
+            // `secure_delete` überschreibt die gelöschten Zellen. Checkpoint
+            // und VACUUM entfernen zusätzlich frühere Kopien aus WAL und
+            // unbenutzten Seiten der Hauptdatei.
+            try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            try db.execute("VACUUM")
+            try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        }
+    }
+
+    /// Konsolidiert Zuordnungen, die ältere Schemas bei zwei gleichzeitig
+    /// startenden App-Instanzen anlegen konnten. Baseline-Zeilen werden pro Pfad
+    /// nach dem neuesten `synced_at` übernommen; abgeleitete Caches und alte
+    /// Löschfreigaben werden verworfen und beim nächsten Lauf sicher neu gebaut.
+    private static func deduplicateMappings(_ db: SQLiteDatabase) throws {
+        let groups = try db.query("""
+        SELECT account_id, mapping_key
+        FROM mappings
+        GROUP BY account_id, mapping_key
+        HAVING COUNT(*) > 1
+        """)
+        for group in groups {
+            guard let accountID = group.string("account_id"),
+                  let mappingKey = group.string("mapping_key") else { continue }
+            let mappings = try db.query(
+                """
+                SELECT id, created_at, last_successful_sync
+                FROM mappings
+                WHERE account_id = ? AND mapping_key = ?
+                ORDER BY created_at, id
+                """,
+                [.text(accountID), .text(mappingKey)]
+            )
+            guard let survivor = mappings.first?.string("id"), mappings.count > 1 else { continue }
+            let ids = mappings.compactMap { $0.string("id") }
+            let latestSuccessfulSync = mappings.compactMap { $0.double("last_successful_sync") }.max()
+            let wasUserPaused = try ids.contains { id in
+                try db.query("SELECT value FROM meta WHERE key = ?", [.text("user-pause.\(id)")])
+                    .first?.string("value") == "1"
+            }
+
+            for duplicate in ids.dropFirst() {
+                for row in try db.query(
+                    "SELECT path, synced_at FROM entries WHERE mapping_id = ?",
+                    [.text(duplicate)]
+                ) {
+                    guard let path = row.string("path"), let duplicateDate = row.double("synced_at") else { continue }
+                    let survivorDate = try db.query(
+                        "SELECT synced_at FROM entries WHERE mapping_id = ? AND path = ?",
+                        [.text(survivor), .text(path)]
+                    ).first?.double("synced_at")
+                    if survivorDate.map({ duplicateDate > $0 }) ?? true {
+                        try db.execute(
+                            "DELETE FROM entries WHERE mapping_id = ? AND path = ?",
+                            [.text(survivor), .text(path)]
+                        )
+                        try db.execute(
+                            "UPDATE entries SET mapping_id = ? WHERE mapping_id = ? AND path = ?",
+                            [.text(survivor), .text(duplicate), .text(path)]
+                        )
+                    } else {
+                        try db.execute(
+                            "DELETE FROM entries WHERE mapping_id = ? AND path = ?",
+                            [.text(duplicate), .text(path)]
+                        )
+                    }
+                }
+                try db.execute("UPDATE conflicts SET mapping_id = ? WHERE mapping_id = ?", [.text(survivor), .text(duplicate)])
+                try db.execute("UPDATE transfers SET mapping_id = ? WHERE mapping_id = ?", [.text(survivor), .text(duplicate)])
+            }
+
+            for table in ["local_index", "remote_index", "queue", "pending_deletions", "upload_sessions"] {
+                for id in ids {
+                    try db.execute("DELETE FROM \(table) WHERE mapping_id = ?", [.text(id)])
+                }
+            }
+            for id in ids {
+                try db.execute("DELETE FROM meta WHERE key = ?", [.text("user-pause.\(id)")])
+            }
+            if wasUserPaused {
+                try db.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, '1') ON CONFLICT(key) DO UPDATE SET value = '1'",
+                    [.text("user-pause.\(survivor)")]
+                )
+            }
+            for duplicate in ids.dropFirst() {
+                try db.execute("DELETE FROM mappings WHERE id = ?", [.text(duplicate)])
+            }
+            try db.execute(
+                """
+                UPDATE mappings
+                SET last_successful_sync = ?, sync_token = NULL, remote_index_complete = 0
+                WHERE id = ?
+                """,
+                [SQLValue(latestSuccessfulSync), .text(survivor)]
+            )
         }
     }
 
     // MARK: - Meta
 
-    public func meta(_ key: String) -> String? {
-        try? db.query("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.string("value")
+    public func meta(_ key: String) throws -> String? {
+        try db.query("SELECT value FROM meta WHERE key = ?", [.text(key)]).first?.string("value")
     }
 
     public func setMeta(_ key: String, _ value: String?) throws {
@@ -162,15 +308,27 @@ public actor SyncStore {
 
     // MARK: - Accounts
 
+    private static func decodeRecord<T: Decodable>(_ type: T.Type, json: String?, table: String,
+                                                    identifier: String) throws -> T {
+        guard let json else {
+            throw SyncStoreError.corruptRecord(table: table, identifier: identifier, details: "JSON fehlt")
+        }
+        do {
+            return try JSONDecoder().decode(type, from: Data(json.utf8))
+        } catch {
+            throw SyncStoreError.corruptRecord(table: table, identifier: identifier, details: "\(error)")
+        }
+    }
+
     public func saveAccount(_ account: AccountConfiguration) throws {
         let json = try String(decoding: JSONEncoder().encode(account), as: UTF8.self)
         try db.execute("INSERT INTO accounts(id, json) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json", [.text(account.id), .text(json)])
     }
 
     public func accounts() throws -> [AccountConfiguration] {
-        try db.query("SELECT json FROM accounts").compactMap { row in
-            guard let json = row.string("json") else { return nil }
-            return try? JSONDecoder().decode(AccountConfiguration.self, from: Data(json.utf8))
+        try db.query("SELECT id, json FROM accounts").map { row in
+            let id = row.string("id") ?? "<ohne ID>"
+            return try Self.decodeRecord(AccountConfiguration.self, json: row.string("json"), table: "accounts", identifier: id)
         }
     }
 
@@ -191,26 +349,48 @@ public actor SyncStore {
     /// Synchronisierungsstand — alte Baselines können keine falschen Löschungen auslösen.
     public func mapping(for account: AccountConfiguration) throws -> SyncMapping {
         if let row = try db.query("SELECT * FROM mappings WHERE account_id = ? AND mapping_key = ?", [.text(account.id), .text(account.mappingKey)]).first {
-            return Self.mapping(from: row)
+            return try Self.mapping(from: row)
         }
         let mapping = SyncMapping(accountID: account.id, mappingKey: account.mappingKey)
         try db.execute("""
         INSERT INTO mappings(id, account_id, mapping_key, created_at, last_successful_sync, sync_token, remote_index_complete)
         VALUES(?, ?, ?, ?, NULL, NULL, 0)
+        ON CONFLICT(account_id, mapping_key) DO NOTHING
         """, [.text(mapping.id), .text(mapping.accountID), .text(mapping.mappingKey), .real(mapping.createdAt.timeIntervalSince1970)])
-        return mapping
+        guard let row = try db.query(
+            "SELECT * FROM mappings WHERE account_id = ? AND mapping_key = ?",
+            [.text(account.id), .text(account.mappingKey)]
+        ).first else {
+            throw SyncStoreError.corruptRecord(
+                table: "mappings",
+                identifier: account.id,
+                details: "Zuordnung konnte nicht atomar angelegt werden"
+            )
+        }
+        return try Self.mapping(from: row)
     }
 
     public func mapping(id: String) throws -> SyncMapping? {
-        try db.query("SELECT * FROM mappings WHERE id = ?", [.text(id)]).first.map(Self.mapping(from:))
+        guard let row = try db.query("SELECT * FROM mappings WHERE id = ?", [.text(id)]).first else { return nil }
+        return try Self.mapping(from: row)
     }
 
-    private static func mapping(from row: SQLRow) -> SyncMapping {
-        SyncMapping(
-            id: row.string("id") ?? "",
-            accountID: row.string("account_id") ?? "",
-            mappingKey: row.string("mapping_key") ?? "",
-            createdAt: row.date("created_at") ?? Date(),
+    private static func mapping(from row: SQLRow) throws -> SyncMapping {
+        guard let id = row.string("id"),
+              let accountID = row.string("account_id"),
+              let mappingKey = row.string("mapping_key"),
+              let createdAt = row.date("created_at") else {
+            throw SyncStoreError.corruptRecord(
+                table: "mappings",
+                identifier: row.string("id") ?? "<ohne ID>",
+                details: "Pflichtfeld fehlt"
+            )
+        }
+        return SyncMapping(
+            id: id,
+            accountID: accountID,
+            mappingKey: mappingKey,
+            createdAt: createdAt,
             lastSuccessfulSync: row.date("last_successful_sync"),
             syncToken: row.string("sync_token"),
             remoteIndexIsComplete: row.bool("remote_index_complete")
@@ -242,17 +422,29 @@ public actor SyncStore {
     public func baseline(mappingID: String) throws -> [String: BaselineEntry] {
         var result: [String: BaselineEntry] = [:]
         for row in try db.query("SELECT * FROM entries WHERE mapping_id = ?", [.text(mappingID)]) {
-            guard let path = row.string("path"), let kindRaw = row.string("kind"), let kind = ItemKind(rawValue: kindRaw) else { continue }
+            guard let path = row.string("path"),
+                  let kindRaw = row.string("kind"),
+                  let kind = ItemKind(rawValue: kindRaw),
+                  let localSize = row.int64("local_size"),
+                  let localModified = row.double("local_mtime"),
+                  let remoteSize = row.int64("remote_size"),
+                  let syncedAt = row.date("synced_at") else {
+                throw SyncStoreError.corruptRecord(
+                    table: "entries",
+                    identifier: row.string("path") ?? "<ohne Pfad>",
+                    details: "Pflichtfeld fehlt oder ist ungültig"
+                )
+            }
             result[path] = BaselineEntry(
                 path: path, kind: kind,
                 localHash: row.string("local_hash"),
-                localSize: row.int64("local_size") ?? 0,
-                localModified: row.double("local_mtime") ?? 0,
+                localSize: localSize,
+                localModified: localModified,
                 remoteValidator: row.string("remote_validator"),
                 remoteValidatorIsStrong: row.bool("remote_validator_strong"),
-                remoteSize: row.int64("remote_size") ?? 0,
+                remoteSize: remoteSize,
                 remoteModified: row.double("remote_mtime"),
-                syncedAt: row.date("synced_at") ?? Date()
+                syncedAt: syncedAt
             )
         }
         return result
@@ -311,18 +503,38 @@ public actor SyncStore {
         public var size: Int64
         public var mtime: Double
         public var hash: String
-        public init(size: Int64, mtime: Double, hash: String) {
+        public var fileID: String?
+        public var changeTime: Double?
+
+        public init(size: Int64, mtime: Double, hash: String, fileID: String? = nil, changeTime: Double? = nil) {
             self.size = size
             self.mtime = mtime
             self.hash = hash
+            self.fileID = fileID
+            self.changeTime = changeTime
         }
     }
 
     public func localIndex(mappingID: String) throws -> [String: LocalIndexEntry] {
         var result: [String: LocalIndexEntry] = [:]
-        for row in try db.query("SELECT path, size, mtime, hash FROM local_index WHERE mapping_id = ?", [.text(mappingID)]) {
-            guard let path = row.string("path"), let hash = row.string("hash") else { continue }
-            result[path] = LocalIndexEntry(size: row.int64("size") ?? 0, mtime: row.double("mtime") ?? 0, hash: hash)
+        for row in try db.query("SELECT path, size, mtime, hash, file_id, change_time FROM local_index WHERE mapping_id = ?", [.text(mappingID)]) {
+            guard let path = row.string("path"),
+                  let size = row.int64("size"),
+                  let mtime = row.double("mtime"),
+                  let hash = row.string("hash") else {
+                throw SyncStoreError.corruptRecord(
+                    table: "local_index",
+                    identifier: row.string("path") ?? "<ohne Pfad>",
+                    details: "Pflichtfeld fehlt"
+                )
+            }
+            result[path] = LocalIndexEntry(
+                size: size,
+                mtime: mtime,
+                hash: hash,
+                fileID: row.string("file_id"),
+                changeTime: row.double("change_time")
+            )
         }
         return result
     }
@@ -331,10 +543,22 @@ public actor SyncStore {
         try db.transaction {
             try db.execute("DELETE FROM local_index WHERE mapping_id = ?", [.text(mappingID)])
             for (path, e) in index {
-                try db.execute("INSERT INTO local_index(mapping_id, path, size, mtime, hash) VALUES(?, ?, ?, ?, ?)",
-                               [.text(mappingID), .text(path), .integer(e.size), .real(e.mtime), .text(e.hash)])
+                try db.execute("""
+                INSERT INTO local_index(mapping_id, path, size, mtime, hash, file_id, change_time)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    .text(mappingID), .text(path), .integer(e.size), .real(e.mtime), .text(e.hash),
+                    SQLValue(e.fileID), SQLValue(e.changeTime),
+                ])
             }
         }
+    }
+
+    public func removeLocalIndex(path: String, mappingID: String) throws {
+        try db.execute(
+            "DELETE FROM local_index WHERE mapping_id = ? AND path = ?",
+            [.text(mappingID), .text(path)]
+        )
     }
 
     // MARK: - Remote index (Cache für Sync-Collection)
@@ -342,8 +566,18 @@ public actor SyncStore {
     public func remoteIndex(mappingID: String) throws -> [String: RemoteItem] {
         var result: [String: RemoteItem] = [:]
         for row in try db.query("SELECT * FROM remote_index WHERE mapping_id = ?", [.text(mappingID)]) {
-            guard let path = row.string("path"), let kindRaw = row.string("kind"), let kind = ItemKind(rawValue: kindRaw) else { continue }
-            result[path] = RemoteItem(path: path, rawPath: row.string("raw_path") ?? path, kind: kind, size: row.int64("size") ?? 0,
+            guard let path = row.string("path"),
+                  let rawPath = row.string("raw_path"),
+                  let kindRaw = row.string("kind"),
+                  let kind = ItemKind(rawValue: kindRaw),
+                  let size = row.int64("size") else {
+                throw SyncStoreError.corruptRecord(
+                    table: "remote_index",
+                    identifier: row.string("path") ?? "<ohne Pfad>",
+                    details: "Pflichtfeld fehlt oder ist ungültig"
+                )
+            }
+            result[path] = RemoteItem(path: path, rawPath: rawPath, kind: kind, size: size,
                                       modified: row.double("mtime"), validator: row.string("validator"),
                                       validatorIsStrong: row.bool("validator_strong"), contentType: row.string("content_type"))
         }
@@ -354,6 +588,24 @@ public actor SyncStore {
         try db.transaction {
             try db.execute("DELETE FROM remote_index WHERE mapping_id = ?", [.text(mappingID)])
             for (_, item) in items { try insertRemoteIndexItem(item, mappingID: mappingID) }
+        }
+    }
+
+    /// Ersetzt Cache und zugehörigen Sync-Token in derselben Transaktion. Ein
+    /// Token darf niemals fortgeschrieben werden, wenn der Bestand nicht
+    /// vollständig persistiert werden konnte.
+    public func replaceRemoteIndex(
+        _ items: [String: RemoteItem],
+        syncToken: String,
+        mappingID: String
+    ) throws {
+        try db.transaction {
+            try db.execute("DELETE FROM remote_index WHERE mapping_id = ?", [.text(mappingID)])
+            for (_, item) in items { try insertRemoteIndexItem(item, mappingID: mappingID) }
+            try db.execute(
+                "UPDATE mappings SET sync_token = ?, remote_index_complete = 1 WHERE id = ?",
+                [.text(syncToken), .text(mappingID)]
+            )
         }
     }
 
@@ -371,18 +623,29 @@ public actor SyncStore {
 
     public func conflicts(mappingID: String, includeResolved: Bool = false) throws -> [ConflictRecord] {
         let sql = includeResolved
-            ? "SELECT json FROM conflicts WHERE mapping_id = ? ORDER BY detected_at DESC"
-            : "SELECT json FROM conflicts WHERE mapping_id = ? AND status = 'open' ORDER BY detected_at DESC"
-        return try db.query(sql, [.text(mappingID)]).compactMap { row in
-            guard let json = row.string("json") else { return nil }
-            return try? JSONDecoder().decode(ConflictRecord.self, from: Data(json.utf8))
+            ? "SELECT id, json FROM conflicts WHERE mapping_id = ? ORDER BY detected_at DESC"
+            : "SELECT id, json FROM conflicts WHERE mapping_id = ? AND status = 'open' ORDER BY detected_at DESC"
+        return try db.query(sql, [.text(mappingID)]).map { row in
+            try Self.decodeRecord(
+                ConflictRecord.self,
+                json: row.string("json"),
+                table: "conflicts",
+                identifier: row.string("id") ?? "<ohne ID>"
+            )
         }
     }
 
     public func openConflict(path: String, mappingID: String) throws -> ConflictRecord? {
-        try db.query("SELECT json FROM conflicts WHERE mapping_id = ? AND path = ? AND status = 'open'", [.text(mappingID), .text(path)]).first.flatMap { row in
-            row.string("json").flatMap { try? JSONDecoder().decode(ConflictRecord.self, from: Data($0.utf8)) }
-        }
+        guard let row = try db.query(
+            "SELECT id, json FROM conflicts WHERE mapping_id = ? AND path = ? AND status = 'open'",
+            [.text(mappingID), .text(path)]
+        ).first else { return nil }
+        return try Self.decodeRecord(
+            ConflictRecord.self,
+            json: row.string("json"),
+            table: "conflicts",
+            identifier: row.string("id") ?? path
+        )
     }
 
     public func saveConflict(_ conflict: ConflictRecord, mappingID: String) throws {
@@ -412,9 +675,13 @@ public actor SyncStore {
     }
 
     public func transfers(mappingID: String, limit: Int = 300) throws -> [TransferRecord] {
-        try db.query("SELECT json FROM transfers WHERE mapping_id = ? ORDER BY started_at DESC LIMIT ?", [.text(mappingID), .integer(Int64(limit))]).compactMap { row in
-            guard let json = row.string("json") else { return nil }
-            return try? JSONDecoder().decode(TransferRecord.self, from: Data(json.utf8))
+        try db.query("SELECT id, json FROM transfers WHERE mapping_id = ? ORDER BY started_at DESC LIMIT ?", [.text(mappingID), .integer(Int64(limit))]).map { row in
+            try Self.decodeRecord(
+                TransferRecord.self,
+                json: row.string("json"),
+                table: "transfers",
+                identifier: row.string("id") ?? "<ohne ID>"
+            )
         }
     }
 
@@ -454,9 +721,19 @@ public actor SyncStore {
     }
 
     public func queue(mappingID: String) throws -> [QueuedItem] {
-        try db.query("SELECT * FROM queue WHERE mapping_id = ? ORDER BY created_at", [.text(mappingID)]).compactMap { row in
-            guard let path = row.string("path"), let dirRaw = row.string("direction"), let dir = TransferDirection(rawValue: dirRaw) else { return nil }
-            return QueuedItem(path: path, direction: dir, size: row.int64("size") ?? 0, createdAt: row.date("created_at") ?? Date())
+        try db.query("SELECT * FROM queue WHERE mapping_id = ? ORDER BY created_at", [.text(mappingID)]).map { row in
+            guard let path = row.string("path"),
+                  let dirRaw = row.string("direction"),
+                  let dir = TransferDirection(rawValue: dirRaw),
+                  let size = row.int64("size"),
+                  let createdAt = row.date("created_at") else {
+                throw SyncStoreError.corruptRecord(
+                    table: "queue",
+                    identifier: row.string("path") ?? "<ohne Pfad>",
+                    details: "Pflichtfeld fehlt oder ist ungültig"
+                )
+            }
+            return QueuedItem(path: path, direction: dir, size: size, createdAt: createdAt)
         }
     }
 
@@ -473,10 +750,17 @@ public actor SyncStore {
     }
 
     public func pendingDeletions(mappingID: String) throws -> [PendingDeletion] {
-        try db.query("SELECT * FROM pending_deletions WHERE mapping_id = ? ORDER BY path", [.text(mappingID)]).compactMap { row in
+        try db.query("SELECT * FROM pending_deletions WHERE mapping_id = ? ORDER BY path", [.text(mappingID)]).map { row in
             guard let path = row.string("path"), let side = row.string("side").flatMap(PendingDeletion.Side.init(rawValue:)),
-                  let kind = row.string("kind").flatMap(ItemKind.init(rawValue:)) else { return nil }
-            return PendingDeletion(path: path, kind: kind, side: side, plannedAt: row.date("planned_at") ?? Date())
+                  let kind = row.string("kind").flatMap(ItemKind.init(rawValue:)),
+                  let plannedAt = row.date("planned_at") else {
+                throw SyncStoreError.corruptRecord(
+                    table: "pending_deletions",
+                    identifier: row.string("path") ?? "<ohne Pfad>",
+                    details: "Pflichtfeld fehlt oder ist ungültig"
+                )
+            }
+            return PendingDeletion(path: path, kind: kind, side: side, plannedAt: plannedAt)
         }
     }
 
@@ -484,22 +768,52 @@ public actor SyncStore {
         try db.execute("DELETE FROM pending_deletions WHERE mapping_id = ?", [.text(mappingID)])
     }
 
+    /// Verwirft einen bestätigungsbedürftigen Löschplan atomar: Entweder werden
+    /// alle zugehörigen Baseline-Teilbäume und der Plan entfernt oder gar nichts.
+    public func discardPendingDeletions(mappingID: String) throws {
+        let pending = try pendingDeletions(mappingID: mappingID)
+        try db.transaction {
+            for item in pending {
+                try removeBaselineSubtree(path: item.path, mappingID: mappingID)
+            }
+            try clearPendingDeletions(mappingID: mappingID)
+        }
+    }
+
     // MARK: - Unterbrochene Uploads
 
     public func uploadState(path: String, mappingID: String) throws -> ResumableUploadState? {
-        try db.query("SELECT json FROM upload_sessions WHERE mapping_id = ? AND path = ?", [.text(mappingID), .text(path)]).first
-            .flatMap { $0.string("json") }
-            .flatMap { try? JSONDecoder().decode(ResumableUploadState.self, from: Data($0.utf8)) }
+        guard let row = try db.query(
+            "SELECT path, json FROM upload_sessions WHERE mapping_id = ? AND path = ?",
+            [.text(mappingID), .text(path)]
+        ).first else { return nil }
+        return try Self.decodeRecord(
+            ResumableUploadState.self,
+            json: row.string("json"),
+            table: "upload_sessions",
+            identifier: row.string("path") ?? path
+        )
     }
 
     public func uploadStates(mappingID: String) throws -> [ResumableUploadState] {
-        try db.query("SELECT json FROM upload_sessions WHERE mapping_id = ?", [.text(mappingID)]).compactMap { row in
-            row.string("json").flatMap { try? JSONDecoder().decode(ResumableUploadState.self, from: Data($0.utf8)) }
+        try db.query("SELECT path, json FROM upload_sessions WHERE mapping_id = ?", [.text(mappingID)]).map { row in
+            try Self.decodeRecord(
+                ResumableUploadState.self,
+                json: row.string("json"),
+                table: "upload_sessions",
+                identifier: row.string("path") ?? "<ohne Pfad>"
+            )
         }
     }
 
     public func saveUploadState(_ state: ResumableUploadState, mappingID: String) throws {
-        let json = try String(decoding: JSONEncoder().encode(state), as: UTF8.self)
+        var persisted = state
+        // Verteidigung in der Persistenzgrenze: Auch manuell konstruierte oder
+        // künftig erweiterte Zustände dürfen keine signierten URLs oder
+        // kurzlebigen Upload-Credentials in SQLite/WAL schreiben.
+        persisted.uploadURLs = []
+        persisted.credential = nil
+        let json = try String(decoding: JSONEncoder().encode(persisted), as: UTF8.self)
         try db.execute("INSERT INTO upload_sessions(mapping_id, path, json) VALUES(?, ?, ?) ON CONFLICT(mapping_id, path) DO UPDATE SET json = excluded.json",
                        [.text(mappingID), .text(state.path), .text(json)])
     }
@@ -524,8 +838,13 @@ public actor SyncStore {
     }
 
     public func shares(accountID: String) throws -> [CloudreveShare] {
-        try db.query("SELECT json FROM shares WHERE account_id = ? ORDER BY created_at DESC", [.text(accountID)]).compactMap { row in
-            row.string("json").flatMap { try? JSONDecoder().decode(ShareCacheEntry.self, from: Data($0.utf8)) }?.share
+        try db.query("SELECT id, json FROM shares WHERE account_id = ? ORDER BY created_at DESC", [.text(accountID)]).map { row in
+            try Self.decodeRecord(
+                ShareCacheEntry.self,
+                json: row.string("json"),
+                table: "shares",
+                identifier: row.string("id") ?? "<ohne ID>"
+            ).share
         }
     }
 
@@ -549,7 +868,6 @@ struct ShareCacheEntry: Codable {
     var url: URL
     var sourceURI: String?
     var isPrivate: Bool
-    var password: String?
     var expires: Date?
     var expired: Bool
     var visited: Int
@@ -559,13 +877,48 @@ struct ShareCacheEntry: Codable {
     var createdAt: Date?
 
     init(share: CloudreveShare) {
-        id = share.id; name = share.name; url = share.url; sourceURI = share.sourceURI; isPrivate = share.isPrivate; password = share.password
+        id = share.id; name = share.name; url = Self.sanitizedURL(for: share); sourceURI = share.sourceURI; isPrivate = share.isPrivate
         expires = share.expires; expired = share.expired; visited = share.visited; downloaded = share.downloaded; remainDownloads = share.remainDownloads
         isFolder = share.isFolder; createdAt = share.createdAt
     }
 
+    /// Private Cloudreve-Links können das Passwort als Pfadsegment hinter der
+    /// Share-ID enthalten. Der Offline-Cache speichert nur den Link bis zur ID;
+    /// nach der nächsten Anmeldung wird der vollständige Link erneut geladen.
+    private static func sanitizedURL(for share: CloudreveShare) -> URL {
+        guard share.isPrivate else { return share.url }
+        var components = URLComponents(url: share.url, resolvingAgainstBaseURL: false)
+        components?.query = nil
+        components?.fragment = nil
+        components?.user = nil
+        components?.password = nil
+        if var components {
+            var segments = components.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+            if let idIndex = segments.lastIndex(of: share.id), idIndex + 1 < segments.count {
+                segments.removeSubrange((idIndex + 1)...)
+                components.path = "/" + segments.joined(separator: "/")
+            } else if let password = share.password,
+                      !password.isEmpty,
+                      let passwordIndex = segments.firstIndex(of: password) {
+                segments.removeSubrange(passwordIndex...)
+                components.path = segments.isEmpty ? "/" : "/" + segments.joined(separator: "/")
+            } else {
+                // Unbekanntes privates URL-Schema: Nur die Origin ist garantiert
+                // frei von einem Passwortsegment.
+                components.path = "/"
+            }
+            if let url = components.url { return url }
+        }
+        var origin = URLComponents()
+        origin.scheme = share.url.scheme
+        origin.host = share.url.host
+        origin.port = share.url.port
+        origin.path = "/"
+        return origin.url ?? URL(string: "about:blank")!
+    }
+
     var share: CloudreveShare {
-        CloudreveShare(id: id, name: name, url: url, sourceURI: sourceURI, isPrivate: isPrivate, password: password, expires: expires, expired: expired,
+        CloudreveShare(id: id, name: name, url: url, sourceURI: sourceURI, isPrivate: isPrivate, password: nil, expires: expires, expired: expired,
                        visited: visited, downloaded: downloaded, remainDownloads: remainDownloads, isFolder: isFolder, createdAt: createdAt)
     }
 }

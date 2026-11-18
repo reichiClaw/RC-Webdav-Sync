@@ -28,7 +28,7 @@ public struct SyncEngineConfiguration: Sendable {
         self.deletionGuard = deletionGuard
         self.caseInsensitiveLocalFileSystem = caseInsensitiveLocalFileSystem
         self.settleTime = settleTime
-        self.minimumFreeSpace = minimumFreeSpace
+        self.minimumFreeSpace = max(0, minimumFreeSpace)
         self.chunkedUploadThreshold = chunkedUploadThreshold
     }
 }
@@ -42,6 +42,9 @@ public struct SyncRunSummary: Sendable, Equatable {
     public var deletionsHeld = 0
     public var needsFollowUp = false
     public var offline = false
+    var authenticationFailure = false
+    var connectivityFailure = false
+    var diskFullFailure = false
     public init() {}
 }
 
@@ -74,11 +77,15 @@ public actor SyncEngine {
     private var rerunRequested = false
     private var retryPolicy = RetryPolicy()
     private var retryTask: Task<Void, Never>?
+    private var retryRepresentsOffline = false
     private var capabilities: WebDAVCapabilities?
-    private var allowedDeletions: Set<String>?
+    private var allowedDeletions: Set<DeletionAuthorization>?
     private var downloadsPausedForDiskSpace = false
+    private var reservedTemporaryBytes: Int64 = 0
+    private var resolvingConflictIDs: Set<String> = []
     private var lastRemoteSnapshot: RemoteSnapshot?
     private var isShutDown = false
+    private var userPauseKey: String { "user-pause.\(mapping.id)" }
 
     public init(account: AccountConfiguration, mapping: SyncMapping, client: WebDAVClientProtocol, store: SyncStore,
                 fileSystem: LocalFileSystem, rules: ExclusionRules, configuration: SyncEngineConfiguration,
@@ -109,27 +116,51 @@ public actor SyncEngine {
 
     /// Lädt den gespeicherten Zustand und bereitet die Engine vor.
     public func start() async {
-        try? await store.markRunningTransfersInterrupted(mappingID: mapping.id)
+        do {
+            try await store.markRunningTransfersInterrupted(mappingID: mapping.id)
+        } catch {
+            reportPersistenceIssue(error)
+            return
+        }
         fileSystem.cleanupTemporaryFiles()
         status.health = .synced
         status.lastSuccessfulSync = mapping.lastSuccessfulSync
         await refreshCounters()
-        if (try? await store.queue(mappingID: mapping.id).count) ?? 0 > 0 { status.health = .attention }
+        do {
+            if try await store.meta(userPauseKey) == "1" {
+                status.isPaused = true
+                status.pauseReason = .user
+                status.health = .paused
+            }
+        } catch {
+            reportPersistenceIssue(error)
+            return
+        }
+        do {
+            if try await store.queue(mappingID: mapping.id).count > 0 { status.health = .attention }
+        } catch {
+            reportPersistenceIssue(error)
+            return
+        }
+        recomputeHealth()
         publish()
     }
 
     /// Fordert einen Abgleich an. Läuft bereits einer, wird im Anschluss ein weiterer ausgeführt.
     public func requestSync(trigger: SyncTrigger) {
         guard !isShutDown else { return }
-        if status.isPaused && status.pauseReason == .user && trigger != .manual {
+        if status.isPaused && status.pauseReason == .user { return }
+        if retryTask != nil,
+           trigger != .manual,
+           trigger != .connectivityRestored,
+           trigger != .retry {
+            logger.debug("engine", "Abgleich (\(trigger.rawValue)) wartet auf den geplanten Wiederholungszeitpunkt")
             return
-        }
-        if status.isPaused && status.pauseReason == .user && trigger == .manual {
-            status.isPaused = false
-            status.pauseReason = nil
         }
         retryTask?.cancel()
         retryTask = nil
+        retryRepresentsOffline = false
+        status.nextRetry = nil
         if runningTask != nil {
             rerunRequested = true
             logger.debug("engine", "Abgleich angefordert (\(trigger.rawValue)) – läuft bereits, wird wiederholt")
@@ -139,12 +170,7 @@ public actor SyncEngine {
         runningTask = Task { [weak self] in
             guard let self else { return }
             await self.runLoop(trigger: trigger)
-            await self.finishedRunning()
         }
-    }
-
-    private func finishedRunning() {
-        runningTask = nil
     }
 
     /// Führt einen Abgleich aus und wartet auf dessen Abschluss (für Tests und Skripte).
@@ -154,18 +180,32 @@ public actor SyncEngine {
         while let running = runningTask { _ = await running.value }
     }
 
-    public func pause() {
+    public func pause() async {
         status.isPaused = true
         status.pauseReason = .user
         status.health = .paused
         runningTask?.cancel()
         retryTask?.cancel()
         retryTask = nil
+        retryRepresentsOffline = false
+        status.nextRetry = nil
+        do {
+            try await store.setMeta(userPauseKey, "1")
+        } catch {
+            reportPersistenceIssue(error)
+        }
+        recomputeHealth()
         publish()
     }
 
-    public func resume() {
+    public func resume() async {
         guard status.isPaused else { return }
+        do {
+            try await store.setMeta(userPauseKey, nil)
+        } catch {
+            reportPersistenceIssue(error)
+            return
+        }
         status.isPaused = false
         status.pauseReason = nil
         downloadsPausedForDiskSpace = false
@@ -184,26 +224,35 @@ public actor SyncEngine {
     }
 
     public func transfers(limit: Int = 300) async -> [TransferRecord] {
-        (try? await store.transfers(mappingID: mapping.id, limit: limit)) ?? []
+        do { return try await store.transfers(mappingID: mapping.id, limit: limit) }
+        catch { reportPersistenceIssue(error); return [] }
     }
 
     public func conflicts() async -> [ConflictRecord] {
-        (try? await store.conflicts(mappingID: mapping.id)) ?? []
+        do { return try await store.conflicts(mappingID: mapping.id) }
+        catch { reportPersistenceIssue(error); return [] }
     }
 
     public func queue() async -> [QueuedItem] {
-        (try? await store.queue(mappingID: mapping.id)) ?? []
+        do { return try await store.queue(mappingID: mapping.id) }
+        catch { reportPersistenceIssue(error); return [] }
     }
 
     public func pendingDeletions() async -> [PendingDeletion] {
-        (try? await store.pendingDeletions(mappingID: mapping.id)) ?? []
+        do { return try await store.pendingDeletions(mappingID: mapping.id) }
+        catch { reportPersistenceIssue(error); return [] }
     }
 
     /// Gibt die zurückgehaltenen Löschungen frei (Löschschutz).
     public func confirmPendingDeletions() async {
-        let pending = await pendingDeletions()
-        allowedDeletions = Set(pending.map(\.path))
-        try? await store.clearPendingDeletions(mappingID: mapping.id)
+        do {
+            let pending = try await store.pendingDeletions(mappingID: mapping.id)
+            try await store.clearPendingDeletions(mappingID: mapping.id)
+            allowedDeletions = Set(pending.map(DeletionAuthorization.init))
+        } catch {
+            reportPersistenceIssue(error)
+            return
+        }
         await refreshCounters()
         publish()
         requestSync(trigger: .manual)
@@ -213,15 +262,43 @@ public actor SyncEngine {
     /// gemeinsamen Stand entfernt, sodass die noch vorhandene Seite als „neu“ gilt und
     /// wiederhergestellt (erneut übertragen) wird.
     public func discardPendingDeletions() async {
-        let pending = await pendingDeletions()
-        for p in pending {
-            try? await store.removeBaselineSubtree(path: p.path, mappingID: mapping.id)
+        do {
+            try await store.discardPendingDeletions(mappingID: mapping.id)
+            allowedDeletions = []
+        } catch {
+            reportPersistenceIssue(error)
+            return
         }
-        try? await store.clearPendingDeletions(mappingID: mapping.id)
-        allowedDeletions = []
         await refreshCounters()
         publish()
         requestSync(trigger: .manual)
+    }
+
+    private func reportPersistenceIssue(_ error: Error) {
+        status.lastIssue = SyncIssue(
+            message: "Der lokale Synchronisierungsstand konnte nicht zuverlässig gelesen oder gespeichert werden.",
+            detail: error.localizedDescription,
+            action: .retry
+        )
+        status.health = .attention
+        logger.error("store", "Persistenzfehler: \(error)")
+        publish()
+    }
+
+    /// Führt blockierende Dateioperationen außerhalb des Engine-Actors aus und
+    /// koppelt deren Lebenszyklus an den aufrufenden Sync-Task.
+    private func performFileOperation<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        let task = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            return try operation()
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     // MARK: - Konfliktauflösung
@@ -235,51 +312,104 @@ public actor SyncEngine {
     /// Setzt eine Benutzerentscheidung um. Vorher wird geprüft, ob die beteiligten
     /// Dateien seit der Erkennung unverändert sind.
     public func resolveConflict(id: String, resolution: ConflictResolution) async throws {
-        let all = (try? await store.conflicts(mappingID: mapping.id)) ?? []
+        guard resolvingConflictIDs.insert(id).inserted else {
+            throw ConflictResolutionError.notApplicable
+        }
+        defer { resolvingConflictIDs.remove(id) }
+        let all = try await store.conflicts(mappingID: mapping.id)
         guard var conflict = all.first(where: { $0.id == id }) else { throw ConflictResolutionError.notFound }
-        let baseline = (try? await store.baseline(mappingID: mapping.id)) ?? [:]
+        let baseline = try await store.baseline(mappingID: mapping.id)
+        guard let expected = baseline[conflict.path] else {
+            throw ConflictResolutionError.filesChangedSinceDetection
+        }
+        try await validateLocalConflictArtifact(path: conflict.path, kind: expected.kind, expectedHash: expected.localHash)
+
         switch conflict.reason {
         case .bothModified, .initialMergeDiffers, .kindMismatch:
             // Am Pfad liegt die Serverversion, die lokale Version in der Konfliktkopie.
             guard let copyPath = conflict.conflictCopyPath else { throw ConflictResolutionError.notApplicable }
-            let pathAttrs = try fileSystem.attributes(conflict.path)
-            let copyAttrs = try fileSystem.attributes(copyPath)
+            guard let copyAttrs = try fileSystem.attributes(copyPath) else {
+                throw ConflictResolutionError.filesChangedSinceDetection
+            }
+            if copyAttrs.kind == .file {
+                let fileSystem = self.fileSystem
+                guard let localHash = conflict.localHash,
+                      try await performFileOperation({ try fileSystem.hash(copyPath) }) == localHash else {
+                    throw ConflictResolutionError.filesChangedSinceDetection
+                }
+            }
             switch resolution {
             case .keepBoth:
                 break
             case .useLocal:
-                guard let pathAttrs, let copyAttrs, pathAttrs.kind == .file, copyAttrs.kind == .file else { throw ConflictResolutionError.notApplicable }
-                // Serverversion am Pfad darf seit der Erkennung nicht verändert worden sein.
-                if let expected = baseline[conflict.path]?.localHash, try fileSystem.hash(conflict.path) != expected {
-                    throw ConflictResolutionError.filesChangedSinceDetection
-                }
-                if let localHash = conflict.localHash, try fileSystem.hash(copyPath) != localHash {
-                    throw ConflictResolutionError.filesChangedSinceDetection
-                }
+                guard conflict.reason != .kindMismatch,
+                      expected.kind == .file,
+                      copyAttrs.kind == .file,
+                      let localHash = conflict.localHash else { throw ConflictResolutionError.notApplicable }
+                try await validateRemoteConflictArtifact(path: conflict.path, expected: expected)
                 let temp = try fileSystem.makeTemporaryFileURL()
-                try FileManager.default.copyItem(at: fileSystem.url(copyPath), to: temp)
-                try fileSystem.installDownloadedFile(from: temp, to: conflict.path, expectedHash: baseline[conflict.path]?.localHash,
-                                                     expectedSize: nil, expectedModified: nil, modifiedDate: Date())
-                try fileSystem.trash(copyPath, recoveryDirectory: config.recoveryDirectory)
-            case .useRemote:
-                guard copyAttrs != nil else { throw ConflictResolutionError.notApplicable }
-                if let localHash = conflict.localHash, copyAttrs?.kind == .file, try fileSystem.hash(copyPath) != localHash {
-                    throw ConflictResolutionError.filesChangedSinceDetection
+                let fileSystem = self.fileSystem
+                let conflictPath = conflict.path
+                let expectedOriginalHash = expected.localHash
+                try await performFileOperation {
+                    let source = try fileSystem.url(copyPath)
+                    guard let before = try POSIXFileMetadata.read(atPath: source.path),
+                          !before.isSymbolicLink else {
+                        throw ConflictResolutionError.filesChangedSinceDetection
+                    }
+                    try FileManager.default.copyItem(at: source, to: temp)
+                    let temporaryFileID = try POSIXFileMetadata.read(atPath: temp.path)?.fileID
+                    defer {
+                        if let current = try? POSIXFileMetadata.read(atPath: temp.path),
+                           current.fileID == temporaryFileID {
+                            try? FileManager.default.removeItem(at: temp)
+                        }
+                    }
+                    guard let after = try POSIXFileMetadata.read(atPath: source.path),
+                          after.cacheToken == before.cacheToken,
+                          try SHA256Hasher.hashFile(at: temp) == localHash else {
+                        throw ConflictResolutionError.filesChangedSinceDetection
+                    }
+                    try fileSystem.installDownloadedFile(from: temp, to: conflictPath, expectedHash: expectedOriginalHash,
+                                                         expectedSize: nil, expectedModified: nil, modifiedDate: Date())
                 }
-                try fileSystem.trash(copyPath, recoveryDirectory: config.recoveryDirectory)
+                _ = try fileSystem.trashVerifiedFile(
+                    copyPath,
+                    expectedHash: localHash,
+                    recoveryDirectory: config.recoveryDirectory
+                )
+            case .useRemote:
+                // Ein Ordner hat keinen gespeicherten Inhalts-Hash. Ihn aufgrund
+                // einer alten Konfliktentscheidung rekursiv zu verwerfen wäre
+                // nicht verlustfrei prüfbar.
+                guard copyAttrs.kind == .file,
+                      let localHash = conflict.localHash else { throw ConflictResolutionError.notApplicable }
+                try await validateRemoteConflictArtifact(path: conflict.path, expected: expected)
+                _ = try fileSystem.trashVerifiedFile(
+                    copyPath,
+                    expectedHash: localHash,
+                    recoveryDirectory: config.recoveryDirectory
+                )
             case .applyDeletion:
                 throw ConflictResolutionError.notApplicable
             }
         case .modifiedLocallyDeletedRemotely, .deletedLocallyModifiedRemotely:
+            try await validateRemoteConflictArtifact(path: conflict.path, expected: expected)
             switch resolution {
             case .keepBoth, .useLocal, .useRemote:
                 break // Die erhaltene Version liegt bereits auf beiden Seiten.
             case .applyDeletion:
                 guard let attrs = try fileSystem.attributes(conflict.path) else { throw ConflictResolutionError.notApplicable }
-                if attrs.kind == .file, let expected = baseline[conflict.path]?.localHash, try fileSystem.hash(conflict.path) != expected {
+                guard attrs.kind == .file,
+                      expected.kind == .file,
+                      let expectedHash = expected.localHash else {
                     throw ConflictResolutionError.filesChangedSinceDetection
                 }
-                try fileSystem.trash(conflict.path, recoveryDirectory: config.recoveryDirectory)
+                _ = try fileSystem.trashVerifiedFile(
+                    conflict.path,
+                    expectedHash: expectedHash,
+                    recoveryDirectory: config.recoveryDirectory
+                )
                 // Der nächste Abgleich erkennt die lokale Löschung und überträgt sie (mit If-Match).
             }
         }
@@ -291,17 +421,67 @@ public actor SyncEngine {
         requestSync(trigger: .conflictResolution)
     }
 
+    private func validateLocalConflictArtifact(path: String, kind: ItemKind, expectedHash: String?) async throws {
+        guard let attrs = try fileSystem.attributes(path), attrs.kind == kind else {
+            throw ConflictResolutionError.filesChangedSinceDetection
+        }
+        if kind == .file {
+            let fileSystem = self.fileSystem
+            guard let expectedHash,
+                  try await performFileOperation({ try fileSystem.hash(path) }) == expectedHash else {
+                throw ConflictResolutionError.filesChangedSinceDetection
+            }
+        }
+    }
+
+    private func validateRemoteConflictArtifact(path: String, expected: BaselineEntry) async throws {
+        let rawPath = lastRemoteSnapshot?.items[path]?.rawPath ?? path
+        guard let current = try await client.stat(rawPath),
+              Self.sameRemoteVersion(current, expected) else {
+            throw ConflictResolutionError.filesChangedSinceDetection
+        }
+        // Schwache Validatoren beweisen keine Bytegleichheit. Vor einer
+        // Entscheidung, die eine lokale Alternative verwirft, wird deshalb der
+        // aktuelle Serverinhalt erneut gehasht.
+        if expected.kind == .file,
+           !(expected.remoteValidatorIsStrong && current.validatorIsStrong) {
+            let temp = try fileSystem.makeTemporaryFileURL()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            do {
+                _ = try await client.download(current.rawPath, to: temp, progress: nil)
+            } catch {
+                if error is WebDAVError || error is CancellationError { throw error }
+                throw LocalFileSystem.mapError(error)
+            }
+            guard let expectedHash = expected.localHash,
+                  try await performFileOperation({ try SHA256Hasher.hashFile(at: temp) }) == expectedHash else {
+                throw ConflictResolutionError.filesChangedSinceDetection
+            }
+        }
+    }
+
     // MARK: - Durchlauf
 
     private func runLoop(trigger: SyncTrigger) async {
         var iterations = 0
         var currentTrigger = trigger
+        var restartIfRequested = true
+        defer {
+            runningTask = nil
+            if restartIfRequested, rerunRequested, !isShutDown, !status.isPaused {
+                rerunRequested = false
+                requestSync(trigger: .followUp)
+            }
+        }
         repeat {
             rerunRequested = false
             iterations += 1
             let summary = await performSync(trigger: currentTrigger)
             if Task.isCancelled { break }
-            if summary.offline { break }
+            if summary.offline {
+                restartIfRequested = false
+                break
+            }
             if summary.needsFollowUp && iterations < 4 {
                 rerunRequested = true
                 currentTrigger = .followUp
@@ -309,12 +489,19 @@ public actor SyncEngine {
         } while rerunRequested && iterations < 4 && !Task.isCancelled
         if rerunRequested && !Task.isCancelled {
             // Mehr als vier Durchgänge hintereinander: kurz warten und erneut planen.
-            scheduleRetry(after: 5, reason: nil)
+            restartIfRequested = false
+            scheduleRetry(after: 5)
         }
     }
 
     private func performSync(trigger: SyncTrigger) async -> SyncRunSummary {
         var summary = SyncRunSummary()
+        // Actor-Reentrancy: Eine Bestätigung, die während eines `await` dieses
+        // Durchgangs eintrifft, darf erst für den nächsten Plan gelten.
+        let runAllowedDeletions = allowedDeletions
+        allowedDeletions = nil
+        let wasOffline = status.health == .offline || status.nextRetry != nil
+        downloadsPausedForDiskSpace = false
         status.isRunning = true
         status.lastAttempt = Date()
         status.completedCount = 0
@@ -355,29 +542,41 @@ public actor SyncEngine {
         do {
             _ = try await client.probe()
             if capabilities == nil {
-                capabilities = try? await client.detectCapabilities()
+                capabilities = try await client.detectCapabilities()
                 status.capabilities = capabilities
             }
         } catch {
             return handleConnectivityFailure(error, summary: summary)
         }
+        // Der Server ist wieder erreichbar. Offene Konflikte oder blockierte
+        // Aktionen dürfen den Netzwerk-Backoff nicht künstlich hoch halten.
+        retryPolicy.reset()
         if status.pauseReason == .authenticationRequired {
             status.isPaused = false
             status.pauseReason = nil
         }
-        if status.health == .offline { eventHandler?(.cameOnline) }
-        retryPolicy.reset()
+        if wasOffline { eventHandler?(.cameOnline) }
 
         // 3. Lokale Bestandsaufnahme
         status.currentStep = "Lese lokalen Ordner …"
         publish()
         let scanner = LocalScanner(fileSystem: fileSystem, rules: rules, settleTime: config.settleTime)
-        let previousIndex = (try? await store.localIndex(mappingID: mapping.id)) ?? [:]
+        let previousIndex: [String: SyncStore.LocalIndexEntry]
+        do {
+            previousIndex = try await store.localIndex(mappingID: mapping.id)
+        } catch {
+            return handlePersistenceFailure(error, summary: summary)
+        }
         let scanResult: LocalScanner.Result
         do {
-            scanResult = try await Task.detached(priority: .utility) { [scanner, previousIndex] in
+            let scanTask = Task.detached(priority: .utility) { [scanner, previousIndex] in
                 try scanner.scan(previousIndex: previousIndex, isCancelled: { Task.isCancelled })
-            }.value
+            }
+            scanResult = try await withTaskCancellationHandler {
+                try await scanTask.value
+            } onCancel: {
+                scanTask.cancel()
+            }
         } catch {
             if error is CancellationError { return summary }
             logger.error("engine", "Lokale Bestandsaufnahme fehlgeschlagen: \(error)")
@@ -385,7 +584,11 @@ public actor SyncEngine {
             summary.failed = 1
             return summary
         }
-        try? await store.replaceLocalIndex(scanResult.hashIndex, mappingID: mapping.id)
+        do {
+            try await store.replaceLocalIndex(scanResult.hashIndex, mappingID: mapping.id)
+        } catch {
+            return handlePersistenceFailure(error, summary: summary)
+        }
         if Task.isCancelled { return summary }
 
         // 4. Server-Bestandsaufnahme
@@ -395,6 +598,9 @@ public actor SyncEngine {
         do {
             remoteSnapshot = try await enumerateRemote()
         } catch {
+            if error is SyncStoreError || error is SQLiteError {
+                return handlePersistenceFailure(error, summary: summary)
+            }
             return handleConnectivityFailure(error, summary: summary)
         }
         lastRemoteSnapshot = remoteSnapshot
@@ -403,12 +609,18 @@ public actor SyncEngine {
         // 5. Planung
         status.currentStep = "Vergleiche Bestände …"
         publish()
-        let baseline = (try? await store.baseline(mappingID: mapping.id)) ?? [:]
-        let openConflicts = (try? await store.conflicts(mappingID: mapping.id)) ?? []
+        let baseline: [String: BaselineEntry]
+        let openConflicts: [ConflictRecord]
+        do {
+            baseline = try await store.baseline(mappingID: mapping.id)
+            openConflicts = try await store.conflicts(mappingID: mapping.id)
+        } catch {
+            return handlePersistenceFailure(error, summary: summary)
+        }
         let input = PlannerInput(baseline: baseline, local: scanResult.snapshot, remote: remoteSnapshot,
                                  openConflictPaths: Set(openConflicts.map(\.path)),
                                  caseInsensitiveLocalFileSystem: config.caseInsensitiveLocalFileSystem,
-                                 allowedDeletions: allowedDeletions)
+                                 allowedDeletions: runAllowedDeletions)
         var plan = SyncPlanner.plan(input)
         if let reason = plan.deletionsSuppressedReason {
             logger.warning("engine", reason)
@@ -417,7 +629,7 @@ public actor SyncEngine {
                                          : "Teile des Serverbestands konnten nicht gelesen werden. Löschungen wurden sicherheitshalber nicht übertragen.",
                                          detail: remoteSnapshot.failedPrefixes.sorted().joined(separator: ", "), action: .retry)
         }
-        let collisions = plan.collisions + scanResult.collisions
+        let collisions = Array(Set(plan.collisions + scanResult.collisions)).sorted()
         if !collisions.isEmpty {
             status.lastIssue = SyncIssue(message: collisions.count == 1
                                          ? "Ein Eintrag kann wegen eines Namenskonflikts nicht synchronisiert werden."
@@ -431,26 +643,60 @@ public actor SyncEngine {
             record.suggestedAction = collisions.contains(path) ? SuggestedAction.renameFile : nil
             try? await store.saveTransfer(record, mappingID: mapping.id)
         }
+        let unresolvedSkipped = plan.skipped.filter { skipped in
+            !scanResult.snapshot.busyPaths.contains(skipped.path)
+                && !openConflicts.contains(where: { $0.path == skipped.path })
+        }
+        if !unresolvedSkipped.isEmpty, status.lastIssue == nil {
+            status.lastIssue = SyncIssue(
+                message: unresolvedSkipped.count == 1
+                    ? "Ein Eintrag wurde aus Sicherheitsgründen übersprungen."
+                    : "\(unresolvedSkipped.count) Einträge wurden aus Sicherheitsgründen übersprungen.",
+                detail: unresolvedSkipped.map(\.path).sorted().joined(separator: ", "),
+                action: .retry
+            )
+        }
 
         // 6. Löschschutz
         let impact = plan.deletionImpact(baseline: baseline)
-        if allowedDeletions == nil, config.deletionGuard.requiresConfirmation(deletionImpact: impact, baselineCount: baseline.count, localItemCount: scanResult.snapshot.items.count) {
+        let baselineFileCount = baseline.values.lazy.filter { $0.kind == .file }.count
+        let localFileCount = scanResult.snapshot.items.values.lazy.filter { $0.kind == .file }.count
+        let guardBaselineCount = baselineFileCount > 0 ? baselineFileCount : baseline.count
+        let guardLocalCount = baselineFileCount > 0 ? localFileCount : scanResult.snapshot.items.count
+        if runAllowedDeletions == nil,
+           config.deletionGuard.requiresConfirmation(
+               deletionImpact: impact,
+               baselineCount: guardBaselineCount,
+               localItemCount: guardLocalCount
+           ) {
             var held: [PendingDeletion] = []
             for action in plan.deletions {
                 switch action {
-                case .deleteRemote(let p, let r): held.append(PendingDeletion(path: p, kind: r.kind, side: .remote))
+                case .deleteRemote(let p, let r) where r.kind == .file:
+                    held.append(PendingDeletion(path: p, kind: r.kind, side: .remote))
                 case .deleteLocal(let p, let l): held.append(PendingDeletion(path: p, kind: l.kind, side: .local))
                 default: break
                 }
             }
-            try? await store.replacePendingDeletions(held, mappingID: mapping.id)
+            do {
+                try await store.replacePendingDeletions(held, mappingID: mapping.id)
+            } catch {
+                return handlePersistenceFailure(error, summary: summary)
+            }
             summary.deletionsHeld = held.count
             logger.notice("engine", "Löschschutz: \(impact) Einträge betroffen – Bestätigung erforderlich")
             plan.deletions.removeAll()
             eventHandler?(.deletionConfirmationRequired(count: held.count))
-        } else if allowedDeletions != nil {
-            // Freigabe gilt genau für einen Durchgang.
-            allowedDeletions = nil
+        } else if runAllowedDeletions != nil {
+            // Die Freigabe wurde am Anfang dieses Durchgangs atomar verbraucht.
+        } else {
+            // Ein früherer Löschplan kann nach neuen Änderungen gegenstandslos
+            // geworden sein und darf dann nicht weiter in der UI stehen.
+            do {
+                try await store.clearPendingDeletions(mappingID: mapping.id)
+            } catch {
+                return handlePersistenceFailure(error, summary: summary)
+            }
         }
 
         // Warteschlange für die Anzeige speichern.
@@ -458,7 +704,11 @@ public actor SyncEngine {
             guard let dir = a.direction else { return nil }
             return QueuedItem(path: a.path, direction: dir, size: a.estimatedBytes)
         }
-        try? await store.replaceQueue(queued, mappingID: mapping.id)
+        do {
+            try await store.replaceQueue(queued, mappingID: mapping.id)
+        } catch {
+            return handlePersistenceFailure(error, summary: summary)
+        }
         status.pendingCount = queued.count
         status.pendingBytes = plan.estimatedBytes
         status.totalCount = plan.transferCount
@@ -471,26 +721,50 @@ public actor SyncEngine {
         // 7. Ausführung
         var failures = 0
         var transferred = 0
+        var haltRemainingActions = false
         for phase in [plan.directoryCreations, plan.moves] {
             for action in phase {
                 if Task.isCancelled { return summary }
                 let result = await execute(action, snapshot: remoteSnapshot)
                 tally(result, &transferred, &failures, &summary)
+                if Self.isTerminalFailure(result) {
+                    haltRemainingActions = true
+                    break
+                }
+            }
+            if haltRemainingActions { break }
+        }
+        if !haltRemainingActions {
+            for result in await executeConcurrently(plan.transfers, snapshot: remoteSnapshot) {
+                tally(result, &transferred, &failures, &summary)
+                if Self.isTerminalFailure(result) { haltRemainingActions = true }
             }
         }
-        for result in await executeConcurrently(plan.transfers, snapshot: remoteSnapshot) {
-            tally(result, &transferred, &failures, &summary)
+        // Löschungen sind die einzige irreversible Phase. Sobald eine vorherige
+        // Aktion fehlgeschlagen oder zurückgestellt wurde, wird in diesem
+        // Durchgang nichts mehr gelöscht – auch nicht bei einem generischen
+        // Einzeldateifehler.
+        if failures > 0 || summary.needsFollowUp || summary.skipped > plan.skipped.count {
+            haltRemainingActions = true
         }
         if Task.isCancelled { return summary }
-        for action in plan.deletions {
-            if Task.isCancelled { return summary }
-            let result = await execute(action, snapshot: remoteSnapshot)
-            tally(result, &transferred, &failures, &summary)
-            status.completedCount += 1
+        if !haltRemainingActions {
+            for action in plan.deletions {
+                if Task.isCancelled { return summary }
+                let result = await execute(action, snapshot: remoteSnapshot)
+                tally(result, &transferred, &failures, &summary)
+                status.completedCount += 1
+                if Self.isTerminalFailure(result) {
+                    haltRemainingActions = true
+                    break
+                }
+            }
         }
-        for action in plan.bookkeeping {
-            let result = await execute(action, snapshot: remoteSnapshot)
-            tally(result, &transferred, &failures, &summary)
+        if !haltRemainingActions {
+            for action in plan.bookkeeping {
+                let result = await execute(action, snapshot: remoteSnapshot)
+                tally(result, &transferred, &failures, &summary)
+            }
         }
 
         summary.transferred = transferred
@@ -498,14 +772,45 @@ public actor SyncEngine {
         try? await store.pruneTransfers(mappingID: mapping.id)
 
         // Verbleibende Warteschlange: nur fehlgeschlagene/zurückgestellte Einträge.
-        let remaining = (try? await store.queue(mappingID: mapping.id)) ?? []
+        let remaining: [QueuedItem]
+        do {
+            remaining = try await store.queue(mappingID: mapping.id)
+        } catch {
+            return handlePersistenceFailure(error, summary: summary)
+        }
         status.pendingCount = remaining.count + scanResult.snapshot.busyPaths.count
         if !scanResult.snapshot.busyPaths.isEmpty { summary.needsFollowUp = true }
 
-        if failures == 0 && scanResult.snapshot.isComplete && remoteSnapshot.isComplete {
+        if summary.authenticationFailure {
+            status.isPaused = true
+            status.pauseReason = .authenticationRequired
+            eventHandler?(.authenticationRequired)
+        } else if summary.connectivityFailure {
+            summary.offline = true
+            let delay = retryPolicy.recordFailure()
+            scheduleRetry(after: delay, offline: true)
+            eventHandler?(.wentOffline)
+        } else if summary.diskFullFailure {
+            // Der freie Speicher wird beim nächsten Durchgang erneut geprüft;
+            // ein einzelner ENOSPC-Fehler darf Downloads nicht dauerhaft sperren.
+            scheduleRetry(after: 30)
+        }
+
+        if failures == 0,
+           !summary.needsFollowUp,
+           summary.deletionsHeld == 0,
+           summary.skipped == 0,
+           remaining.isEmpty,
+           scanResult.snapshot.isComplete,
+           remoteSnapshot.isComplete {
             let now = Date()
-            try? await store.setLastSuccessfulSync(now, mappingID: mapping.id)
+            do {
+                try await store.setLastSuccessfulSync(now, mappingID: mapping.id)
+            } catch {
+                return handlePersistenceFailure(error, summary: summary)
+            }
             status.lastSuccessfulSync = now
+            retryPolicy.reset()
         }
         await refreshCounters()
         if transferred > 0 || failures > 0 {
@@ -518,8 +823,16 @@ public actor SyncEngine {
     private func tally(_ result: ActionResult, _ transferred: inout Int, _ failures: inout Int, _ summary: inout SyncRunSummary) {
         switch result {
         case .succeeded: transferred += 1
-        case .failed: failures += 1
+        case .failed(let failure):
+            failures += 1
+            switch failure {
+            case .connectivity: summary.connectivityFailure = true
+            case .authentication: summary.authenticationFailure = true
+            case .diskFull: summary.diskFullFailure = true
+            case .other: break
+            }
         case .deferred: summary.needsFollowUp = true
+        case .blocked: summary.skipped += 1
         case .conflict:
             transferred += 1
             summary.conflictsCreated += 1
@@ -543,18 +856,34 @@ public actor SyncEngine {
         case .cancelled:
             break
         default:
-            let wasOnline = status.health != .offline
-            summary.offline = true
             status.lastIssue = SyncIssue(message: dav.userDescription, detail: dav.technicalDescription, action: dav.suggestedAction)
             let delay = retryPolicy.recordFailure()
-            scheduleRetry(after: delay, reason: dav)
-            if wasOnline && dav.isConnectivityProblem { eventHandler?(.wentOffline) }
+            let isOffline = dav.isConnectivityProblem
+            if isOffline {
+                let wasOnline = status.health != .offline
+                summary.offline = true
+                if wasOnline { eventHandler?(.wentOffline) }
+            }
+            scheduleRetry(after: delay, offline: isOffline)
         }
         return summary
     }
 
-    private func scheduleRetry(after delay: TimeInterval, reason: WebDAVError?) {
+    private func handlePersistenceFailure(_ error: Error, summary: SyncRunSummary) -> SyncRunSummary {
+        var summary = summary
+        summary.failed += 1
+        status.lastIssue = SyncIssue(
+            message: "Der lokale Synchronisierungsstand konnte nicht zuverlässig gelesen oder gespeichert werden. Es wurden sicherheitshalber keine weiteren Änderungen ausgeführt.",
+            detail: error.localizedDescription,
+            action: .retry
+        )
+        logger.error("store", "Persistenzfehler – Abgleich abgebrochen: \(error)")
+        return summary
+    }
+
+    private func scheduleRetry(after delay: TimeInterval, offline: Bool = false) {
         retryTask?.cancel()
+        retryRepresentsOffline = offline
         status.nextRetry = Date().addingTimeInterval(delay)
         logger.info("engine", "Nächster Versuch in \(Int(delay)) s")
         retryTask = Task { [weak self] in
@@ -566,6 +895,7 @@ public actor SyncEngine {
 
     private func retryFired() {
         retryTask = nil
+        retryRepresentsOffline = false
         status.nextRetry = nil
         requestSync(trigger: .retry)
     }
@@ -574,20 +904,22 @@ public actor SyncEngine {
 
     private func enumerateRemote() async throws -> RemoteSnapshot {
         let enumerator = RemoteEnumerator(client: client, rules: rules, concurrency: config.maxConcurrentTransfers)
-        let current = (try? await store.mapping(id: mapping.id)) ?? mapping
+        let current = try await store.mapping(id: mapping.id) ?? mapping
         if capabilities?.supportsSyncCollection == true, let token = current.syncToken, current.remoteIndexIsComplete {
-            let cached = (try? await store.remoteIndex(mappingID: mapping.id)) ?? [:]
+            let cached = try await store.remoteIndex(mappingID: mapping.id)
             do {
                 let snapshot = try await enumerator.incremental(cached: cached, token: token)
-                try? await store.replaceRemoteIndex(snapshot.items, mappingID: mapping.id)
-                try? await store.setSyncToken(snapshot.syncToken, remoteIndexComplete: true, mappingID: mapping.id)
+                guard let nextToken = snapshot.syncToken else {
+                    throw WebDAVError.invalidResponse("sync-collection lieferte keinen Folgetoken")
+                }
+                try await store.replaceRemoteIndex(snapshot.items, syncToken: nextToken, mappingID: mapping.id)
                 logger.debug("remote", "sync-collection: \(snapshot.items.count) Einträge im Bestand")
                 return snapshot
             } catch let error as WebDAVError {
                 switch error {
                 case .invalidSyncToken, .invalidResponse, .unexpectedStatus, .forbidden, .conflict:
                     logger.notice("remote", "sync-collection nicht verwendbar (\(error.technicalDescription)) – vollständige Bestandsaufnahme")
-                    try? await store.setSyncToken(nil, remoteIndexComplete: false, mappingID: mapping.id)
+                    try await store.setSyncToken(nil, remoteIndexComplete: false, mappingID: mapping.id)
                 default:
                     throw error
                 }
@@ -600,10 +932,9 @@ public actor SyncEngine {
         }
         let snapshot = try await enumerator.fullWalk(isCancelled: { Task.isCancelled })
         if snapshot.isComplete, let token {
-            try? await store.replaceRemoteIndex(snapshot.items, mappingID: mapping.id)
-            try? await store.setSyncToken(token, remoteIndexComplete: true, mappingID: mapping.id)
+            try await store.replaceRemoteIndex(snapshot.items, syncToken: token, mappingID: mapping.id)
         } else {
-            try? await store.setSyncToken(nil, remoteIndexComplete: false, mappingID: mapping.id)
+            try await store.setSyncToken(nil, remoteIndexComplete: false, mappingID: mapping.id)
         }
         logger.debug("remote", "Vollständige Bestandsaufnahme: \(snapshot.items.count) Einträge, vollständig=\(snapshot.isComplete)")
         return snapshot
@@ -611,11 +942,21 @@ public actor SyncEngine {
 
     // MARK: - Ausführung
 
-    enum ActionResult {
+    enum ActionFailure: Sendable, Equatable {
+        case connectivity
+        case authentication
+        case diskFull
+        case other
+    }
+
+    enum ActionResult: Sendable {
         case succeeded
-        case failed
+        case failed(ActionFailure)
         /// Vorbedingung nicht mehr erfüllt → im nächsten Durchgang neu planen.
         case deferred
+        /// Serverfähigkeit fehlt dauerhaft; in der Queue behalten, aber keinen
+        /// unmittelbaren Wiederholungs-Loop auslösen.
+        case blocked
         case conflict
         case noop
     }
@@ -627,6 +968,7 @@ public actor SyncEngine {
         await withTaskGroup(of: ActionResult.self) { group in
             var iterator = actions.makeIterator()
             var running = 0
+            var shouldStop = false
             while running < limit, let action = iterator.next() {
                 group.addTask { await self.execute(action, snapshot: snapshot) }
                 running += 1
@@ -635,13 +977,24 @@ public actor SyncEngine {
                 results.append(result)
                 status.completedCount += 1
                 publish()
+                if Self.isTerminalFailure(result) {
+                    shouldStop = true
+                    group.cancelAll()
+                }
                 if Task.isCancelled { continue }
-                if let next = iterator.next() {
+                if !shouldStop, let next = iterator.next() {
                     group.addTask { await self.execute(next, snapshot: snapshot) }
                 }
             }
         }
         return results
+    }
+
+    private static func isTerminalFailure(_ result: ActionResult) -> Bool {
+        if case .failed(let failure) = result {
+            return failure == .connectivity || failure == .authentication || failure == .diskFull
+        }
+        return false
     }
 
     private func beginTransfer(_ action: SyncAction) async -> TransferRecord? {
@@ -656,6 +1009,7 @@ public actor SyncEngine {
 
     private func finishTransfer(_ record: TransferRecord?, state: TransferState, error: Error? = nil, note: String? = nil) async {
         guard var record else { return }
+        let observedBytes = status.activeTransfers.first(where: { $0.id == record.id })?.bytesDone ?? record.bytesDone
         record.state = state
         record.finishedAt = Date()
         if let error {
@@ -666,13 +1020,13 @@ public actor SyncEngine {
         } else if let note {
             record.errorMessage = note
         }
-        if state == .succeeded { record.bytesDone = record.bytesTotal }
+        record.bytesDone = state == .succeeded ? record.bytesTotal : observedBytes
         try? await store.saveTransfer(record, mappingID: mapping.id)
-        if state == .succeeded || state == .skipped {
+        if state == .succeeded {
             try? await store.removeQueued(path: record.path, direction: record.direction, mappingID: mapping.id)
         }
         status.activeTransfers.removeAll { $0.id == record.id }
-        status.bytesDone += record.bytesTotal
+        status.bytesDone += record.bytesDone
         publish()
     }
 
@@ -703,11 +1057,11 @@ public actor SyncEngine {
         do {
             switch action {
             case .uploadNew(let path, let local):
-                return try await performUpload(path: path, local: local, remote: nil, conflictReason: nil)
+                return try await performUpload(path: path, local: local, remote: nil, conflictReason: nil, snapshot: snapshot)
             case .uploadChanged(let path, let local, let remote):
-                return try await performUpload(path: path, local: local, remote: remote, conflictReason: nil)
+                return try await performUpload(path: path, local: local, remote: remote, conflictReason: nil, snapshot: snapshot)
             case .keepLocalAfterRemoteDelete(let path, let local):
-                return try await performUpload(path: path, local: local, remote: nil, conflictReason: .modifiedLocallyDeletedRemotely)
+                return try await performUpload(path: path, local: local, remote: nil, conflictReason: .modifiedLocallyDeletedRemotely, snapshot: snapshot)
             case .download(let path, let remote, let replacing):
                 return try await performDownload(path: path, remote: remote, replacing: replacing, conflictReason: nil)
             case .keepRemoteAfterLocalDelete(let path, let remote):
@@ -744,25 +1098,231 @@ public actor SyncEngine {
                 return .noop
             }
         } catch {
+            let davError = (error as? WebDAVError) ?? (error as? CloudreveError)?.asWebDAVError
+            if Task.isCancelled || error is CancellationError || davError == .cancelled {
+                let record = status.activeTransfers.first { $0.path == action.path }
+                await finishTransfer(record, state: .cancelled, error: error)
+                return .deferred
+            }
             logger.error("engine", "Aktion fehlgeschlagen (\(action.path)): \(error)")
             let record = status.activeTransfers.first { $0.path == action.path }
                 ?? TransferRecord(path: action.path, direction: action.direction ?? .upload, state: .failed, startedAt: Date(), finishedAt: Date())
             await finishTransfer(record, state: .failed, error: error)
-            if let dav = error as? WebDAVError, dav.isConnectivityProblem {
-                status.lastIssue = SyncIssue(message: dav.userDescription, detail: dav.technicalDescription, action: dav.suggestedAction)
+            var failure: ActionFailure = .other
+            if let davError {
+                switch davError {
+                case .authenticationRequired:
+                    failure = .authentication
+                default:
+                    if davError.isConnectivityProblem { failure = .connectivity }
+                }
+                status.lastIssue = SyncIssue(
+                    message: davError.userDescription,
+                    detail: davError.technicalDescription,
+                    action: davError.suggestedAction
+                )
             }
             if case LocalFileError.diskFull = error {
                 downloadsPausedForDiskSpace = true
                 status.lastIssue = SyncIssue(message: LocalFileError.diskFull.userDescription, action: .freeDiskSpace)
                 eventHandler?(.diskFull)
+                failure = .diskFull
             }
-            return .failed
+            return .failed(failure)
         }
     }
 
     // MARK: Upload
 
-    private func performUpload(path: String, local: LocalItem, remote: RemoteItem?, conflictReason: ConflictReason?) async throws -> ActionResult {
+    /// Konservative Versionsprüfung für Server, die bedingte Schreibzugriffe
+    /// nicht zuverlässig unterstützen. `nil == nil` ist kein Versionsbeweis.
+    private static func sameRemoteVersion(_ current: RemoteItem?, _ expected: RemoteItem) -> Bool {
+        guard let current, current.kind == expected.kind else { return false }
+        guard let expectedValidator = expected.validator,
+              current.validator == expectedValidator,
+              current.size == expected.size else { return false }
+        switch (current.modified, expected.modified) {
+        case let (lhs?, rhs?):
+            return abs(lhs - rhs) < 0.001
+        case (nil, nil):
+            return expected.validator != nil
+        case (.some, nil), (nil, .some):
+            return expected.validator != nil
+        }
+    }
+
+    /// Variante für einen gespeicherten gemeinsamen Stand. Dateien ohne
+    /// Validator dürfen zunächst über Größe und Zeit gebunden werden; der
+    /// Aufrufer verifiziert ihren Inhalt anschließend per SHA-256. Für Ordner
+    /// gibt es diesen Inhaltsbeweis nicht.
+    private static func sameRemoteVersion(_ current: RemoteItem, _ expected: BaselineEntry) -> Bool {
+        guard current.kind == expected.kind, current.size == expected.remoteSize else { return false }
+        if let expectedValidator = expected.remoteValidator {
+            // Ein passender starker ETag ist der Versionsbeweis. Bei schwachen
+            // ETags verifiziert der Aufrufer zusätzlich den Inhalt; ein
+            // fehlendes Last-Modified-Feld darf diese Prüfung nicht verhindern.
+            return current.validator == expectedValidator
+        }
+        if expected.kind == .directory {
+            return false
+        }
+        switch (current.modified, expected.remoteModified) {
+        case let (lhs?, rhs?):
+            return abs(lhs - rhs) < 0.001
+        default:
+            return false
+        }
+    }
+
+    private struct VerifiedRemoteContent {
+        var validator: String
+        var strong: Bool
+        var size: Int64
+        var modified: Double?
+    }
+
+    /// Unveränderliche Arbeitskopie für einen Upload. So kann ein Editor die
+    /// Originaldatei während einer laufenden URLSession-Übertragung ersetzen
+    /// oder weiterschreiben, ohne dass eine Mischversion auf dem Server landet.
+    private struct StagedUpload {
+        var fileURL: URL
+        var size: Int64
+        var modified: Double
+        var hash: String
+        var sourceCacheToken: String
+        var stagedCacheToken: String
+    }
+
+    private func stageUpload(path: String) async throws -> StagedUpload {
+        guard let attributes = try fileSystem.attributes(path), attributes.kind == .file,
+              let source = try POSIXFileMetadata.read(atPath: fileSystem.url(path).path),
+              !source.isSymbolicLink else {
+            throw LocalFileError.changedSinceScan(path)
+        }
+        try reserveTemporarySpace(for: attributes.size)
+        var temporary: URL?
+        do {
+            let generated = try fileSystem.makeTemporaryFileURL()
+            temporary = generated
+            let fileSystem = self.fileSystem
+            return try await performFileOperation {
+                try FileManager.default.copyItem(at: try fileSystem.url(path), to: generated)
+                try FileManager.default.setAttributes(
+                    [.modificationDate: Date(timeIntervalSince1970: attributes.modified)],
+                    ofItemAtPath: generated.path
+                )
+                guard let currentAttributes = try fileSystem.attributes(path),
+                      currentAttributes.kind == .file,
+                      currentAttributes.size == attributes.size,
+                      currentAttributes.modified == attributes.modified,
+                      let current = try POSIXFileMetadata.read(atPath: fileSystem.url(path).path),
+                      current.cacheToken == source.cacheToken,
+                      !current.isSymbolicLink else {
+                    throw LocalFileError.changedSinceScan(path)
+                }
+                let stagedSize = ((try FileManager.default.attributesOfItem(atPath: generated.path)[.size]) as? NSNumber)?.int64Value ?? -1
+                guard stagedSize == attributes.size else {
+                    throw LocalFileError.changedSinceScan(path)
+                }
+                guard let stagedBeforeHash = try POSIXFileMetadata.read(atPath: generated.path),
+                      !stagedBeforeHash.isSymbolicLink else {
+                    throw LocalFileError.changedSinceScan(path)
+                }
+                let hash = try SHA256Hasher.hashFile(at: generated)
+                guard let stagedMetadata = try POSIXFileMetadata.read(atPath: generated.path),
+                      stagedMetadata.cacheToken == stagedBeforeHash.cacheToken,
+                      !stagedMetadata.isSymbolicLink else {
+                    throw LocalFileError.changedSinceScan(path)
+                }
+                return StagedUpload(
+                    fileURL: generated,
+                    size: attributes.size,
+                    modified: attributes.modified,
+                    hash: hash,
+                    sourceCacheToken: source.cacheToken,
+                    stagedCacheToken: stagedMetadata.cacheToken
+                )
+            }
+        } catch {
+            if let temporary { try? FileManager.default.removeItem(at: temporary) }
+            releaseTemporarySpace(attributes.size)
+            throw LocalFileSystem.mapError(error)
+        }
+    }
+
+    /// Baut einen Zielpfad unter Verwendung der exakten Schreibweise des
+    /// tiefsten bereits vorhandenen Serverordners (wichtig für NFD/NFC).
+    private static func rawRemotePath(for path: String, snapshot: RemoteSnapshot) -> String {
+        if let exact = snapshot.items[path] { return exact.rawPath }
+        for ancestor in RelativePath.ancestors(of: path).reversed() {
+            guard let item = snapshot.items[ancestor], item.kind == .directory else { continue }
+            let suffix = String(path.dropFirst(ancestor.count + 1))
+            return RelativePath.join(item.rawPath, suffix)
+        }
+        return path
+    }
+
+    /// Verknüpft Inhalt und Validator über dieselbe GET-Antwort. Damit kann kein
+    /// zwischen Mutation und nachträglichem PROPFIND eingeschobener Fremdstand
+    /// versehentlich als eigener Upload in die Baseline gelangen.
+    private func verifyRemoteContent(rawPath: String, expectedHash: String?, expectedSize: Int64) async throws -> VerifiedRemoteContent? {
+        guard let expectedHash else { return nil }
+        guard let before = try await client.stat(rawPath), before.kind == .file, before.size == expectedSize else {
+            return nil
+        }
+        try reserveTemporarySpace(for: expectedSize)
+        let temp: URL
+        do {
+            temp = try fileSystem.makeTemporaryFileURL()
+        } catch {
+            releaseTemporarySpace(expectedSize)
+            throw error
+        }
+        defer {
+            try? FileManager.default.removeItem(at: temp)
+            releaseTemporarySpace(expectedSize)
+        }
+        let result: DownloadResult
+        do {
+            result = try await client.download(rawPath, to: temp, progress: nil)
+        } catch {
+            if error is WebDAVError || error is CancellationError { throw error }
+            throw LocalFileSystem.mapError(error)
+        }
+        guard result.contentLength == expectedSize,
+              try await performFileOperation({ try SHA256Hasher.hashFile(at: temp) }) == expectedHash else {
+            return nil
+        }
+        guard let after = try await client.stat(rawPath),
+              after.kind == before.kind,
+              after.size == before.size,
+              after.validator == before.validator,
+              after.modified == before.modified else { return nil }
+        if result.isDirectDAVResponse, let responseETag = result.etag,
+           let currentETag = after.validator, responseETag != currentETag {
+            return nil
+        }
+        if let etag = after.validator, !etag.isEmpty {
+            return VerifiedRemoteContent(
+                validator: etag,
+                strong: after.validatorIsStrong,
+                size: result.contentLength,
+                modified: after.modified
+            )
+        }
+        if let modified = after.modified ?? result.lastModified?.timeIntervalSince1970 {
+            return VerifiedRemoteContent(
+                validator: "mtime:\(Int(modified));size:\(result.contentLength)",
+                strong: false,
+                size: result.contentLength,
+                modified: modified
+            )
+        }
+        return nil
+    }
+
+    private func performUpload(path: String, local: LocalItem, remote: RemoteItem?, conflictReason: ConflictReason?,
+                               snapshot: RemoteSnapshot) async throws -> ActionResult {
         let record = await beginTransfer(.uploadNew(path: path, local: local))
         let localPath = local.rawPath
         // Version festlegen, die hochgeladen wird.
@@ -771,29 +1331,66 @@ public actor SyncEngine {
             return .deferred
         }
         var version = local
-        if attrs.size != local.size || attrs.modified != local.modified {
-            version.size = attrs.size
-            version.modified = attrs.modified
-            version.hash = try fileSystem.hash(localPath)
-        }
-        let fileURL = try fileSystem.url(localPath)
+        version.size = attrs.size
+        version.modified = attrs.modified
         var ifMatch: String?
         var ifNoneMatchAll = false
+        let hasAtomicWebDAVPrecondition = remote?.validatorIsStrong == true
+            && capabilities?.supportsConditionalWrites == true
+        let needsVersionedTransport = capabilities?.honorsIfMatch == false
+            || (remote != nil && !hasAtomicWebDAVPrecondition)
+        let uploadTransportAvailable: Bool
+        if let uploadTransport {
+            uploadTransportAvailable = await uploadTransport.isAvailable()
+        } else {
+            uploadTransportAvailable = false
+        }
+        let versionedTransportAvailable = needsVersionedTransport && uploadTransportAvailable
         if let remote {
-            if remote.validatorIsStrong && capabilities?.supportsConditionalWrites != false {
+            if hasAtomicWebDAVPrecondition {
                 ifMatch = remote.validator
+            } else if !versionedTransportAvailable {
+                if uploadTransport != nil {
+                    throw WebDAVError.authenticationRequired(status: 401)
+                }
+                await finishTransfer(record, state: .skipped, note: "Der Server bietet keinen atomaren Versionsschutz; Überschreiben wurde sicherheitshalber zurückgestellt")
+                return .blocked
             } else {
-                // Ohne starke ETags: unmittelbar vor dem Schreiben den Serverstand prüfen.
+                // Zusätzliche Vorprüfung; die eigentliche Atomarität liefert der
+                // versionierte Upload-Endpunkt.
                 let current = try await client.stat(remote.rawPath)
-                if current?.validator != remote.validator {
+                if !Self.sameRemoteVersion(current, remote) {
                     await finishTransfer(record, state: .skipped, note: "Serverversion hat sich geändert – wird neu abgeglichen")
                     return .deferred
                 }
             }
         } else {
             ifNoneMatchAll = true
+            if capabilities?.honorsIfMatch == false, !versionedTransportAvailable {
+                if uploadTransport != nil {
+                    throw WebDAVError.authenticationRequired(status: 401)
+                }
+                await finishTransfer(record, state: .skipped, note: "Der Server bietet keinen atomaren Schutz beim Anlegen; Upload wurde sicherheitshalber zurückgestellt")
+                return .blocked
+            }
         }
-        let rawPath = remote?.rawPath ?? path
+        let rawPath = remote?.rawPath ?? Self.rawRemotePath(for: path, snapshot: snapshot)
+        let staged: StagedUpload
+        do {
+            staged = try await stageUpload(path: localPath)
+        } catch LocalFileError.changedSinceScan {
+            try await store.removeLocalIndex(path: path, mappingID: mapping.id)
+            await finishTransfer(record, state: .skipped, note: "Datei wurde während der Vorbereitung geändert – wird erneut geprüft")
+            return .deferred
+        }
+        defer {
+            try? FileManager.default.removeItem(at: staged.fileURL)
+            releaseTemporarySpace(staged.size)
+        }
+        version.size = staged.size
+        version.modified = staged.modified
+        version.hash = staged.hash
+        let fileURL = staged.fileURL
         let recordID = record?.id
         let progressHandler: TransferProgress = { [weak self] done, total in
             guard let self, let recordID else { return }
@@ -801,9 +1398,11 @@ public actor SyncEngine {
         }
         let result: UploadResult
         do {
-            if let transport = uploadTransport, let threshold = config.chunkedUploadThreshold, version.size >= threshold, await transport.isAvailable() {
-                if version.hash == nil { version.hash = try fileSystem.hash(localPath) }
-                let info = UploadRequestInfo(path: path, rawPath: localPath, fileURL: fileURL, size: version.size, modified: version.modified,
+            let exceedsChunkThreshold = config.chunkedUploadThreshold.map { version.size >= $0 } ?? false
+            if let transport = uploadTransport,
+               (needsVersionedTransport || exceedsChunkThreshold),
+               uploadTransportAvailable {
+                let info = UploadRequestInfo(path: path, rawPath: localPath, remotePath: rawPath, fileURL: fileURL, size: version.size, modified: version.modified,
                                              hash: version.hash ?? "", replacingValidator: remote?.validator)
                 logger.info("engine", "Chunk-Upload für \(path) (\(version.size) Bytes)")
                 result = try await transport.upload(info, progress: progressHandler)
@@ -815,36 +1414,78 @@ public actor SyncEngine {
             await finishTransfer(record, state: .skipped, note: "Serverversion hat sich zwischenzeitlich geändert – wird neu abgeglichen")
             return .deferred
         } catch LocalFileError.changedSinceScan {
+            try await store.removeLocalIndex(path: path, mappingID: mapping.id)
             await finishTransfer(record, state: .skipped, note: "Datei wurde während der Übertragung geändert – wird erneut hochgeladen")
             return .deferred
         } catch let error as CloudreveError {
             if case .unsupportedStoragePolicy = error {
+                guard !needsVersionedTransport else {
+                    logger.warning("engine", "\(error.userDescription) – unsicherer WebDAV-Rückfall für \(path) abgelehnt")
+                    await finishTransfer(record, state: .skipped, note: "Die Serverrichtlinie unterstützt keinen atomar geschützten Upload; Datei bleibt ausstehend")
+                    return .blocked
+                }
                 logger.warning("engine", "\(error.userDescription) – Rückfall auf WebDAV-PUT für \(path)")
                 result = try await client.upload(file: fileURL, to: rawPath, ifMatch: ifMatch, ifNoneMatchAll: ifNoneMatchAll, progress: progressHandler)
             } else {
                 throw error.asWebDAVError
             }
         }
-        // Validator ermitteln (Antwort-Header oder PROPFIND).
+        let expectedVersionHash = version.hash
+        let stagedStillMatches = try await performFileOperation {
+            guard let stagedMetadata = try POSIXFileMetadata.read(atPath: staged.fileURL.path),
+                  stagedMetadata.cacheToken == staged.stagedCacheToken,
+                  !stagedMetadata.isSymbolicLink else { return false }
+            return try SHA256Hasher.hashFile(at: staged.fileURL) == expectedVersionHash
+        }
+        guard stagedStillMatches else {
+            await finishTransfer(record, state: .skipped, note: "Upload-Arbeitskopie wurde unerwartet verändert – wird erneut geprüft")
+            return .deferred
+        }
+        // Nur ein Validator aus der Mutationsantwort ist kausal mit den
+        // hochgeladenen Bytes verknüpft. Fehlt er, wird die tatsächlich
+        // auslieferbare Repräsentation per GET gehasht; ein späteres PROPFIND
+        // allein könnte bereits die Version eines fremden Schreibers sehen.
         var validator = result.etag
-        var strong = validator.map { !$0.hasPrefix("W/") } ?? false
+        var strong = validator?.isStrongHTTPETag == true
         var remoteSize = version.size
         var remoteModified: Double?
-        if validator == nil, let stat = try? await client.stat(rawPath) {
-            validator = stat.validator
-            strong = stat.validatorIsStrong
-            remoteSize = stat.size
-            remoteModified = stat.modified
+        if validator == nil {
+            guard let verified = try await verifyRemoteContent(rawPath: rawPath, expectedHash: version.hash, expectedSize: version.size) else {
+                await finishTransfer(record, state: .skipped, note: "Serverversion konnte nach dem Upload nicht eindeutig bestätigt werden – wird neu abgeglichen")
+                return .deferred
+            }
+            validator = verified.validator
+            strong = verified.strong
+            remoteSize = verified.size
+            remoteModified = verified.modified
         }
         // Wurde die Datei während des Uploads verändert? Dann bleibt sie ausstehend.
-        var note: String?
-        if let after = try fileSystem.attributes(localPath), after.size != version.size || after.modified != version.modified {
-            note = "Datei wurde während der Übertragung erneut geändert – wird erneut hochgeladen"
-        }
+        let fileSystem = self.fileSystem
+        let expectedSize = version.size
+        let expectedModified = version.modified
+        let expectedHash = version.hash
+        let sourceToken = staged.sourceCacheToken
+        let sourceUnchanged = (try? await performFileOperation {
+            guard let after = try fileSystem.attributes(localPath),
+                  after.size == expectedSize,
+                  after.modified == expectedModified,
+                  let afterMetadata = try POSIXFileMetadata.read(atPath: fileSystem.url(localPath).path),
+                  afterMetadata.cacheToken == sourceToken else { return false }
+            return try fileSystem.hash(localPath) == expectedHash
+        }) == true
+        // Die Arbeitskopie wurde nachweislich installiert. Auch wenn das
+        // Original währenddessen weiterbearbeitet wurde, ist diese Version nun
+        // der gemeinsame Stand; der Folgelauf erkennt die lokale Folgeänderung
+        // dadurch als normalen Upload statt als künstlichen Erstkonflikt.
         try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: version.hash, localSize: version.size, localModified: version.modified,
                                                      remoteValidator: validator, remoteValidatorIsStrong: strong, remoteSize: remoteSize,
                                                      remoteModified: remoteModified), mappingID: mapping.id)
-        await finishTransfer(record, state: .succeeded, note: note)
+        if !sourceUnchanged {
+            try await store.removeLocalIndex(path: path, mappingID: mapping.id)
+            await finishTransfer(record, state: .skipped, note: "Datei wurde während der Übertragung erneut geändert – wird erneut abgeglichen")
+            return .deferred
+        }
+        await finishTransfer(record, state: .succeeded)
         if let conflictReason {
             let conflict = ConflictRecord(path: path, kind: .file, reason: conflictReason, localHash: version.hash, localSize: version.size,
                                           localModified: version.modified, remoteValidator: nil, remoteSize: nil, remoteModified: nil)
@@ -853,39 +1494,81 @@ public actor SyncEngine {
             logger.notice("engine", "Konflikt (lokal geändert, Server gelöscht): \(path) – lokale Version erhalten")
             return .conflict
         }
-        if note != nil { return .deferred }
         return .succeeded
     }
 
     // MARK: Download
 
     private func checkDiskSpace(for size: Int64) throws {
-        if let free = fileSystem.availableCapacity(), free < size + config.minimumFreeSpace {
+        guard size >= 0 else { throw LocalFileError.io("Server meldet eine ungültige Dateigröße") }
+        let (temporaryTotal, temporaryOverflow) = reservedTemporaryBytes.addingReportingOverflow(size)
+        let (required, overflow) = temporaryTotal.addingReportingOverflow(config.minimumFreeSpace)
+        if temporaryOverflow || overflow || fileSystem.availableCapacity().map({ $0 < required }) == true {
             throw LocalFileError.diskFull
         }
     }
 
+    private func reserveTemporarySpace(for size: Int64) throws {
+        try checkDiskSpace(for: size)
+        reservedTemporaryBytes += size
+    }
+
+    private func releaseTemporarySpace(_ size: Int64) {
+        reservedTemporaryBytes = max(0, reservedTemporaryBytes - max(0, size))
+    }
+
     private func downloadToTemp(_ remote: RemoteItem, recordID: String?) async throws -> (URL, DownloadResult, String) {
-        try checkDiskSpace(for: remote.size)
-        let temp = try fileSystem.makeTemporaryFileURL()
+        try reserveTemporarySpace(for: remote.size)
+        let temp: URL
+        do {
+            temp = try fileSystem.makeTemporaryFileURL()
+        } catch {
+            releaseTemporarySpace(remote.size)
+            throw error
+        }
         do {
             let result = try await client.download(remote.rawPath, to: temp, progress: { [weak self] done, total in
                 guard let self, let recordID else { return }
                 Task { await self.updateProgress(recordID: recordID, done: done, total: total) }
             })
-            let hash = try SHA256Hasher.hashFile(at: temp)
+            let hash = try await performFileOperation { try SHA256Hasher.hashFile(at: temp) }
             return (temp, result, hash)
         } catch {
+            releaseTemporarySpace(remote.size)
             try? FileManager.default.removeItem(at: temp)
             if error is WebDAVError || error is CancellationError { throw error }
             throw LocalFileSystem.mapError(error)
         }
     }
 
-    private func remoteValidatorAfterDownload(_ remote: RemoteItem, result: DownloadResult) async -> (String?, Bool, Double?) {
-        if let etag = result.etag { return (etag, !etag.hasPrefix("W/"), result.lastModified?.timeIntervalSince1970 ?? remote.modified) }
-        if let stat = try? await client.stat(remote.rawPath) { return (stat.validator, stat.validatorIsStrong, stat.modified) }
-        return (remote.validator, remote.validatorIsStrong, remote.modified)
+    private func remoteValidatorAfterDownload(_ remote: RemoteItem, result: DownloadResult) async throws -> (String?, Bool, Double?)? {
+        guard let current = try await client.stat(remote.rawPath),
+              current.kind == remote.kind,
+              current.size == remote.size,
+              current.size == result.contentLength else { return nil }
+        if let expectedValidator = remote.validator {
+            guard current.validator == expectedValidator else { return nil }
+        } else {
+            guard current.validator == nil,
+                  let before = remote.modified,
+                  let after = current.modified,
+                  abs(before - after) < 0.001 else { return nil }
+        }
+        // Bei einer fremden Object-Storage-Antwort gehört der GET-ETag nicht
+        // zum DAV-Namensraum. Bei einer direkten Antwort muss ein vorhandener
+        // GET-ETag dagegen mit dem anschließenden PROPFIND übereinstimmen.
+        if result.isDirectDAVResponse, let responseETag = result.etag,
+           let currentETag = current.validator, responseETag != currentETag {
+            return nil
+        }
+        let modified = current.modified ?? result.lastModified?.timeIntervalSince1970
+        if let validator = current.validator {
+            return (validator, current.validatorIsStrong, modified)
+        }
+        if let modified {
+            return ("mtime:\(Int(modified));size:\(result.contentLength)", false, modified)
+        }
+        return nil
     }
 
     private func performDownload(path: String, remote: RemoteItem, replacing: LocalItem?, conflictReason: ConflictReason?) async throws -> ActionResult {
@@ -898,20 +1581,40 @@ public actor SyncEngine {
         }
         let targetPath = replacing?.rawPath ?? path
         let (temp, result, hash) = try await downloadToTemp(remote, recordID: record?.id)
-        let (validator, strong, remoteModified) = await remoteValidatorAfterDownload(remote, result: result)
+        let temporaryFileID = try POSIXFileMetadata.read(atPath: temp.path)?.fileID
+        defer {
+            if let current = try? POSIXFileMetadata.read(atPath: temp.path),
+               current.fileID == temporaryFileID {
+                try? FileManager.default.removeItem(at: temp)
+            }
+            releaseTemporarySpace(remote.size)
+        }
+        guard let (validator, strong, remoteModified) = try await remoteValidatorAfterDownload(remote, result: result) else {
+            await finishTransfer(record, state: .skipped, note: "Serverdatei hat sich während des Downloads geändert – wird neu abgeglichen")
+            return .deferred
+        }
         let modifiedDate = remoteModified.map { Date(timeIntervalSince1970: $0) }
-        if let replacing, replacing.hash == hash {
+        let fileSystem = self.fileSystem
+        if replacing != nil,
+           let current = try fileSystem.attributes(targetPath),
+           current.kind == .file,
+           try await performFileOperation({ try fileSystem.hash(targetPath) }) == hash {
             // Inhalt identisch – nur gemeinsamen Stand aktualisieren.
             try? FileManager.default.removeItem(at: temp)
-            try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: hash, localSize: replacing.size, localModified: replacing.modified,
+            try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: hash, localSize: current.size, localModified: current.modified,
                                                          remoteValidator: validator, remoteValidatorIsStrong: strong, remoteSize: result.contentLength,
                                                          remoteModified: remoteModified), mappingID: mapping.id)
             await finishTransfer(record, state: .succeeded, note: "Inhalt war bereits identisch")
             return .succeeded
         }
         do {
-            try fileSystem.installDownloadedFile(from: temp, to: targetPath, expectedHash: replacing?.hash, expectedSize: replacing?.size,
-                                                 expectedModified: replacing?.modified, modifiedDate: modifiedDate)
+            let expectedHash = replacing?.hash
+            let expectedSize = replacing?.size
+            let expectedModified = replacing?.modified
+            try await performFileOperation {
+                try fileSystem.installDownloadedFile(from: temp, to: targetPath, expectedHash: expectedHash, expectedSize: expectedSize,
+                                                     expectedModified: expectedModified, modifiedDate: modifiedDate)
+            }
         } catch LocalFileError.changedSinceScan {
             await finishTransfer(record, state: .skipped, note: "Lokale Datei wurde zwischenzeitlich geändert – wird neu abgeglichen")
             return .deferred
@@ -938,7 +1641,18 @@ public actor SyncEngine {
         if downloadsPausedForDiskSpace { throw LocalFileError.diskFull }
         let record = await beginTransfer(.verifyConflict(path: path, local: local, remote: remote, reason: reason))
         let (temp, result, remoteHash) = try await downloadToTemp(remote, recordID: record?.id)
-        let (validator, strong, remoteModified) = await remoteValidatorAfterDownload(remote, result: result)
+        let temporaryFileID = try POSIXFileMetadata.read(atPath: temp.path)?.fileID
+        defer {
+            if let current = try? POSIXFileMetadata.read(atPath: temp.path),
+               current.fileID == temporaryFileID {
+                try? FileManager.default.removeItem(at: temp)
+            }
+            releaseTemporarySpace(remote.size)
+        }
+        guard let (validator, strong, remoteModified) = try await remoteValidatorAfterDownload(remote, result: result) else {
+            await finishTransfer(record, state: .skipped, note: "Serverdatei hat sich während des Downloads geändert – wird neu abgeglichen")
+            return .deferred
+        }
         // Lokale Version muss noch dem geplanten Stand entsprechen.
         let localPath = local.rawPath
         guard let attrs = try fileSystem.attributes(localPath), attrs.kind == .file else {
@@ -946,10 +1660,8 @@ public actor SyncEngine {
             await finishTransfer(record, state: .skipped, note: "Lokale Datei nicht mehr vorhanden – wird neu abgeglichen")
             return .deferred
         }
-        var localHash = local.hash
-        if attrs.size != local.size || attrs.modified != local.modified {
-            localHash = try fileSystem.hash(localPath)
-        }
+        let fileSystem = self.fileSystem
+        let localHash = try await performFileOperation { try fileSystem.hash(localPath) }
         if localHash == remoteHash {
             try? FileManager.default.removeItem(at: temp)
             try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: remoteHash, localSize: attrs.size, localModified: attrs.modified,
@@ -958,9 +1670,23 @@ public actor SyncEngine {
             await finishTransfer(record, state: .succeeded, note: "Beide Seiten hatten denselben Inhalt – zusammengeführt")
             return .succeeded
         }
+        if reason == .bothModified,
+           let baseline = try await store.baseline(mappingID: mapping.id)[path],
+           baseline.localHash == remoteHash {
+            // Ein schwacher oder fehlender Validator ließ die Serverseite nur
+            // vorsorglich als geändert erscheinen. Der Inhaltsvergleich zeigt,
+            // dass sie weiterhin dem gemeinsamen Stand entspricht. Die lokale
+            // Fassung darf deshalb nicht in eine künstliche Konfliktkopie
+            // verschoben werden; der geschützte Uploadpfad entscheidet, ob der
+            // Server ein atomar abgesichertes Überschreiben erlaubt.
+            await finishTransfer(record, state: .skipped, note: "Serverinhalt ist unverändert; lokaler Upload wird sicher geprüft")
+            return try await performUpload(path: path, local: local, remote: remote, conflictReason: nil, snapshot: lastRemoteSnapshot ?? RemoteSnapshot())
+        }
         // Beide Versionen erhalten: lokale Version wird zur Konfliktkopie, Serverversion übernimmt den Pfad.
         let copyName = RelativePath.conflictCopyName(for: RelativePath.name(of: path), deviceName: config.deviceName)
-        let copyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
+        let desiredCopyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
+        let copyPath = try fileSystem.uniqueRelativePath(desiredCopyPath)
+        let actualCopyName = RelativePath.name(of: copyPath)
         try fileSystem.move(localPath, to: copyPath)
         do {
             try fileSystem.installDownloadedFile(from: temp, to: path, expectedHash: nil, expectedSize: nil, expectedModified: nil,
@@ -977,7 +1703,7 @@ public actor SyncEngine {
         let conflict = ConflictRecord(path: path, kind: .file, reason: reason, localHash: localHash, localSize: attrs.size, localModified: attrs.modified,
                                       remoteValidator: validator, remoteSize: result.contentLength, remoteModified: remoteModified, conflictCopyPath: copyPath)
         try await store.saveConflict(conflict, mappingID: mapping.id)
-        await finishTransfer(record, state: .succeeded, note: "Konflikt: lokale Version als „\(copyName)“ gesichert")
+        await finishTransfer(record, state: .succeeded, note: "Konflikt: lokale Version als „\(actualCopyName)“ gesichert")
         eventHandler?(.conflictDetected(path: path))
         logger.notice("engine", "Konflikt: \(path) – Konfliktkopie \(copyPath)")
         return .conflict
@@ -986,29 +1712,73 @@ public actor SyncEngine {
     private func performKindMismatch(path: String, local: LocalItem, remote: RemoteItem) async throws -> ActionResult {
         let record = await beginTransfer(.kindMismatch(path: path, local: local, remote: remote))
         let copyName = RelativePath.conflictCopyName(for: RelativePath.name(of: path), deviceName: config.deviceName)
-        let copyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
+        let desiredCopyPath = RelativePath.join(RelativePath.parent(of: path) ?? "", copyName)
+        let copyPath = try fileSystem.uniqueRelativePath(desiredCopyPath)
+
+        var downloaded: (temp: URL, tempFileID: String, result: DownloadResult, hash: String,
+                         validator: String?, strong: Bool, modified: Double?)?
+        defer {
+            if let downloaded {
+                if let current = try? POSIXFileMetadata.read(atPath: downloaded.temp.path),
+                   current.fileID == downloaded.tempFileID {
+                    try? FileManager.default.removeItem(at: downloaded.temp)
+                }
+                releaseTemporarySpace(remote.size)
+            }
+        }
+        if remote.kind == .file {
+            let value = try await downloadToTemp(remote, recordID: record?.id)
+            guard let validator = try await remoteValidatorAfterDownload(remote, result: value.1) else {
+                try? FileManager.default.removeItem(at: value.0)
+                releaseTemporarySpace(remote.size)
+                await finishTransfer(record, state: .skipped, note: "Serverdatei hat sich während des Downloads geändert – wird neu abgeglichen")
+                return .deferred
+            }
+            guard let tempFileID = try POSIXFileMetadata.read(atPath: value.0.path)?.fileID else {
+                try? FileManager.default.removeItem(at: value.0)
+                releaseTemporarySpace(remote.size)
+                throw LocalFileError.io("Temporäre Download-Datei ist verschwunden")
+            }
+            downloaded = (value.0, tempFileID, value.1, value.2, validator.0, validator.1, validator.2)
+        }
+
         try fileSystem.move(local.rawPath, to: copyPath)
-        try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
-        if remote.kind == .directory {
-            try fileSystem.createDirectory(path)
-            try await store.upsertBaseline(BaselineEntry(path: path, kind: .directory, localHash: nil, localSize: 0, localModified: 0,
-                                                         remoteValidator: remote.validator, remoteValidatorIsStrong: remote.validatorIsStrong,
-                                                         remoteSize: 0, remoteModified: remote.modified), mappingID: mapping.id)
-        } else {
-            let (temp, result, hash) = try await downloadToTemp(remote, recordID: record?.id)
-            let (validator, strong, remoteModified) = await remoteValidatorAfterDownload(remote, result: result)
-            try fileSystem.installDownloadedFile(from: temp, to: path, expectedHash: nil, expectedSize: nil, expectedModified: nil,
-                                                 modifiedDate: remoteModified.map { Date(timeIntervalSince1970: $0) })
-            let installed = try fileSystem.attributes(path)
-            try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: hash, localSize: installed?.size ?? result.contentLength,
-                                                         localModified: installed?.modified ?? 0, remoteValidator: validator, remoteValidatorIsStrong: strong,
-                                                         remoteSize: result.contentLength, remoteModified: remoteModified), mappingID: mapping.id)
+        do {
+            if remote.kind == .directory {
+                try fileSystem.createDirectory(path)
+                try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
+                try await store.upsertBaseline(BaselineEntry(path: path, kind: .directory, localHash: nil, localSize: 0, localModified: 0,
+                                                             remoteValidator: remote.validator, remoteValidatorIsStrong: remote.validatorIsStrong,
+                                                             remoteSize: 0, remoteModified: remote.modified), mappingID: mapping.id)
+            } else if let downloaded {
+                try fileSystem.installDownloadedFile(from: downloaded.temp, to: path, expectedHash: nil, expectedSize: nil, expectedModified: nil,
+                                                     modifiedDate: downloaded.modified.map { Date(timeIntervalSince1970: $0) })
+                let installed = try fileSystem.attributes(path)
+                try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
+                try await store.upsertBaseline(BaselineEntry(path: path, kind: .file, localHash: downloaded.hash,
+                                                             localSize: installed?.size ?? downloaded.result.contentLength,
+                                                             localModified: installed?.modified ?? 0, remoteValidator: downloaded.validator,
+                                                             remoteValidatorIsStrong: downloaded.strong,
+                                                             remoteSize: downloaded.result.contentLength, remoteModified: downloaded.modified),
+                                                 mappingID: mapping.id)
+            }
+        } catch {
+            if let temp = downloaded?.temp { try? FileManager.default.removeItem(at: temp) }
+            // Ist die Serverversion bereits am Ziel installiert, bleibt sie
+            // zusammen mit der lokalen Konfliktkopie erhalten. Ein pauschales
+            // Entfernen könnte Benutzeränderungen löschen, die zwischenzeitlich
+            // im neuen Ziel entstanden sind. Nur wenn noch kein Ersatz existiert,
+            // kann die ursprüngliche Version gefahrlos zurückgeschoben werden.
+            if (try? fileSystem.attributes(path)) == nil {
+                try? fileSystem.move(copyPath, to: local.rawPath)
+            }
+            throw error
         }
         let conflict = ConflictRecord(path: path, kind: local.kind, reason: .kindMismatch, localHash: local.hash, localSize: local.size,
                                       localModified: local.modified, remoteValidator: remote.validator, remoteSize: remote.size,
                                       remoteModified: remote.modified, conflictCopyPath: copyPath)
         try await store.saveConflict(conflict, mappingID: mapping.id)
-        await finishTransfer(record, state: .succeeded, note: "Datei/Ordner-Konflikt: lokale Version als „\(copyName)“ gesichert")
+        await finishTransfer(record, state: .succeeded, note: "Datei/Ordner-Konflikt: lokale Version als „\(RelativePath.name(of: copyPath))“ gesichert")
         eventHandler?(.conflictDetected(path: path))
         return .conflict
     }
@@ -1017,11 +1787,12 @@ public actor SyncEngine {
 
     private func performCreateRemoteDirectory(path: String, snapshot: RemoteSnapshot) async throws -> ActionResult {
         let record = await beginTransfer(.createRemoteDirectory(path: path))
+        let rawPath = Self.rawRemotePath(for: path, snapshot: snapshot)
         var validator: String?
         var strong = false
         var modified: Double?
         do {
-            try await client.makeDirectory(path)
+            try await client.makeDirectory(rawPath)
         } catch let error as WebDAVError {
             if case .conflict(let status, _) = error, status == 405 {
                 // existiert bereits
@@ -1029,15 +1800,16 @@ public actor SyncEngine {
                 throw error
             }
         }
-        if let stat = try? await client.stat(path) {
-            if stat.kind != .directory {
-                await finishTransfer(record, state: .skipped, note: "Auf dem Server liegt an dieser Stelle eine Datei – wird neu abgeglichen")
-                return .deferred
-            }
-            validator = stat.validator
-            strong = stat.validatorIsStrong
-            modified = stat.modified
+        guard let stat = try await client.stat(rawPath) else {
+            throw WebDAVError.invalidResponse("Der neu angelegte Ordner „\(path)“ ist nicht auffindbar")
         }
+        if stat.kind != .directory {
+            await finishTransfer(record, state: .skipped, note: "Auf dem Server liegt an dieser Stelle eine Datei – wird neu abgeglichen")
+            return .deferred
+        }
+        validator = stat.validator
+        strong = stat.validatorIsStrong
+        modified = stat.modified
         try await store.upsertBaseline(BaselineEntry(path: path, kind: .directory, localHash: nil, localSize: 0, localModified: 0,
                                                      remoteValidator: validator, remoteValidatorIsStrong: strong, remoteSize: 0, remoteModified: modified), mappingID: mapping.id)
         await finishTransfer(record, state: .succeeded)
@@ -1051,32 +1823,19 @@ public actor SyncEngine {
             await finishTransfer(record, state: .skipped, note: "Eintrag ist lokal wieder vorhanden – wird neu abgeglichen")
             return .deferred
         }
-        var ifMatch: String?
-        if remote.kind == .file {
-            if remote.validatorIsStrong {
-                ifMatch = remote.validator
-            } else {
-                let current = try await client.stat(remote.rawPath)
-                if let current, current.validator != remote.validator {
-                    await finishTransfer(record, state: .skipped, note: "Serverversion hat sich geändert – wird neu abgeglichen")
-                    return .deferred
-                }
-            }
-        } else {
-            // Ordner: unmittelbar vor dem Löschen nochmals prüfen, dass keine neuen Einträge entstanden sind.
-            let children = try await client.list(directory: remote.rawPath)
-            let baseline = try await store.baseline(mappingID: mapping.id)
-            for child in children where !rules.isExcluded(relativePath: child.path) {
-                guard let b = baseline[child.path] else {
-                    await finishTransfer(record, state: .skipped, note: "Im Ordner sind auf dem Server neue Einträge entstanden – wird neu abgeglichen")
-                    return .deferred
-                }
-                if child.kind == .file, child.validator != b.remoteValidator {
-                    await finishTransfer(record, state: .skipped, note: "Im Ordner wurden auf dem Server Dateien geändert – wird neu abgeglichen")
-                    return .deferred
-                }
-            }
+        if remote.kind == .directory {
+            await finishTransfer(
+                record,
+                state: .skipped,
+                note: "Rekursive Server-Löschungen besitzen keine atomare Vorbedingung für neue Kinder; der leere Ordner bleibt sicherheitshalber bestehen"
+            )
+            return .blocked
         }
+        guard remote.validatorIsStrong, capabilities?.supportsConditionalWrites == true else {
+            await finishTransfer(record, state: .skipped, note: "Der Server kann diese Löschung nicht atomar gegen parallele Änderungen schützen; sie wurde nicht ausgeführt")
+            return .blocked
+        }
+        let ifMatch = remote.validator
         do {
             try await client.delete(remote.rawPath, ifMatch: ifMatch)
         } catch let error as WebDAVError where error == .preconditionFailed {
@@ -1091,6 +1850,13 @@ public actor SyncEngine {
     private func performDeleteLocal(path: String, local: LocalItem) async throws -> ActionResult {
         let record = await beginTransfer(.deleteLocal(path: path, local: local))
         let localPath = local.rawPath
+        // Ein einzelnes still ausgelassenes PROPFIND-Kind darf niemals als
+        // bestätigte Serverlöschung gelten. Auch ein nach dem Listing neu
+        // angelegter Eintrag wird so vor der lokalen Mutation erkannt.
+        if try await client.stat(path) != nil {
+            await finishTransfer(record, state: .skipped, note: "Servereintrag ist wieder vorhanden – wird neu abgeglichen")
+            return .deferred
+        }
         // Sicherheitsprüfung: Der Eintrag muss lokal noch dem bekannten Stand entsprechen.
         guard let attrs = try fileSystem.attributes(localPath) else {
             try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
@@ -1098,44 +1864,36 @@ public actor SyncEngine {
             return .succeeded
         }
         if attrs.kind == .file {
-            if attrs.size != local.size || attrs.modified != local.modified, try fileSystem.hash(localPath) != local.hash {
+            guard let expectedHash = local.hash else {
                 await finishTransfer(record, state: .skipped, note: "Lokale Datei wurde zwischenzeitlich geändert – wird neu abgeglichen")
                 return .deferred
             }
-        } else {
-            let baseline = try await store.baseline(mappingID: mapping.id)
-            if try !directoryMatchesBaseline(localPath, baseline: baseline) {
-                await finishTransfer(record, state: .skipped, note: "Im Ordner gibt es lokal neue oder geänderte Dateien – wird neu abgeglichen")
+            let destination: URL?
+            do {
+                destination = try fileSystem.trashVerifiedFile(
+                    localPath,
+                    expectedHash: expectedHash,
+                    recoveryDirectory: config.recoveryDirectory
+                )
+            } catch LocalFileError.changedSinceScan {
+                await finishTransfer(record, state: .skipped, note: "Lokale Datei wurde zwischenzeitlich geändert – wird neu abgeglichen")
                 return .deferred
             }
-        }
-        let destination = try fileSystem.trash(localPath, recoveryDirectory: config.recoveryDirectory)
-        try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
-        let note = destination.map { $0.path.contains("/.Trash") ? "In den Papierkorb verschoben" : "In den Wiederherstellungsbereich verschoben" }
-        await finishTransfer(record, state: .succeeded, note: note)
-        return .succeeded
-    }
-
-    /// Prüft, ob alle Dateien eines lokalen Ordners noch dem gemeinsamen Stand entsprechen.
-    private func directoryMatchesBaseline(_ dir: String, baseline: [String: BaselineEntry]) throws -> Bool {
-        let url = try fileSystem.url(dir)
-        guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey], options: []) else { return true }
-        let rootPath = fileSystem.root.path
-        for case let child as URL in enumerator {
-            var rel = child.standardizedFileURL.path
-            guard rel.hasPrefix(rootPath + "/") else { continue }
-            rel = String(rel.dropFirst(rootPath.count + 1)).precomposedStringWithCanonicalMapping
-            if rules.isExcluded(relativePath: rel) { continue }
-            guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]) else { return false }
-            if values.isDirectory == true { continue }
-            guard let b = baseline[rel] else { return false }
-            let size = Int64(values.fileSize ?? 0)
-            let mtime = values.contentModificationDate?.timeIntervalSince1970 ?? 0
-            if size != b.localSize || mtime != b.localModified {
-                if try SHA256Hasher.hashFile(at: child) != b.localHash { return false }
+            try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
+            let note = destination.map {
+                $0.path.contains("/.Trash") ? "In den Papierkorb verschoben" : "In den Wiederherstellungsbereich verschoben"
             }
+            await finishTransfer(record, state: .succeeded, note: note)
+            return .succeeded
+        } else {
+            guard try fileSystem.removeDirectoryIfEmpty(localPath, rules: rules) else {
+                await finishTransfer(record, state: .skipped, note: "Ordner ist nicht leer – Inhalte werden neu abgeglichen")
+                return .deferred
+            }
+            try await store.removeBaselineSubtree(path: path, mappingID: mapping.id)
+            await finishTransfer(record, state: .succeeded, note: "Leeren Ordner entfernt")
+            return .succeeded
         }
-        return true
     }
 
     private func performMoveRemote(from: String, to: String, remote: RemoteItem, local: LocalItem, snapshot: RemoteSnapshot) async throws -> ActionResult {
@@ -1144,22 +1902,53 @@ public actor SyncEngine {
             await finishTransfer(record, state: .skipped, note: "Quelle ist lokal wieder vorhanden – wird neu abgeglichen")
             return .deferred
         }
-        do {
-            try await client.move(from: remote.rawPath, to: to, overwrite: false, ifMatch: remote.validatorIsStrong ? remote.validator : nil)
-        } catch {
-            logger.notice("engine", "MOVE \(from) → \(to) fehlgeschlagen (\(error)); Rückfall auf Upload + Löschung")
-            await finishTransfer(record, state: .skipped, note: "Umbenennung auf dem Server nicht möglich – wird als Upload und Löschung übertragen")
-            let up = try await performUpload(path: to, local: local, remote: nil, conflictReason: nil)
-            if up == .succeeded {
-                _ = try await performDeleteRemote(path: from, remote: remote)
-            }
-            return up
+        guard remote.validatorIsStrong, capabilities?.supportsConditionalWrites == true else {
+            await finishTransfer(record, state: .skipped, note: "Der Server kann die Umbenennung nicht atomar gegen parallele Änderungen schützen; sie wurde nicht ausgeführt")
+            return .blocked
         }
-        let stat = try await client.stat(to)
+        let rawDestination = Self.rawRemotePath(for: to, snapshot: snapshot)
+        if try await client.stat(rawDestination) != nil {
+            await finishTransfer(record, state: .skipped, note: "Am Serverziel ist inzwischen ein Eintrag entstanden – wird neu abgeglichen")
+            return .deferred
+        }
+        do {
+            try await client.move(from: remote.rawPath, to: rawDestination, overwrite: false, ifMatch: remote.validatorIsStrong ? remote.validator : nil)
+        } catch let error as WebDAVError where error == .preconditionFailed {
+            await finishTransfer(record, state: .skipped, note: "Serverquelle oder -ziel hat sich geändert – wird neu abgeglichen")
+            return .deferred
+        } catch let error as WebDAVError {
+            let supportsFallback: Bool
+            switch error {
+            case .conflict(let status, _):
+                supportsFallback = status == 405 || status == 501
+            case .unexpectedStatus(let status, _):
+                supportsFallback = status == 405 || status == 501
+            default:
+                supportsFallback = false
+            }
+            guard supportsFallback else { throw error }
+            logger.notice("engine", "MOVE \(from) → \(to) fehlgeschlagen (\(error)); Rückfall auf Upload + Löschung")
+            let up = try await performUpload(path: to, local: local, remote: nil, conflictReason: nil, snapshot: snapshot)
+            guard case .succeeded = up else {
+                await finishTransfer(record, state: .skipped, note: "Ersatzupload der Umbenennung bleibt ausstehend")
+                return up
+            }
+            let deletion = try await performDeleteRemote(path: from, remote: remote)
+            if case .succeeded = deletion {
+                await finishTransfer(record, state: .succeeded, note: "Als Upload und geschützte Quelllöschung übertragen")
+            } else {
+                await finishTransfer(record, state: .skipped, note: "Ziel wurde hochgeladen; die geschützte Quelllöschung bleibt ausstehend")
+            }
+            return deletion
+        }
+        guard let verified = try await verifyRemoteContent(rawPath: rawDestination, expectedHash: local.hash, expectedSize: local.size) else {
+            await finishTransfer(record, state: .skipped, note: "Ziel der Server-Umbenennung konnte nicht eindeutig bestätigt werden – wird neu abgeglichen")
+            return .deferred
+        }
         try await store.removeBaselineSubtree(path: from, mappingID: mapping.id)
         try await store.upsertBaseline(BaselineEntry(path: to, kind: .file, localHash: local.hash, localSize: local.size, localModified: local.modified,
-                                                     remoteValidator: stat?.validator, remoteValidatorIsStrong: stat?.validatorIsStrong ?? false,
-                                                     remoteSize: stat?.size ?? local.size, remoteModified: stat?.modified), mappingID: mapping.id)
+                                                     remoteValidator: verified.validator, remoteValidatorIsStrong: verified.strong,
+                                                     remoteSize: verified.size, remoteModified: verified.modified), mappingID: mapping.id)
         await finishTransfer(record, state: .succeeded)
         return .succeeded
     }
@@ -1175,10 +1964,15 @@ public actor SyncEngine {
     }
 
     private func refreshCounters() async {
-        status.openConflicts = (try? await store.openConflictCount(mappingID: mapping.id)) ?? 0
-        status.pendingDeletions = (try? await store.pendingDeletions(mappingID: mapping.id).count) ?? 0
-        if !status.isRunning {
-            status.pendingCount = (try? await store.queue(mappingID: mapping.id).count) ?? 0
+        do {
+            status.openConflicts = try await store.openConflictCount(mappingID: mapping.id)
+            status.pendingDeletions = try await store.pendingDeletions(mappingID: mapping.id).count
+            if !status.isRunning {
+                status.pendingCount = try await store.queue(mappingID: mapping.id).count
+            }
+        } catch {
+            reportPersistenceIssue(error)
+            return
         }
         recomputeHealth()
     }
@@ -1188,8 +1982,10 @@ public actor SyncEngine {
             status.health = .syncing
         } else if status.isPaused {
             status.health = .paused
+        } else if downloadsPausedForDiskSpace {
+            status.health = .attention
         } else if status.nextRetry != nil {
-            status.health = .offline
+            status.health = retryRepresentsOffline ? .offline : .attention
         } else if status.pendingDeletions > 0 || status.lastIssue != nil {
             status.health = .attention
         } else if status.openConflicts > 0 {

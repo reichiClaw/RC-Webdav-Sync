@@ -21,10 +21,14 @@ public struct DownloadResult: Sendable {
     public var etag: String?
     public var lastModified: Date?
     public var contentLength: Int64
-    public init(etag: String?, lastModified: Date?, contentLength: Int64) {
+    /// `false`, wenn der DAV-Server auf einen fremden Object-Storage
+    /// umgeleitet hat; dessen ETag ist kein DAV-Validator.
+    public var isDirectDAVResponse: Bool
+    public init(etag: String?, lastModified: Date?, contentLength: Int64, isDirectDAVResponse: Bool = true) {
         self.etag = etag
         self.lastModified = lastModified
         self.contentLength = contentLength
+        self.isDirectDAVResponse = isDirectDAVResponse
     }
 }
 
@@ -106,6 +110,15 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         guard let scheme = baseURL.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
             throw WebDAVError.invalidResponse("Ungültiges URL-Schema")
         }
+        guard let host = baseURL.host, !host.isEmpty,
+              baseURL.user == nil, baseURL.password == nil,
+              baseURL.query == nil, baseURL.fragment == nil else {
+            throw WebDAVError.invalidResponse("Die Serveradresse muss einen Host enthalten und darf keine Zugangsdaten, Abfrage oder Fragmentangabe enthalten")
+        }
+        let decodedSegments = baseURL.path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !decodedSegments.contains(".."), !decodedSegments.contains(".") else {
+            throw WebDAVError.invalidResponse("Die Serveradresse enthält unsichere Pfadsegmente")
+        }
         if scheme == "http" && !allowInsecureHTTP && !WebDAVClient.isLoopback(baseURL) {
             throw WebDAVError.insecureURL
         }
@@ -125,7 +138,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.httpAdditionalHeaders = ["User-Agent": "reichi-Sync/1.0 (macOS)"]
-        let delegate = TransportDelegate(allowedHost: self.baseURL.host ?? "", logger: logger)
+        let delegate = TransportDelegate(allowedOrigin: self.baseURL, logger: logger)
         self.delegate = delegate
         self.session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
     }
@@ -143,7 +156,9 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
-    public func url(for rawPath: String, isCollection: Bool = false) -> URL {
+    public func url(for rawPath: String, isCollection: Bool = false) throws -> URL {
+        guard !rawPath.hasPrefix("/") else { throw PathError.outsideRoot }
+        _ = try RelativePath.normalize(rawPath)
         var result = baseURL
         for seg in rawPath.split(separator: "/", omittingEmptySubsequences: true) {
             result.appendPathComponent(String(seg), isDirectory: false)
@@ -169,10 +184,47 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return nil
     }
 
+    /// Validiert eine servergelieferte URI-Referenz vollständig. Insbesondere dürfen
+    /// absolute `href`s nicht auf eine andere Origin zeigen und kodierte Traversals
+    /// nicht durch stilles Überspringen eine unvollständige Aufzählung erzeugen.
+    func validatedPath(for resource: DAVResource) throws -> (key: String, raw: String) {
+        var hrefPath = resource.hrefPath
+        if let rawHref = resource.rawHref {
+            guard let resolved = URL(string: rawHref, relativeTo: baseURL)?.absoluteURL,
+                  resolved.user == nil, resolved.password == nil,
+                  resolved.query == nil, resolved.fragment == nil,
+                  TransportDelegate.hasSameOrigin(resolved, baseURL) else {
+                throw WebDAVError.invalidResponse("Unsicheres oder fremdes DAV-href: \(rawHref)")
+            }
+            hrefPath = resolved.path
+        }
+        guard let raw = relativePath(fromHrefPath: hrefPath) else {
+            throw WebDAVError.invalidResponse("DAV-href außerhalb der konfigurierten Basis: \(hrefPath)")
+        }
+        do {
+            return (try RelativePath.normalize(raw), raw)
+        } catch {
+            throw WebDAVError.invalidResponse("Ungültiger DAV-Pfad: \(raw)")
+        }
+    }
+
+    private static func validate(_ multi: MultiStatusResponse, context: String) throws {
+        guard multi.issues.isEmpty else {
+            throw WebDAVError.invalidResponse("\(context): \(multi.issues.joined(separator: "; "))")
+        }
+    }
+
+    private static func validateProperties(_ resource: DAVResource, context: String) throws {
+        guard resource.successfulProperties.contains("resourcetype") else {
+            throw WebDAVError.invalidResponse("\(context): resourcetype fehlt oder konnte nicht gelesen werden")
+        }
+    }
+
     // MARK: - Requests
 
-    private func makeRequest(_ method: String, path rawPath: String, isCollection: Bool = false, headers: [String: String] = [:], body: Data? = nil) -> URLRequest {
-        var request = URLRequest(url: url(for: rawPath, isCollection: isCollection))
+    private func makeRequest(_ method: String, path rawPath: String, isCollection: Bool = false,
+                             headers: [String: String] = [:], body: Data? = nil) throws -> URLRequest {
+        var request = URLRequest(url: try url(for: rawPath, isCollection: isCollection))
         request.httpMethod = method
         request.setValue(credentials.authorizationHeader, forHTTPHeaderField: "Authorization")
         request.setValue("application/xml; charset=utf-8", forHTTPHeaderField: "Content-Type")
@@ -200,6 +252,9 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Response, Error>) in
                 let task = session.dataTask(with: request) { data, response, error in
+                    defer {
+                        if let id = holder.taskIdentifier { delegate.finishTask(taskIdentifier: id) }
+                    }
                     if let error {
                         continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
@@ -223,7 +278,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                 task.resume()
             }
         } onCancel: {
-            holder.task?.cancel()
+            holder.cancel()
         }
     }
 
@@ -307,39 +362,74 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         let response = try await perform(makeRequest("PROPFIND", path: "", isCollection: true, headers: ["Depth": "0"], body: Data(Self.capabilitiesBody.utf8)))
         try check(response, accept: [207], context: "PROPFIND /")
         let multi = try MultiStatusParser.parse(response.data)
-        if let root = multi.resources.first {
-            caps.supportsSyncCollection = root.supportsSyncCollection || root.properties["sync-token"] != nil
-            caps.providesETags = root.etag != nil
-            caps.strongETags = root.hasStrongETag
+        try Self.validate(multi, context: "PROPFIND /")
+        guard multi.resources.count == 1, let root = multi.resources.first else {
+            throw WebDAVError.invalidResponse("PROPFIND / lieferte nicht genau eine Ressource")
         }
+        if let status = root.status, !(200..<300).contains(status) {
+            throw Self.error(for: status, body: Data(), context: "PROPFIND /")
+        }
+        try Self.validateProperties(root, context: "PROPFIND /")
+        let capabilityRootPath = try validatedPath(for: root)
+        guard capabilityRootPath.key.isEmpty else {
+            throw WebDAVError.invalidResponse("PROPFIND / lieferte eine fremde Ressource")
+        }
+        caps.supportsSyncCollection = root.supportsSyncCollection || root.properties["sync-token"] != nil
+        caps.providesETags = root.etag != nil
+        // Ein Collection-ETag beweist nichts über Datei-ETags.
+        caps.strongETags = false
         // ETag-Stärke anhand einer Datei verifizieren (Collections liefern nicht immer ETags).
         if !caps.strongETags {
             let listing = try await perform(makeRequest("PROPFIND", path: "", isCollection: true, headers: ["Depth": "1"], body: Data(Self.propfindBody.utf8)))
-            if listing.status == 207, let parsed = try? MultiStatusParser.parse(listing.data) {
-                let files = parsed.resources.filter { !$0.isCollection }
-                if let first = files.first {
-                    caps.providesETags = first.etag != nil
-                    caps.strongETags = first.hasStrongETag
-                } else if !files.isEmpty || caps.providesETags {
-                    // keine Dateien zur Prüfung: optimistisch bleiben
+            if listing.status == 207 {
+                do {
+                    let parsed = try MultiStatusParser.parse(listing.data)
+                    try Self.validate(parsed, context: "PROPFIND / (Fähigkeitstest)")
+                    var files: [DAVResource] = []
+                    var seen: Set<String> = []
+                    for resource in parsed.resources {
+                        if let status = resource.status, !(200..<300).contains(status) {
+                            throw Self.error(for: status, body: Data(), context: "PROPFIND / (Fähigkeitstest)")
+                        }
+                        try Self.validateProperties(resource, context: "PROPFIND / (Fähigkeitstest)")
+                        let mapped = try validatedPath(for: resource)
+                        guard seen.insert(mapped.key).inserted else {
+                            throw WebDAVError.invalidResponse("Doppelter Pfad im Fähigkeitstest")
+                        }
+                        if !resource.isCollection { files.append(resource) }
+                    }
+                    if let first = files.first {
+                        caps.providesETags = first.etag != nil
+                        caps.strongETags = first.hasStrongETag
+                    }
+                } catch {
+                    logger.warning("webdav", "Datei-ETag-Fähigkeit konnte nicht sicher bestimmt werden: \(error)")
                 }
             }
-        }
-        if software.contains("nextcloud") || software.contains("owncloud") || software.contains("apache") || software.contains("nginx") || software.contains("sabre") {
-            // Diese Server liefern starke ETags für Dateien.
-            if caps.providesETags { caps.strongETags = true }
         }
         if software.contains("nextcloud") || software.contains("owncloud") { caps.serverKind = .nextcloud }
 
         // Cloudreve: WebDAV unter <Site>/dav/, Ping-Endpunkt unter <Site>/api/v4/site/ping.
-        if serverKindHint != .generic, let version = await cloudreveVersion() {
+        if serverKindHint == .cloudreve {
+            caps.serverKind = .cloudreve
+            caps.honorsIfMatch = false
+        }
+        if let version = await cloudreveVersion() {
             caps.serverKind = .cloudreve
             caps.serverVersion = version
             caps.serverSoftware = caps.serverSoftware ?? "Cloudreve \(version)"
-            // Cloudreve-ETags sind die Entity-ID der aktuellen Version (stark), aber
-            // `If-Match` wird vom Server nicht ausgewertet.
-            if caps.providesETags { caps.strongETags = true }
+            // `If-Match` wird von Cloudreve-WebDAV nicht ausgewertet. Ob ein
+            // konkreter ETag stark ist, wird ausschließlich aus dessen Syntax
+            // abgeleitet und nicht aus einem leicht fälschbaren Server-Header.
             caps.honorsIfMatch = false
+        } else if caps.serverKind != .cloudreve {
+            caps.honorsIfMatch = await probeConditionalWrites()
+            if !caps.honorsIfMatch {
+                logger.warning(
+                    "webdav",
+                    "Bedingte PUT/DELETE/MOVE-Zugriffe konnten nicht sicher bestätigt werden; destruktive Änderungen bleiben gesperrt"
+                )
+            }
         }
         logger.info("webdav", "Fähigkeiten: DAV=\(caps.davClasses.sorted()) sync=\(caps.supportsSyncCollection) etags=\(caps.providesETags) strong=\(caps.strongETags) ifMatch=\(caps.honorsIfMatch) kind=\(caps.serverKind.rawValue) server=\(caps.serverSoftware ?? "?")")
         return caps
@@ -366,11 +456,89 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return version
     }
 
+    /// Prüft die für einen verlustfreien Abgleich benötigten HTTP-
+    /// Vorbedingungen an zwei zufälligen, intern ausgeschlossenen Dateien.
+    /// Ausschließlich diese neu angelegten Probeobjekte werden verändert.
+    private func probeConditionalWrites() async -> Bool {
+        let nonce = UUID().uuidString.lowercased()
+        let source = "\(ExclusionRules.internalPrefix)-capability-\(nonce).tmp"
+        let destination = "\(ExclusionRules.internalPrefix)-capability-\(nonce)-moved.tmp"
+        let impossibleETag = "\"reichi-sync-never-\(UUID().uuidString)\""
+
+        func cleanup(_ path: String) async {
+            guard var request = try? makeRequest("DELETE", path: path) else { return }
+            request.setValue(nil, forHTTPHeaderField: "Content-Type")
+            _ = try? await perform(request)
+        }
+
+        func finish(_ result: Bool) async -> Bool {
+            await cleanup(source)
+            await cleanup(destination)
+            return result
+        }
+
+        do {
+            let body = Data("reichi-sync-capability-probe".utf8)
+            let create = try await perform(makeRequest(
+                "PUT",
+                path: source,
+                headers: ["If-None-Match": "*", "Content-Type": "application/octet-stream"],
+                body: body
+            ))
+            guard [200, 201, 204].contains(create.status) else { return await finish(false) }
+
+            let duplicate = try await perform(makeRequest(
+                "PUT",
+                path: source,
+                headers: ["If-None-Match": "*", "Content-Type": "application/octet-stream"],
+                body: body
+            ))
+            guard duplicate.status == 412 else { return await finish(false) }
+
+            let staleWrite = try await perform(makeRequest(
+                "PUT",
+                path: source,
+                headers: ["If-Match": impossibleETag, "Content-Type": "application/octet-stream"],
+                body: body
+            ))
+            guard staleWrite.status == 412 else { return await finish(false) }
+
+            let staleMove = try await perform(makeRequest(
+                "MOVE",
+                path: source,
+                headers: [
+                    "Destination": try url(for: destination).absoluteString,
+                    "Overwrite": "F",
+                    "If-Match": impossibleETag,
+                ]
+            ))
+            guard staleMove.status == 412 else { return await finish(false) }
+
+            var deleteRequest = try makeRequest("DELETE", path: source, headers: ["If-Match": impossibleETag])
+            deleteRequest.setValue(nil, forHTTPHeaderField: "Content-Type")
+            let staleDelete = try await perform(deleteRequest)
+            guard staleDelete.status == 412 else { return await finish(false) }
+            return await finish(true)
+        } catch {
+            logger.debug("webdav", "Vorbedingungsprobe fehlgeschlagen: \(error)")
+            return await finish(false)
+        }
+    }
+
     public func probe() async throws -> RemoteItem {
         let response = try await perform(makeRequest("PROPFIND", path: "", isCollection: true, headers: ["Depth": "0"], body: Data(Self.propfindBody.utf8)))
         try check(response, accept: [207], context: "PROPFIND /")
         let multi = try MultiStatusParser.parse(response.data)
-        guard let root = multi.resources.first else { throw WebDAVError.invalidResponse("Leere Multi-Status-Antwort") }
+        try Self.validate(multi, context: "PROPFIND /")
+        guard multi.resources.count == 1, let root = multi.resources.first else {
+            throw WebDAVError.invalidResponse("PROPFIND / lieferte nicht genau eine Ressource")
+        }
+        if let status = root.status, !(200..<300).contains(status) {
+            throw Self.error(for: status, body: Data(), context: "PROPFIND /")
+        }
+        try Self.validateProperties(root, context: "PROPFIND /")
+        let rootPath = try validatedPath(for: root)
+        guard rootPath.key.isEmpty else { throw WebDAVError.invalidResponse("PROPFIND / lieferte eine fremde Ressource") }
         guard root.isCollection else { throw WebDAVError.invalidResponse("Die Adresse zeigt nicht auf einen Ordner") }
         return RemoteItem(path: "", rawPath: "", kind: .directory, validator: root.validator, validatorIsStrong: root.hasStrongETag)
     }
@@ -379,19 +547,23 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         let response = try await perform(makeRequest("PROPFIND", path: rawPath, isCollection: true, headers: ["Depth": "1"], body: Data(Self.propfindBody.utf8)))
         try check(response, accept: [207], context: "PROPFIND \(rawPath)")
         let multi = try MultiStatusParser.parse(response.data)
+        try Self.validate(multi, context: "PROPFIND \(rawPath)")
         var items: [RemoteItem] = []
-        let selfKey = (try? RelativePath.normalize(rawPath)) ?? rawPath
+        let selfKey = try RelativePath.normalize(rawPath)
+        var seen: Set<String> = []
         for res in multi.resources {
-            if let status = res.status, !(200..<300).contains(status) { continue }
-            guard let rel = relativePath(fromHrefPath: res.hrefPath) else {
-                logger.warning("webdav", "Unerwartetes href außerhalb der Basis: \(res.hrefPath)")
-                continue
+            if let status = res.status, !(200..<300).contains(status) {
+                throw Self.error(for: status, body: Data(), context: "PROPFIND \(rawPath)")
             }
-            guard let key = try? RelativePath.normalize(rel) else {
-                logger.warning("webdav", "Ungültiger Pfad vom Server übersprungen: \(rel)")
-                continue
+            try Self.validateProperties(res, context: "PROPFIND \(rawPath)")
+            let (key, rel) = try validatedPath(for: res)
+            guard seen.insert(key).inserted else {
+                throw WebDAVError.invalidResponse("PROPFIND \(rawPath): doppelter oder Unicode-kollidierender Pfad \(key)")
             }
             if key == selfKey { continue }
+            guard RelativePath.parent(of: key) == selfKey else {
+                throw WebDAVError.invalidResponse("PROPFIND Depth: 1 lieferte keinen direkten Nachfolger: \(key)")
+            }
             items.append(Self.makeItem(key: key, raw: rel, res))
         }
         return items
@@ -408,10 +580,23 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         if response.status == 404 { return nil }
         try check(response, accept: [207], context: "PROPFIND \(rawPath)")
         let multi = try MultiStatusParser.parse(response.data)
-        guard let res = multi.resources.first else { return nil }
-        if let status = res.status, status == 404 { return nil }
-        let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
-        return Self.makeItem(key: key, raw: rawPath, res)
+        try Self.validate(multi, context: "PROPFIND \(rawPath)")
+        guard multi.resources.count == 1, let res = multi.resources.first else {
+            throw WebDAVError.invalidResponse("PROPFIND \(rawPath) lieferte nicht genau eine Ressource")
+        }
+        if let status = res.status {
+            if status == 404 { return nil }
+            if !(200..<300).contains(status) {
+                throw Self.error(for: status, body: Data(), context: "PROPFIND \(rawPath)")
+            }
+        }
+        try Self.validateProperties(res, context: "PROPFIND \(rawPath)")
+        let (key, rel) = try validatedPath(for: res)
+        let expected = try RelativePath.normalize(rawPath)
+        guard key == expected else {
+            throw WebDAVError.invalidResponse("PROPFIND \(rawPath) lieferte \(key)")
+        }
+        return Self.makeItem(key: key, raw: rel, res)
     }
 
     public func syncCollection(token: String?) async throws -> SyncCollectionResult {
@@ -433,18 +618,24 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         let response = try await perform(makeRequest("REPORT", path: "", isCollection: true, headers: ["Depth": "0"], body: Data(body.utf8)))
         try check(response, accept: [207], context: "REPORT sync-collection")
         let multi = try MultiStatusParser.parse(response.data)
+        try Self.validate(multi, context: "REPORT sync-collection")
         guard let newToken = multi.syncToken, !newToken.isEmpty else {
             throw WebDAVError.invalidResponse("sync-collection ohne sync-token")
         }
         var changes: [SyncCollectionChange] = []
+        var seen: Set<String> = []
         for res in multi.resources {
-            guard let rel = relativePath(fromHrefPath: res.hrefPath), let key = try? RelativePath.normalize(rel) else { continue }
+            let (key, rel) = try validatedPath(for: res)
+            guard seen.insert(key).inserted else {
+                throw WebDAVError.invalidResponse("REPORT sync-collection: doppelter oder Unicode-kollidierender Pfad \(key)")
+            }
             if key.isEmpty { continue }
             if let status = res.status, status == 404 {
                 changes.append(SyncCollectionChange(item: nil, path: key, deleted: true))
             } else if let status = res.status, !(200..<300).contains(status) {
-                continue
+                throw Self.error(for: status, body: Data(), context: "REPORT sync-collection")
             } else {
+                try Self.validateProperties(res, context: "REPORT sync-collection")
                 changes.append(SyncCollectionChange(item: Self.makeItem(key: key, raw: rel, res), path: key, deleted: false))
             }
         }
@@ -455,13 +646,25 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         let response = try await perform(makeRequest("PROPFIND", path: "", isCollection: true, headers: ["Depth": "0"], body: Data(Self.capabilitiesBody.utf8)))
         try check(response, accept: [207], context: "PROPFIND /")
         let multi = try MultiStatusParser.parse(response.data)
-        guard let token = multi.resources.first?.properties["sync-token"], !token.isEmpty else { return nil }
+        try Self.validate(multi, context: "PROPFIND /")
+        guard multi.resources.count == 1, let root = multi.resources.first else {
+            throw WebDAVError.invalidResponse("PROPFIND / lieferte nicht genau eine Ressource")
+        }
+        if let status = root.status, !(200..<300).contains(status) {
+            throw Self.error(for: status, body: Data(), context: "PROPFIND /")
+        }
+        let rootPath = try validatedPath(for: root)
+        guard rootPath.key.isEmpty else { throw WebDAVError.invalidResponse("PROPFIND / lieferte eine fremde Ressource") }
+        guard let token = root.properties["sync-token"], !token.isEmpty else { return nil }
         return token
     }
 
     public func download(_ rawPath: String, to destination: URL, progress: TransferProgress?) async throws -> DownloadResult {
-        var request = makeRequest("GET", path: rawPath)
+        var request = try makeRequest("GET", path: rawPath)
         request.setValue(nil, forHTTPHeaderField: "Content-Type")
+        // Synchronisierte Dateien müssen bytegenau ankommen. Transparente
+        // HTTP-Komprimierung würde eine Content-Length-Prüfung unzuverlässig machen.
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         logger.debug("webdav", "GET \(request.url?.path ?? "?")")
         let session = self.session
         let delegate = self.delegate
@@ -469,7 +672,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DownloadResult, Error>) in
                 let task = session.downloadTask(with: request) { tempURL, response, error in
-                    defer { if let id = holder.task?.taskIdentifier { delegate.removeProgress(taskIdentifier: id) } }
+                    defer { if let id = holder.taskIdentifier { delegate.finishTask(taskIdentifier: id) } }
                     if let error {
                         continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
@@ -479,19 +682,47 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                         return
                     }
                     guard http.statusCode == 200 else {
-                        let data = (try? Data(contentsOf: tempURL)) ?? Data()
+                        let data: Data
+                        if let handle = try? FileHandle(forReadingFrom: tempURL) {
+                            data = (try? handle.read(upToCount: 300)) ?? Data()
+                            try? handle.close()
+                        } else {
+                            data = Data()
+                        }
                         try? FileManager.default.removeItem(at: tempURL)
                         continuation.resume(throwing: Self.error(for: http.statusCode, body: data, context: "GET \(rawPath)"))
                         return
                     }
                     do {
+                        let requestedURL = try self.url(for: rawPath)
+                        let finalURL = http.url ?? requestedURL
+                        let finalIsDAVOrigin = TransportDelegate.hasSameOrigin(finalURL, self.baseURL)
+                        if finalIsDAVOrigin, finalURL.path != requestedURL.path {
+                            throw WebDAVError.redirectRefused(
+                                "GET \(requestedURL.path) wurde auf eine andere DAV-Ressource umgeleitet (\(finalURL.path))"
+                            )
+                        }
                         let fm = FileManager.default
+                        let attributes = try fm.attributesOfItem(atPath: tempURL.path)
+                        guard let number = attributes[.size] as? NSNumber else {
+                            throw WebDAVError.invalidResponse("Downloadgröße konnte nicht bestimmt werden")
+                        }
+                        let size = number.int64Value
+                        if http.expectedContentLength >= 0, size != http.expectedContentLength {
+                            throw WebDAVError.invalidResponse(
+                                "Unvollständiger Download: \(size) statt \(http.expectedContentLength) Bytes"
+                            )
+                        }
                         if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
                         try fm.moveItem(at: tempURL, to: destination)
-                        let size = (try? fm.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value ?? 0
                         let etag = http.value(forHTTPHeaderField: "ETag") ?? http.value(forHTTPHeaderField: "OC-ETag")
                         let lm = http.value(forHTTPHeaderField: "Last-Modified").flatMap(MultiStatusParser.parseHTTPDate)
-                        continuation.resume(returning: DownloadResult(etag: etag, lastModified: lm, contentLength: size))
+                        continuation.resume(returning: DownloadResult(
+                            etag: etag,
+                            lastModified: lm,
+                            contentLength: size,
+                            isDirectDAVResponse: finalIsDAVOrigin
+                        ))
                     } catch {
                         try? FileManager.default.removeItem(at: tempURL)
                         continuation.resume(throwing: error)
@@ -502,12 +733,12 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                 task.resume()
             }
         } onCancel: {
-            holder.task?.cancel()
+            holder.cancel()
         }
     }
 
     public func upload(file: URL, to rawPath: String, ifMatch: String?, ifNoneMatchAll: Bool, progress: TransferProgress?) async throws -> UploadResult {
-        var request = makeRequest("PUT", path: rawPath)
+        var request = try makeRequest("PUT", path: rawPath)
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         if let ifMatch { request.setValue(ifMatch, forHTTPHeaderField: "If-Match") }
         if ifNoneMatchAll { request.setValue("*", forHTTPHeaderField: "If-None-Match") }
@@ -525,7 +756,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UploadResult, Error>) in
                 let task = session.uploadTask(with: request, fromFile: file) { data, response, error in
-                    defer { if let id = holder.task?.taskIdentifier { delegate.removeProgress(taskIdentifier: id) } }
+                    defer { if let id = holder.taskIdentifier { delegate.finishTask(taskIdentifier: id) } }
                     if let error {
                         continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
@@ -546,12 +777,12 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                 task.resume()
             }
         } onCancel: {
-            holder.task?.cancel()
+            holder.cancel()
         }
     }
 
     public func makeDirectory(_ rawPath: String) async throws {
-        var request = makeRequest("MKCOL", path: rawPath, isCollection: true)
+        var request = try makeRequest("MKCOL", path: rawPath, isCollection: true)
         request.setValue(nil, forHTTPHeaderField: "Content-Type")
         let response = try await perform(request)
         try check(response, accept: [201], context: "MKCOL \(rawPath)")
@@ -560,7 +791,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
     public func delete(_ rawPath: String, ifMatch: String?) async throws {
         var headers: [String: String] = [:]
         if let ifMatch { headers["If-Match"] = ifMatch }
-        var request = makeRequest("DELETE", path: rawPath, headers: headers)
+        var request = try makeRequest("DELETE", path: rawPath, headers: headers)
         request.setValue(nil, forHTTPHeaderField: "Content-Type")
         let response = try await perform(request)
         if response.status == 404 { return } // bereits weg
@@ -569,11 +800,11 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
 
     public func move(from rawPath: String, to destinationRawPath: String, overwrite: Bool, ifMatch: String?) async throws {
         var headers: [String: String] = [
-            "Destination": url(for: destinationRawPath).absoluteString,
+            "Destination": try url(for: destinationRawPath).absoluteString,
             "Overwrite": overwrite ? "T" : "F",
         ]
         if let ifMatch { headers["If-Match"] = ifMatch }
-        var request = makeRequest("MOVE", path: rawPath, headers: headers)
+        var request = try makeRequest("MOVE", path: rawPath, headers: headers)
         request.setValue(nil, forHTTPHeaderField: "Content-Type")
         let response = try await perform(request)
         try check(response, accept: [201, 204], context: "MOVE \(rawPath) → \(destinationRawPath)")
@@ -589,32 +820,82 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
 
 /// Hält die laufende Task für die Abbruchbehandlung.
 final class TaskHolder: @unchecked Sendable {
-    var task: URLSessionTask?
+    private let lock = NSLock()
+    private var storedTask: URLSessionTask?
+    private var cancellationRequested = false
+
+    var task: URLSessionTask? {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return storedTask
+        }
+        set {
+            lock.lock()
+            storedTask = newValue
+            let shouldCancel = cancellationRequested
+            lock.unlock()
+            if shouldCancel { newValue?.cancel() }
+        }
+    }
+
+    var taskIdentifier: Int? { task?.taskIdentifier }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let task = storedTask
+        lock.unlock()
+        task?.cancel()
+    }
 }
 
 /// Session-Delegate: Fortschritt, Redirect-Schutz.
 ///
-/// Umleitungen werden nur auf denselben Host und nur für lesende Methoden
-/// zugelassen. Damit gelangen Zugangsdaten nie an fremde Hosts.
+/// Umleitungen bleiben für DAV-Methoden auf derselben Origin. Reine GET/HEAD-
+/// Downloads dürfen einer fremden HTTPS-Origin folgen, nachdem sämtliche
+/// Zugangsdaten und sensiblen Header entfernt wurden.
 final class TransportDelegate: NSObject, URLSessionDataDelegate, URLSessionDownloadDelegate, @unchecked Sendable {
-    private let allowedHost: String
+    private struct Origin: Equatable {
+        let scheme: String
+        let host: String
+        let port: Int
+
+        init?(_ url: URL?) {
+            guard let url,
+                  let scheme = url.scheme?.lowercased(),
+                  let host = url.host?.lowercased() else { return nil }
+            self.scheme = scheme
+            self.host = host
+            self.port = url.port ?? (scheme == "https" ? 443 : 80)
+        }
+    }
+
+    private let allowedOrigin: Origin
     private let logger: SyncLogger
     private let lock = NSLock()
     private var progressHandlers: [Int: TransferProgress] = [:]
     private var refusedRedirects: Set<Int> = []
     private var authChallenged: Set<Int> = []
 
-    init(allowedHost: String, logger: SyncLogger) {
-        self.allowedHost = allowedHost.lowercased()
+    init(allowedOrigin: URL, logger: SyncLogger) {
+        self.allowedOrigin = Origin(allowedOrigin)!
         self.logger = logger
+    }
+
+    static func hasSameOrigin(_ lhs: URL, _ rhs: URL) -> Bool {
+        Origin(lhs) == Origin(rhs)
     }
 
     func setProgress(_ handler: @escaping TransferProgress, taskIdentifier: Int) {
         lock.lock(); progressHandlers[taskIdentifier] = handler; lock.unlock()
     }
 
-    func removeProgress(taskIdentifier: Int) {
-        lock.lock(); progressHandlers[taskIdentifier] = nil; lock.unlock()
+    func finishTask(taskIdentifier: Int) {
+        lock.lock()
+        progressHandlers[taskIdentifier] = nil
+        refusedRedirects.remove(taskIdentifier)
+        authChallenged.remove(taskIdentifier)
+        lock.unlock()
     }
 
     func wasRedirectRefused(taskIdentifier: Int) -> Bool {
@@ -645,25 +926,54 @@ final class TransportDelegate: NSObject, URLSessionDataDelegate, URLSessionDownl
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
-        let newHost = request.url?.host?.lowercased() ?? ""
         let method = task.originalRequest?.httpMethod?.uppercased() ?? "GET"
-        let readOnly = ["GET", "HEAD", "OPTIONS", "PROPFIND"].contains(method)
-        let sameOrigin = newHost == allowedHost && (request.url?.scheme?.lowercased() == task.originalRequest?.url?.scheme?.lowercased())
-        guard sameOrigin, readOnly else {
-            logger.warning("webdav", "Umleitung abgelehnt (\(response.statusCode)) → \(request.url?.host ?? "?") für \(method)")
-            lock.lock(); refusedRedirects.insert(task.taskIdentifier); lock.unlock()
-            completionHandler(nil)
+        let readOnly = ["GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT"].contains(method)
+        let originalOrigin = Origin(task.originalRequest?.url)
+        let redirectOrigin = Origin(request.url)
+        let sameOrigin = originalOrigin == allowedOrigin && redirectOrigin == allowedOrigin
+        if sameOrigin, readOnly {
+            var redirected = request
+            redirected.httpMethod = method
+            if let original = task.originalRequest {
+                for (k, v) in original.allHTTPHeaderFields ?? [:] where redirected.value(forHTTPHeaderField: k) == nil {
+                    redirected.setValue(v, forHTTPHeaderField: k)
+                }
+                redirected.httpBody = original.httpBody
+            }
+            completionHandler(redirected)
             return
         }
-        var redirected = request
-        redirected.httpMethod = method
-        if let original = task.originalRequest {
-            for (k, v) in original.allHTTPHeaderFields ?? [:] where redirected.value(forHTTPHeaderField: k) == nil {
-                redirected.setValue(v, forHTTPHeaderField: k)
+
+        // Cloudreve kann Downloads zu einer signierten Object-Storage-URL
+        // umleiten. Ausschließlich GET/HEAD darf einer fremden HTTPS-Origin
+        // folgen; Authentisierung, Cookies und sonstige sensible Header werden
+        // dabei explizit entfernt.
+        let destination = request.url
+        let secureForeignRead = originalOrigin == allowedOrigin
+            && (method == "GET" || method == "HEAD")
+            && destination?.scheme?.lowercased() == "https"
+            && destination?.user == nil
+            && destination?.password == nil
+        if secureForeignRead {
+            var redirected = request
+            redirected.httpMethod = method
+            for header in ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "X-API-Key"] {
+                redirected.setValue(nil, forHTTPHeaderField: header)
             }
-            redirected.httpBody = original.httpBody
+            if let original = task.originalRequest {
+                for header in ["Accept", "Accept-Encoding", "Range", "User-Agent"] {
+                    if let value = original.value(forHTTPHeaderField: header) {
+                        redirected.setValue(value, forHTTPHeaderField: header)
+                    }
+                }
+            }
+            completionHandler(redirected)
+            return
         }
-        completionHandler(redirected)
+
+        logger.warning("webdav", "Umleitung abgelehnt (\(response.statusCode)) → \(request.url?.host ?? "?") für \(method)")
+        lock.lock(); refusedRedirects.insert(task.taskIdentifier); lock.unlock()
+        completionHandler(nil)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {

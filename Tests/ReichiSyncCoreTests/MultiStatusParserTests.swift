@@ -86,8 +86,59 @@ final class MultiStatusParserTests: XCTestCase {
         XCTAssertEqual(res.validator, "mtime:\(Int(MultiStatusParser.parseHTTPDate("Mon, 16 Nov 2026 10:00:00 GMT")!.timeIntervalSince1970));size:7")
     }
 
+    func testOnlySyntacticallyValidStrongEntityTagsAreTrusted() {
+        XCTAssertTrue("\"abc\"".isStrongHTTPETag)
+        XCTAssertTrue("\"\"".isStrongHTTPETag)
+        XCTAssertTrue("\"ä\"".isStrongHTTPETag)
+        XCTAssertFalse("W/\"abc\"".isStrongHTTPETag)
+        XCTAssertFalse("abc".isStrongHTTPETag)
+        XCTAssertFalse(" \"abc\"".isStrongHTTPETag)
+        XCTAssertFalse("\"a b\"".isStrongHTTPETag)
+        XCTAssertFalse("\"a\\\"b\"".isStrongHTTPETag)
+    }
+
     func testInvalidXMLThrows() {
         XCTAssertThrowsError(try MultiStatusParser.parse(Data("<not-xml".utf8)))
+    }
+
+    func testStructurallyIncompleteResponseIsMarkedUnsafe() throws {
+        let xml = """
+        <?xml version="1.0"?>
+        <D:multistatus xmlns:D="DAV:">
+          <D:response>
+            <D:propstat><D:prop><D:resourcetype/></D:prop><D:status>kein-status</D:status></D:propstat>
+          </D:response>
+        </D:multistatus>
+        """
+        let response = try MultiStatusParser.parse(Data(xml.utf8))
+        XCTAssertFalse(response.issues.isEmpty)
+        XCTAssertTrue(response.resources.isEmpty)
+    }
+
+    func testNegativeContentLengthIsMarkedUnsafe() throws {
+        let xml = """
+        <D:multistatus xmlns:D="DAV:"><D:response><D:href>/x/a</D:href>
+        <D:propstat><D:prop><D:resourcetype/><D:getcontentlength>-1</D:getcontentlength></D:prop>
+        <D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>
+        """
+        let response = try MultiStatusParser.parse(Data(xml.utf8))
+        XCTAssertFalse(response.issues.isEmpty)
+        XCTAssertNil(response.resources.first?.contentLength)
+    }
+
+    func testServerHrefMustStayOnConfiguredOrigin() throws {
+        let client = try WebDAVClient(
+            baseURL: URL(string: "https://example.org/dav/")!,
+            credentials: WebDAVCredentials(username: "anna", password: "pw")
+        )
+        let foreign = DAVResource(hrefPath: "/dav/a.txt", rawHref: "https://evil.example/dav/a.txt")
+        XCTAssertThrowsError(try client.validatedPath(for: foreign))
+
+        let nfdName = "a\u{0308}.txt"
+        let local = DAVResource(hrefPath: "/dav/\(nfdName)", rawHref: "/dav/a%CC%88.txt")
+        let mapped = try client.validatedPath(for: local)
+        XCTAssertEqual(mapped.key, "ä.txt")
+        XCTAssertEqual(mapped.raw, nfdName)
     }
 
     func testRelativePathMapping() throws {
@@ -97,13 +148,17 @@ final class MultiStatusParserTests: XCTestCase {
         XCTAssertEqual(client.relativePath(fromHrefPath: "/remote.php/dav/files/anna/Projekte/Sub/Datei ä.txt"), "Sub/Datei ä.txt")
         XCTAssertEqual(client.relativePath(fromHrefPath: "/remote.php/dav/files/anna/Projekte/Sub/"), "Sub")
         XCTAssertNil(client.relativePath(fromHrefPath: "/remote.php/dav/files/bob/Projekte/x"))
-        XCTAssertEqual(client.url(for: "Ordner A/Datei ü.txt").absoluteString, "https://cloud.example.org/remote.php/dav/files/anna/Projekte/Ordner%20A/Datei%20%C3%BC.txt")
-        XCTAssertEqual(client.url(for: "Sub", isCollection: true).absoluteString, "https://cloud.example.org/remote.php/dav/files/anna/Projekte/Sub/")
+        XCTAssertEqual(try client.url(for: "Ordner A/Datei ü.txt").absoluteString, "https://cloud.example.org/remote.php/dav/files/anna/Projekte/Ordner%20A/Datei%20%C3%BC.txt")
+        XCTAssertEqual(try client.url(for: "Sub", isCollection: true).absoluteString, "https://cloud.example.org/remote.php/dav/files/anna/Projekte/Sub/")
+        XCTAssertThrowsError(try client.url(for: "../anderer-bereich"))
     }
 
     func testInsecureURLRejected() {
         XCTAssertThrowsError(try WebDAVClient(baseURL: URL(string: "http://example.org/dav")!, credentials: WebDAVCredentials(username: "a", password: "b")))
         XCTAssertNoThrow(try WebDAVClient(baseURL: URL(string: "http://localhost:8080/dav")!, credentials: WebDAVCredentials(username: "a", password: "b")))
         XCTAssertNoThrow(try WebDAVClient(baseURL: URL(string: "http://example.org/dav")!, credentials: WebDAVCredentials(username: "a", password: "b"), allowInsecureHTTP: true))
+        XCTAssertThrowsError(try WebDAVClient(baseURL: URL(string: "https://user:secret@example.org/dav")!, credentials: WebDAVCredentials(username: "a", password: "b")))
+        XCTAssertThrowsError(try WebDAVClient(baseURL: URL(string: "https://example.org/dav?redirect=evil")!, credentials: WebDAVCredentials(username: "a", password: "b")))
+        XCTAssertThrowsError(try WebDAVClient(baseURL: URL(string: "file:///tmp/dav")!, credentials: WebDAVCredentials(username: "a", password: "b")))
     }
 }

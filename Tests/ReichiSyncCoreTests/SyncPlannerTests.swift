@@ -19,13 +19,32 @@ final class SyncPlannerTests: XCTestCase {
 
     private func plan(baseline: [BaselineEntry] = [], local: [LocalItem] = [], remote: [RemoteItem] = [],
                       localComplete: Bool = true, remoteComplete: Bool = true, failedPrefixes: Set<String> = [],
-                      busy: Set<String> = [], openConflicts: Set<String> = [], allowedDeletions: Set<String>? = nil) -> SyncPlan {
+                      remoteCollisions: [String] = [], busy: Set<String> = [], openConflicts: Set<String> = [],
+                      allowedDeletions: Set<String>? = nil) -> SyncPlan {
+        let localItems = Dictionary(uniqueKeysWithValues: local.map { ($0.path, $0) })
+        let remoteItems = Dictionary(uniqueKeysWithValues: remote.map { ($0.path, $0) })
+        let authorizations = allowedDeletions.map { paths in
+            Set(paths.compactMap { path -> DeletionAuthorization? in
+                if let item = remoteItems[path], localItems[path] == nil {
+                    return DeletionAuthorization(path: path, kind: item.kind, side: .remote)
+                }
+                if let item = localItems[path], remoteItems[path] == nil {
+                    return DeletionAuthorization(path: path, kind: item.kind, side: .local)
+                }
+                return nil
+            })
+        }
         let input = PlannerInput(
             baseline: Dictionary(uniqueKeysWithValues: baseline.map { ($0.path, $0) }),
-            local: LocalSnapshot(items: Dictionary(uniqueKeysWithValues: local.map { ($0.path, $0) }), isComplete: localComplete, busyPaths: busy),
-            remote: RemoteSnapshot(items: Dictionary(uniqueKeysWithValues: remote.map { ($0.path, $0) }), isComplete: remoteComplete, failedPrefixes: failedPrefixes),
+            local: LocalSnapshot(items: localItems, isComplete: localComplete, busyPaths: busy),
+            remote: RemoteSnapshot(
+                items: remoteItems,
+                isComplete: remoteComplete,
+                failedPrefixes: failedPrefixes,
+                collisions: remoteCollisions
+            ),
             openConflictPaths: openConflicts,
-            allowedDeletions: allowedDeletions
+            allowedDeletions: authorizations
         )
         return SyncPlanner.plan(input)
     }
@@ -155,21 +174,46 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertEqual(p.skipped.count, 2)
     }
 
+    func testUnicodeNormalizationCollisionFreezesServerPathAndDescendants() {
+        let p = plan(
+            baseline: [base("über", kind: .directory), base("über/a.txt")],
+            local: [local("über", kind: .directory), local("über/a.txt")],
+            remote: [remote("über/a.txt", etag: "\"e2\"")],
+            remoteComplete: false,
+            failedPrefixes: [""],
+            remoteCollisions: ["über"]
+        )
+        XCTAssertTrue(p.allActions.isEmpty)
+        XCTAssertEqual(p.collisions, ["über"])
+        XCTAssertTrue(p.skipped.contains { $0.path == "über" })
+    }
+
     func testDeletionGuardFilter() {
         let p = plan(baseline: [base("a.txt"), base("b.txt")], local: [], remote: [remote("a.txt"), remote("b.txt")], allowedDeletions: ["a.txt"])
         XCTAssertEqual(p.deletions.count, 1)
         XCTAssertEqual(p.deletions.first?.path, "a.txt")
     }
 
+    func testDeletionApprovalCannotFlipFromLocalToRemoteSide() {
+        let input = PlannerInput(
+            baseline: ["a.txt": base("a.txt")],
+            local: LocalSnapshot(),
+            remote: RemoteSnapshot(items: ["a.txt": remote("a.txt")]),
+            allowedDeletions: [DeletionAuthorization(path: "a.txt", kind: .file, side: .local)]
+        )
+        let p = SyncPlanner.plan(input)
+        XCTAssertTrue(p.deletions.isEmpty)
+        XCTAssertTrue(p.skipped.contains { $0.path == "a.txt" })
+    }
+
     // MARK: Ordner
 
-    func testLocallyDeletedDirectoryWithUnchangedContentDeletesRemoteDirectoryOnce() {
+    func testLocallyDeletedDirectoryDeletesKnownRemoteFilesIndividually() {
         let p = plan(baseline: [base("d", kind: .directory), base("d/a.txt"), base("d/b.txt")],
                      local: [],
                      remote: [remote("d", kind: .directory), remote("d/a.txt"), remote("d/b.txt")])
-        XCTAssertEqual(p.deletions.count, 1)
-        guard case .deleteRemote(let path, _)? = p.deletions.first else { return XCTFail() }
-        XCTAssertEqual(path, "d")
+        XCTAssertEqual(Set(p.deletions.map(\.path)), ["d/a.txt", "d/b.txt"])
+        XCTAssertEqual(p.deletions.first?.path.split(separator: "/").count, 2)
     }
 
     func testLocallyDeletedDirectoryWithNewRemoteFileIsKept() {
@@ -191,12 +235,11 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertTrue(p.directoryCreations.contains { if case .createRemoteDirectory(let path) = $0 { return path == "d" }; return false })
     }
 
-    func testRemotelyDeletedDirectoryUnchangedIsTrashedOnce() {
+    func testRemotelyDeletedDirectoryDeletesFilesThenEmptyDirectory() {
         let p = plan(baseline: [base("d", kind: .directory), base("d/a.txt")],
                      local: [local("d", kind: .directory), local("d/a.txt")],
                      remote: [])
-        XCTAssertEqual(p.deletions.count, 1)
-        XCTAssertEqual(p.deletions.first?.path, "d")
+        XCTAssertEqual(p.deletions.map(\.path), ["d/a.txt", "d"])
     }
 
     func testUploadIntoMissingRemoteDirectoryCreatesParents() {
@@ -208,8 +251,10 @@ final class SyncPlannerTests: XCTestCase {
     func testDeletionsAreOrderedDeepestFirst() {
         let p = plan(baseline: [base("d", kind: .directory), base("d/a.txt"), base("e.txt")],
                      local: [], remote: [remote("d", kind: .directory), remote("d/a.txt"), remote("e.txt")])
-        // Ordner d wird als Ganzes gelöscht, e.txt einzeln.
-        XCTAssertEqual(Set(p.deletions.map(\.path)), ["d", "e.txt"])
+        // Bekannte Kinder werden einzeln konditional gelöscht. Der Ordner selbst
+        // bleibt als Baseline-Tombstone bestehen, weil DELETE rekursiv wäre.
+        XCTAssertEqual(Set(p.deletions.map(\.path)), ["d/a.txt", "e.txt"])
+        XCTAssertEqual(p.deletions.first?.path, "d/a.txt")
     }
 
     // MARK: Umbenennungen
@@ -229,10 +274,23 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertTrue(p.moves.isEmpty)
     }
 
-    func testValidatorFallbackToSizeWhenMissing() {
+    func testMissingValidatorIsReverifiedEvenWhenSizeMatches() {
         var r = remote("a.txt", etag: "")
         r.validator = nil
         let p = plan(baseline: [base("a.txt")], local: [local("a.txt")], remote: [r])
-        XCTAssertTrue(p.isEmpty, "Ohne Validator und mit gleicher Größe gilt der Eintrag als unverändert")
+        guard case .download? = p.transfers.first else {
+            return XCTFail("Ohne Validator ist gleiche Größe kein Beweis für unveränderten Inhalt")
+        }
+    }
+
+    func testValidatorFallbackDetectsChangedModificationDate() {
+        var b = base("a.txt")
+        b.remoteValidator = nil
+        b.remoteModified = 1_000
+        var r = remote("a.txt", etag: "")
+        r.validator = nil
+        r.modified = 2_000
+        let p = plan(baseline: [b], local: [local("a.txt")], remote: [r])
+        guard case .download(_, _, _)? = only(p) else { return XCTFail("\(p.allActions)") }
     }
 }

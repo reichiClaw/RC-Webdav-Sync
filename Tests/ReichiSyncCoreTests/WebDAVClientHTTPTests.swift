@@ -134,7 +134,13 @@ final class WebDAVClientHTTPTests: XCTestCase {
         let store = try SyncStore(path: base.appendingPathComponent("db.sqlite").path)
         let account = AccountConfiguration(name: "HTTP", serverURL: baseURL, username: "anna", localRootPath: root.path, allowInsecureHTTP: true)
         let mapping = try await store.mapping(for: account)
-        let config = SyncEngineConfiguration(deviceName: "HTTPMac", recoveryDirectory: base.appendingPathComponent("Recovery"), settleTime: 0, minimumFreeSpace: 0)
+        let config = SyncEngineConfiguration(
+            deviceName: "HTTPMac",
+            recoveryDirectory: base.appendingPathComponent("Recovery"),
+            deletionGuard: DeletionGuard(threshold: 1000, fraction: 1),
+            settleTime: 0,
+            minimumFreeSpace: 0
+        )
         let engine = SyncEngine(account: account, mapping: mapping, client: client, store: store, fileSystem: LocalFileSystem(root: root), rules: ExclusionRules(), configuration: config)
         await engine.start()
         await engine.syncAndWait()

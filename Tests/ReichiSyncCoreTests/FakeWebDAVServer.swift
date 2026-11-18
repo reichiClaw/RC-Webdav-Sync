@@ -18,6 +18,7 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     private var etagCounter = 0
     private var changeCounter = 0
     private var changeLog: [(seq: Int, path: String, deleted: Bool)] = []
+    private var rawPathAliases: [String: String] = [:]
 
     // Fehlerinjektion
     var failListingPrefixes: Set<String> = []
@@ -26,9 +27,15 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     var dropConnectionOnUploadButStore = false
     var dropConnectionOnDownload = false
     var beforeUpload: (@Sendable (String) async -> Void)?
+    var beforeStat: (@Sendable (String) async -> Void)?
+    var beforeList: (@Sendable (String) async -> Void)?
     var supportsSync = false
     var weakETags = false
+    var honorsIfMatch = true
+    var authFailOnUpload = false
+    var moveUnsupported = false
     var requestLog: [String] = []
+    var additionalListItems: [String: [RemoteItem]] = [:]
 
     init() {}
 
@@ -46,11 +53,31 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
         record(path, deleted: false)
     }
 
+    /// Legt einen normalisierten Schlüssel unter einer abweichenden rohen
+    /// Unicode-Schreibweise an (wie ein WebDAV-href in NFD).
+    func mkdirWithRawPath(_ rawPath: String) {
+        guard let path = try? RelativePath.normalize(rawPath) else { return }
+        for ancestor in RelativePath.ancestors(of: path) { directories.insert(ancestor) }
+        directories.insert(path)
+        rawPathAliases[path] = rawPath
+        record(path, deleted: false)
+    }
+
+    func putFileWithRawPath(_ rawPath: String, _ content: String, modified: Date = Date()) {
+        guard let path = try? RelativePath.normalize(rawPath) else { return }
+        for ancestor in RelativePath.ancestors(of: path) { directories.insert(ancestor) }
+        files[path] = File(data: Data(content.utf8), etag: nextETag(), modified: modified)
+        rawPathAliases[path] = rawPath
+        record(path, deleted: false)
+    }
+
     func remove(_ path: String) {
         files[path] = nil
         directories.remove(path)
+        rawPathAliases[path] = nil
         for key in files.keys where RelativePath.isDescendant(key, of: path) { files[key] = nil }
         for key in directories where RelativePath.isDescendant(key, of: path) { directories.remove(key) }
+        for key in rawPathAliases.keys where RelativePath.isDescendant(key, of: path) { rawPathAliases[key] = nil }
         record(path, deleted: true)
     }
 
@@ -66,8 +93,16 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     func setDropConnectionOnUploadButStore(_ value: Bool) { dropConnectionOnUploadButStore = value }
     func setDropConnectionOnDownload(_ value: Bool) { dropConnectionOnDownload = value }
     func setBeforeUpload(_ hook: (@Sendable (String) async -> Void)?) { beforeUpload = hook }
+    func setBeforeStat(_ hook: (@Sendable (String) async -> Void)?) { beforeStat = hook }
+    func setBeforeList(_ hook: (@Sendable (String) async -> Void)?) { beforeList = hook }
     func setSupportsSync(_ value: Bool) { supportsSync = value }
     func setWeakETags(_ value: Bool) { weakETags = value }
+    func setHonorsIfMatch(_ value: Bool) { honorsIfMatch = value }
+    func setAuthFailOnUpload(_ value: Bool) { authFailOnUpload = value }
+    func setMoveUnsupported(_ value: Bool) { moveUnsupported = value }
+    func setAdditionalListItems(_ items: [RemoteItem], for directory: String = "") {
+        additionalListItems[directory] = items
+    }
     func log() -> [String] { requestLog }
     func clearLog() { requestLog = [] }
 
@@ -88,11 +123,11 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
 
     private func item(_ path: String) -> RemoteItem? {
         if let f = files[path] {
-            return RemoteItem(path: path, rawPath: path, kind: .file, size: Int64(f.data.count), modified: f.modified.timeIntervalSince1970,
+            return RemoteItem(path: path, rawPath: rawPathAliases[path] ?? path, kind: .file, size: Int64(f.data.count), modified: f.modified.timeIntervalSince1970,
                               validator: f.etag, validatorIsStrong: !f.etag.hasPrefix("W/"), contentType: nil)
         }
         if directories.contains(path) {
-            return RemoteItem(path: path, rawPath: path, kind: .directory, size: 0, modified: nil, validator: "\"dir\"", validatorIsStrong: false)
+            return RemoteItem(path: path, rawPath: rawPathAliases[path] ?? path, kind: .directory, size: 0, modified: nil, validator: "\"dir\"", validatorIsStrong: true)
         }
         return nil
     }
@@ -101,7 +136,8 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
 
     func detectCapabilities() async throws -> WebDAVCapabilities {
         try checkConnection()
-        return WebDAVCapabilities(davClasses: ["1", "3"], supportsSyncCollection: supportsSync, providesETags: true, strongETags: !weakETags, serverSoftware: "FakeDAV")
+        return WebDAVCapabilities(davClasses: ["1", "3"], supportsSyncCollection: supportsSync, providesETags: true,
+                                  strongETags: !weakETags, serverSoftware: "FakeDAV", honorsIfMatch: honorsIfMatch)
     }
 
     func probe() async throws -> RemoteItem {
@@ -114,18 +150,22 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
         try checkConnection()
         requestLog.append("LIST \(rawPath)")
         let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
+        if let beforeList { await beforeList(key) }
         if failListingPrefixes.contains(key) { throw WebDAVError.unexpectedStatus(500, "Simulierter Serverfehler") }
         guard directories.contains(key) else { throw WebDAVError.notFound }
         var result: [RemoteItem] = []
         for path in files.keys where RelativePath.parent(of: path) == key { result.append(item(path)!) }
         for path in directories where !path.isEmpty && RelativePath.parent(of: path) == key { result.append(item(path)!) }
+        result.append(contentsOf: additionalListItems[key] ?? [])
         return result
     }
 
     func stat(_ rawPath: String) async throws -> RemoteItem? {
         try checkConnection()
         requestLog.append("STAT \(rawPath)")
-        return item((try? RelativePath.normalize(rawPath)) ?? rawPath)
+        let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
+        if let beforeStat { await beforeStat(key) }
+        return item(key)
     }
 
     func syncCollection(token: String?) async throws -> SyncCollectionResult {
@@ -173,12 +213,13 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
 
     func upload(file: URL, to rawPath: String, ifMatch: String?, ifNoneMatchAll: Bool, progress: TransferProgress?) async throws -> UploadResult {
         try checkConnection()
+        if authFailOnUpload { throw WebDAVError.authenticationRequired(status: 401) }
         requestLog.append("PUT \(rawPath) ifMatch=\(ifMatch ?? "-") ifNoneMatch=\(ifNoneMatchAll)")
         let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
         if let hook = beforeUpload { await hook(key) }
         guard let parent = RelativePath.parent(of: key), directories.contains(parent) else { throw WebDAVError.conflict(status: 409, "Elternordner fehlt") }
         if ifNoneMatchAll, files[key] != nil { throw WebDAVError.preconditionFailed }
-        if let ifMatch {
+        if honorsIfMatch, let ifMatch {
             guard let existing = files[key], existing.etag == ifMatch else { throw WebDAVError.preconditionFailed }
         }
         let data = try Data(contentsOf: file)
@@ -207,7 +248,7 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
         try checkConnection()
         requestLog.append("DELETE \(rawPath) ifMatch=\(ifMatch ?? "-")")
         let key = (try? RelativePath.normalize(rawPath)) ?? rawPath
-        if let ifMatch, let f = files[key], f.etag != ifMatch { throw WebDAVError.preconditionFailed }
+        if honorsIfMatch, let ifMatch, let f = files[key], f.etag != ifMatch { throw WebDAVError.preconditionFailed }
         guard exists(key) else { throw WebDAVError.notFound }
         remove(key)
     }
@@ -215,14 +256,17 @@ actor FakeWebDAVServer: WebDAVClientProtocol {
     func move(from rawPath: String, to destinationRawPath: String, overwrite: Bool, ifMatch: String?) async throws {
         try checkConnection()
         requestLog.append("MOVE \(rawPath) -> \(destinationRawPath)")
+        if moveUnsupported { throw WebDAVError.conflict(status: 405, "MOVE nicht unterstützt") }
         let from = (try? RelativePath.normalize(rawPath)) ?? rawPath
         let to = (try? RelativePath.normalize(destinationRawPath)) ?? destinationRawPath
         guard let f = files[from] else { throw WebDAVError.notFound }
-        if let ifMatch, f.etag != ifMatch { throw WebDAVError.preconditionFailed }
+        if honorsIfMatch, let ifMatch, f.etag != ifMatch { throw WebDAVError.preconditionFailed }
         if !overwrite, exists(to) { throw WebDAVError.preconditionFailed }
         guard let parent = RelativePath.parent(of: to), directories.contains(parent) else { throw WebDAVError.conflict(status: 409, "Elternordner fehlt") }
         files[to] = File(data: f.data, etag: nextETag(), modified: f.modified)
         files[from] = nil
+        rawPathAliases[to] = destinationRawPath
+        rawPathAliases[from] = nil
         record(from, deleted: true)
         record(to, deleted: false)
     }

@@ -32,11 +32,24 @@ final class DevServerLauncher {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: python)
         var arguments = [script.path, "--root", serverRoot.path, "--port", "0", "--user", user, "--password", password] + extraArguments
-        let pipe = Pipe()
-        proc.standardOutput = pipe
+        let readinessURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("reichi-devserver-ready-\(UUID().uuidString).log")
+        guard FileManager.default.createFile(atPath: readinessURL.path, contents: nil),
+              let readinessHandle = FileHandle(forWritingAtPath: readinessURL.path) else {
+            throw NSError(
+                domain: "de.reichi.sync.tests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Temporäre Readiness-Datei konnte nicht angelegt werden"]
+            )
+        }
+        defer {
+            try? readinessHandle.close()
+            try? FileManager.default.removeItem(at: readinessURL)
+        }
+        proc.standardOutput = readinessHandle
         // REICHI_DEVSERVER_LOG=/pfad/datei.log protokolliert die Serveranfragen (Fehlersuche).
         if let logPath = ProcessInfo.processInfo.environment["REICHI_DEVSERVER_LOG"] {
-            if !FileManager.default.fileExists(atPath: logPath) { FileManager.default.createFile(atPath: logPath, contents: nil) }
+            if !FileManager.default.fileExists(atPath: logPath) { _ = FileManager.default.createFile(atPath: logPath, contents: nil) }
             if let handle = FileHandle(forWritingAtPath: logPath) {
                 handle.seekToEndOfFile()
                 proc.standardError = handle
@@ -49,20 +62,23 @@ final class DevServerLauncher {
         try proc.run()
         process = proc
 
-        var buffer = Data()
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
-            let chunk = pipe.fileHandleForReading.availableData
-            if chunk.isEmpty { usleep(50_000); continue }
-            buffer.append(chunk)
+            let buffer = (try? Data(contentsOf: readinessURL)) ?? Data()
             if let text = String(data: buffer, encoding: .utf8), let line = text.split(separator: "\n").first(where: { $0.hasPrefix("READY ") }),
                let p = Int(line.dropFirst("READY ".count).trimmingCharacters(in: .whitespaces)) {
                 port = p
                 return
             }
+            if !proc.isRunning { break }
+            usleep(50_000)
         }
         stop()
-        throw XCTSkip("Testserver konnte nicht gestartet werden")
+        throw NSError(
+            domain: "de.reichi.sync.tests",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "Testserver konnte nicht innerhalb von 10 Sekunden gestartet werden"]
+        )
     }
 
     func stop() {

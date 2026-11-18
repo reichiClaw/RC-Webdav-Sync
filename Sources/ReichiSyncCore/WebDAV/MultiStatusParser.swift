@@ -12,6 +12,7 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
 
     private var resources: [DAVResource] = []
     private var syncToken: String?
+    private var issues: [String] = []
 
     private var currentResource: DAVResource?
     private var currentHref: String?
@@ -20,7 +21,11 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
     private var currentProps: [String: String] = [:]
     private var currentIsCollection = false
     private var currentSupportsSync = false
+    private var currentSuccessfulProperties: Set<String> = []
+    private var currentFailedProperties: Set<String> = []
+    private var currentPropstatStatuses: [Int] = []
     private var currentPropstatProps: [String: String] = [:]
+    private var currentPropstatPropertyNames: Set<String> = []
     private var propstatIsCollection = false
     private var propstatSupportsSync = false
 
@@ -51,7 +56,7 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
         guard sawMultistatus else {
             throw WebDAVError.invalidResponse("Kein multistatus-Element in der Antwort")
         }
-        return MultiStatusResponse(resources: resources, syncToken: syncToken)
+        return MultiStatusResponse(resources: resources, syncToken: syncToken, issues: issues)
     }
 
     // MARK: XMLParserDelegate
@@ -72,10 +77,14 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
             currentProps = [:]
             currentIsCollection = false
             currentSupportsSync = false
+            currentSuccessfulProperties = []
+            currentFailedProperties = []
+            currentPropstatStatuses = []
         case "propstat":
             inPropstat = true
             currentPropstatStatus = nil
             currentPropstatProps = [:]
+            currentPropstatPropertyNames = []
             propstatIsCollection = false
             propstatSupportsSync = false
         case "prop":
@@ -90,6 +99,10 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
             if inSupportedReportSet { propstatSupportsSync = true }
         default:
             break
+        }
+        if inProp, parentIs("prop"), elementName != "prop" {
+            let key = ns == Self.dav ? elementName : "{\(ns)}\(elementName)"
+            currentPropstatPropertyNames.insert(key)
         }
     }
 
@@ -119,12 +132,23 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
                 } else if parentIsResponse {
                     currentResponseStatus = code
                 }
+                if code == nil {
+                    issues.append("Ungültige DAV-Statuszeile")
+                }
             case "propstat":
                 inPropstat = false
-                if let status = currentPropstatStatus, (200..<300).contains(status) {
+                guard let status = currentPropstatStatus else {
+                    issues.append("DAV-propstat ohne Status")
+                    break
+                }
+                currentPropstatStatuses.append(status)
+                if (200..<300).contains(status) {
                     currentProps.merge(currentPropstatProps) { _, new in new }
+                    currentSuccessfulProperties.formUnion(currentPropstatPropertyNames)
                     if propstatIsCollection { currentIsCollection = true }
                     if propstatSupportsSync { currentSupportsSync = true }
+                } else {
+                    currentFailedProperties.formUnion(currentPropstatPropertyNames)
                 }
             case "prop":
                 inProp = false
@@ -163,16 +187,36 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
     }
 
     private func finishResponse() {
-        guard let href = currentHref else { return }
+        guard let href = currentHref, !href.isEmpty else {
+            issues.append("DAV-response ohne href")
+            return
+        }
         let decodedPath = Self.decodeHrefPath(href)
-        var resource = DAVResource(hrefPath: decodedPath, status: currentResponseStatus)
+        var resource = DAVResource(hrefPath: decodedPath, rawHref: href, status: currentResponseStatus)
         resource.isCollection = currentIsCollection
         resource.supportsSyncCollection = currentSupportsSync
         resource.properties = currentProps
+        resource.successfulProperties = currentSuccessfulProperties
+        resource.failedProperties = currentFailedProperties
+        resource.propstatStatuses = currentPropstatStatuses
         if let etag = currentProps["getetag"], !etag.isEmpty { resource.etag = etag }
-        if let len = currentProps["getcontentlength"], let n = Int64(len.trimmingCharacters(in: .whitespaces)) { resource.contentLength = n }
-        if let lm = currentProps["getlastmodified"] { resource.lastModified = Self.parseHTTPDate(lm) }
+        if let len = currentProps["getcontentlength"] {
+            if let n = Int64(len.trimmingCharacters(in: .whitespaces)), n >= 0 {
+                resource.contentLength = n
+            } else if !len.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append("Ungültige getcontentlength für \(href)")
+            }
+        }
+        if let lm = currentProps["getlastmodified"] {
+            resource.lastModified = Self.parseHTTPDate(lm)
+            if resource.lastModified == nil, !lm.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                issues.append("Ungültiges getlastmodified für \(href)")
+            }
+        }
         if let ct = currentProps["getcontenttype"], !ct.isEmpty { resource.contentType = ct }
+        if currentResponseStatus == nil, currentPropstatStatuses.isEmpty {
+            issues.append("DAV-response ohne Status oder propstat für \(href)")
+        }
         resources.append(resource)
     }
 
@@ -212,9 +256,12 @@ public final class MultiStatusParser: NSObject, XMLParserDelegate {
             return df
         }
     }()
+    private static let httpDateLock = NSLock()
 
     public static func parseHTTPDate(_ string: String) -> Date? {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        httpDateLock.lock()
+        defer { httpDateLock.unlock() }
         for df in httpDateFormatters {
             if let d = df.date(from: trimmed) { return d }
         }

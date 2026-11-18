@@ -29,6 +29,9 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
     /// Lokaler Stammordner (Pfad). Der dauerhafte Zugriff wird in der App über ein
     /// Security-Scoped Bookmark hergestellt, das getrennt gespeichert wird.
     public var localRootPath: String
+    /// Persistente Geräte-/Inode-Kennung der ausgewählten Wurzel. Ein anderer
+    /// Ordner am gleichen Pfad darf niemals dieselbe Baseline übernehmen.
+    public var localRootIdentity: String?
     /// Intervall für die Suche nach Serveränderungen in Sekunden.
     public var pollInterval: TimeInterval
     /// Benutzerdefinierte Ausschlussmuster (zusätzlich zu den Standardausschlüssen).
@@ -53,6 +56,9 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
     public var cloudreveEmail: String?
     /// ID des verwendeten WebDAV-Kontos in Cloudreve.
     public var davAccountID: String?
+    /// `true`, wenn dieses Konto von reichi Sync angelegt wurde und beim
+    /// Entfernen der Verbindung widerrufen werden darf.
+    public var davAccountManaged: Bool
     /// Relative Wurzel des WebDAV-Kontos als Cloudreve-URI, z. B. `cloudreve://my/Sync`.
     /// Daraus werden die Datei-URIs für die Upload-API gebildet.
     public var davAccountURI: String?
@@ -62,17 +68,19 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
     public var chunkedUploadThreshold: Int64
 
     public init(id: String = UUID().uuidString, name: String, serverURL: URL, username: String, localRootPath: String,
+                localRootIdentity: String? = nil,
                 pollInterval: TimeInterval = 60, exclusionPatterns: [String] = [], allowInsecureHTTP: Bool = false,
                 deletionGuardThreshold: Int = 25, deletionGuardFraction: Double = 0.2, maxConcurrentTransfers: Int = 3,
                 notificationsEnabled: Bool = true, createdAt: Date = Date(),
                 serverKind: AccountServerKind = .webdav, cloudreveSiteURL: URL? = nil, cloudreveEmail: String? = nil,
-                davAccountID: String? = nil, davAccountURI: String? = nil, chunkedUploadsEnabled: Bool = true,
+                davAccountID: String? = nil, davAccountManaged: Bool = false, davAccountURI: String? = nil, chunkedUploadsEnabled: Bool = true,
                 chunkedUploadThreshold: Int64 = AccountConfiguration.defaultChunkedUploadThreshold) {
         self.id = id
         self.name = name
         self.serverURL = serverURL
         self.username = username
         self.localRootPath = localRootPath
+        self.localRootIdentity = localRootIdentity ?? Self.readRootIdentity(atPath: localRootPath)
         self.pollInterval = pollInterval
         self.exclusionPatterns = exclusionPatterns
         self.allowInsecureHTTP = allowInsecureHTTP
@@ -85,6 +93,7 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
         self.cloudreveSiteURL = cloudreveSiteURL
         self.cloudreveEmail = cloudreveEmail
         self.davAccountID = davAccountID
+        self.davAccountManaged = davAccountManaged
         self.davAccountURI = davAccountURI
         self.chunkedUploadsEnabled = chunkedUploadsEnabled
         self.chunkedUploadThreshold = chunkedUploadThreshold
@@ -97,6 +106,8 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
         serverURL = try c.decode(URL.self, forKey: .serverURL)
         username = try c.decode(String.self, forKey: .username)
         localRootPath = try c.decode(String.self, forKey: .localRootPath)
+        localRootIdentity = try c.decodeIfPresent(String.self, forKey: .localRootIdentity)
+            ?? Self.readRootIdentity(atPath: localRootPath)
         pollInterval = try c.decodeIfPresent(TimeInterval.self, forKey: .pollInterval) ?? 60
         exclusionPatterns = try c.decodeIfPresent([String].self, forKey: .exclusionPatterns) ?? []
         allowInsecureHTTP = try c.decodeIfPresent(Bool.self, forKey: .allowInsecureHTTP) ?? false
@@ -109,6 +120,7 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
         cloudreveSiteURL = try c.decodeIfPresent(URL.self, forKey: .cloudreveSiteURL)
         cloudreveEmail = try c.decodeIfPresent(String.self, forKey: .cloudreveEmail)
         davAccountID = try c.decodeIfPresent(String.self, forKey: .davAccountID)
+        davAccountManaged = try c.decodeIfPresent(Bool.self, forKey: .davAccountManaged) ?? false
         davAccountURI = try c.decodeIfPresent(String.self, forKey: .davAccountURI)
         chunkedUploadsEnabled = try c.decodeIfPresent(Bool.self, forKey: .chunkedUploadsEnabled) ?? true
         chunkedUploadThreshold = try c.decodeIfPresent(Int64.self, forKey: .chunkedUploadThreshold) ?? AccountConfiguration.defaultChunkedUploadThreshold
@@ -117,12 +129,54 @@ public struct AccountConfiguration: Codable, Sendable, Hashable, Identifiable {
     /// Cloudreve-Konfiguration vollständig (Site, E-Mail, WebDAV-Konto bekannt)?
     public var isCloudreve: Bool { serverKind == .cloudreve && cloudreveSiteURL != nil }
 
-    /// Eindeutiger Schlüssel der Zuordnung „Server-Ordner ↔ lokaler Ordner“.
-    /// Ändert sich Server-URL oder lokaler Stammordner, entsteht eine neue
-    /// Zuordnung mit leerem Synchronisierungsstand.
+    /// Eindeutiger Schlüssel der Zuordnung und ihrer Synchronisierungssemantik.
+    ///
+    /// Identität des entfernten Kontos und Ausschlussregeln gehören dazu: Ein
+    /// alter gemeinsamer Stand darf weder für ein anderes Konto noch nach einer
+    /// Änderung der sichtbaren Dateimenge wiederverwendet werden.
     public var mappingKey: String {
         let server = serverURL.absoluteString.hasSuffix("/") ? serverURL.absoluteString : serverURL.absoluteString + "/"
+        let fields = [
+            "mapping-v3",
+            server,
+            username,
+            localRootPath,
+            localRootIdentity ?? Self.readRootIdentity(atPath: localRootPath) ?? "unavailable",
+            serverKind.rawValue,
+            cloudreveSiteURL?.absoluteString ?? "",
+            davAccountID ?? "",
+            davAccountURI ?? "",
+            exclusionPatterns.sorted().map(Self.lengthPrefixed).joined()
+        ]
+        return fields.map(Self.lengthPrefixed).joined(separator: "|")
+    }
+
+    /// Bindet einen neu ausgewählten lokalen Ordner an seine Dateisystem-ID.
+    public mutating func setLocalRootPath(_ path: String) {
+        localRootPath = path
+        localRootIdentity = Self.readRootIdentity(atPath: path)
+    }
+
+    public func matchesLocalRootIdentity(atPath path: String) -> Bool {
+        guard let localRootIdentity,
+              let current = Self.readRootIdentity(atPath: path) else { return false }
+        return current == localRootIdentity
+    }
+
+    private static func readRootIdentity(atPath path: String) -> String? {
+        (try? POSIXFileMetadata.read(atPath: path))?.fileID
+    }
+
+    /// Schlüssel aus den Datenbankschemata 1 und 2. Er wird ausschließlich
+    /// verwendet, um vorhandene Baselines beim Upgrade eindeutig dem neuen,
+    /// semantikgebundenen Schlüssel zuzuordnen.
+    var legacyMappingKey: String {
+        let server = serverURL.absoluteString.hasSuffix("/") ? serverURL.absoluteString : serverURL.absoluteString + "/"
         return "\(server)|\(localRootPath)"
+    }
+
+    private static func lengthPrefixed(_ value: String) -> String {
+        "\(value.utf8.count):\(value)"
     }
 }
 
