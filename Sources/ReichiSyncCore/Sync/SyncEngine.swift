@@ -420,7 +420,7 @@ public actor SyncEngine {
             var record = TransferRecord(id: "skip|" + path, path: path, direction: .upload, state: .skipped)
             record.finishedAt = Date()
             record.errorMessage = reason
-            record.suggestedAction = collisions.contains(path) ? .renameFile : .none
+            record.suggestedAction = collisions.contains(path) ? SuggestedAction.renameFile : nil
             try? await store.saveTransfer(record, mappingID: mapping.id)
         }
 

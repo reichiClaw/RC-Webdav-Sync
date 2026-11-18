@@ -193,7 +193,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Response, Error>) in
                 let task = session.dataTask(with: request) { data, response, error in
                     if let error {
-                        continuation.resume(throwing: Self.mapTransportError(error))
+                        continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
                     }
                     guard let http = response as? HTTPURLResponse else {
@@ -219,11 +219,12 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
         }
     }
 
-    static func mapTransportError(_ error: Error) -> WebDAVError {
+    static func mapTransportError(_ error: Error, authChallenged: Bool = false) -> WebDAVError {
         let ns = error as NSError
         if ns.domain == NSURLErrorDomain {
             switch ns.code {
-            case NSURLErrorCancelled: return .cancelled
+            case NSURLErrorCancelled: return authChallenged ? .authenticationRequired(status: 401) : .cancelled
+            case NSURLErrorUserAuthenticationRequired, NSURLErrorUserCancelledAuthentication: return .authenticationRequired(status: 401)
             case NSURLErrorServerCertificateUntrusted, NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateHasUnknownRoot,
                  NSURLErrorServerCertificateNotYetValid, NSURLErrorSecureConnectionFailed:
                 return .network("TLS-Zertifikat konnte nicht geprüft werden (\(ns.code))")
@@ -429,7 +430,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                 let task = session.downloadTask(with: request) { tempURL, response, error in
                     defer { if let id = holder.task?.taskIdentifier { delegate.removeProgress(taskIdentifier: id) } }
                     if let error {
-                        continuation.resume(throwing: Self.mapTransportError(error))
+                        continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
                     }
                     guard let http = response as? HTTPURLResponse, let tempURL else {
@@ -485,7 +486,7 @@ public final class WebDAVClient: WebDAVClientProtocol, @unchecked Sendable {
                 let task = session.uploadTask(with: request, fromFile: file) { data, response, error in
                     defer { if let id = holder.task?.taskIdentifier { delegate.removeProgress(taskIdentifier: id) } }
                     if let error {
-                        continuation.resume(throwing: Self.mapTransportError(error))
+                        continuation.resume(throwing: Self.mapTransportError(error, authChallenged: holder.task.map { delegate.wasAuthChallenged(taskIdentifier: $0.taskIdentifier) } ?? false))
                         return
                     }
                     guard let http = response as? HTTPURLResponse else {
@@ -560,6 +561,7 @@ final class TransportDelegate: NSObject, URLSessionDataDelegate, URLSessionDownl
     private let lock = NSLock()
     private var progressHandlers: [Int: TransferProgress] = [:]
     private var refusedRedirects: Set<Int> = []
+    private var authChallenged: Set<Int> = []
 
     init(allowedHost: String, logger: SyncLogger) {
         self.allowedHost = allowedHost.lowercased()
@@ -577,6 +579,28 @@ final class TransportDelegate: NSObject, URLSessionDataDelegate, URLSessionDownl
     func wasRedirectRefused(taskIdentifier: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return refusedRedirects.contains(taskIdentifier)
+    }
+
+    func wasAuthChallenged(taskIdentifier: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return authChallenged.contains(taskIdentifier)
+    }
+
+    /// Zugangsdaten werden ausschließlich über den vorab gesetzten Authorization-Header
+    /// übertragen. Eine HTTP-Anmeldeaufforderung bedeutet daher, dass der Server sie
+    /// abgelehnt hat; sie wird als „Anmeldung erforderlich“ gemeldet. Server-Zertifikate
+    /// durchlaufen die reguläre Systemprüfung.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let method = challenge.protectionSpace.authenticationMethod
+        if method == NSURLAuthenticationMethodHTTPBasic || method == NSURLAuthenticationMethodHTTPDigest || method == NSURLAuthenticationMethodNTLM {
+            lock.lock(); authChallenged.insert(task.taskIdentifier); lock.unlock()
+            if method != NSURLAuthenticationMethodHTTPBasic {
+                logger.warning("webdav", "Server verlangt \(method); unterstützt wird nur Basic Authentication über HTTPS")
+            }
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
