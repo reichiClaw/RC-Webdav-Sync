@@ -1,0 +1,53 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test core
+        run: swift test -Xswiftc -warnings-as-errors
+      - name: Build universal release app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MARKETING_VERSION="$VERSION" Scripts/build-app.sh release dist
+      - name: Package release app
+        id: package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="dist/reichi-Sync-${VERSION}-macOS-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/reichi Sync.app" \
+            "$ARCHIVE"
+          (
+            cd dist
+            shasum -a 256 "$(basename "$ARCHIVE")" \
+              > "$(basename "$ARCHIVE").sha256"
+          )
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "checksum=$ARCHIVE.sha256" >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "$ARCHIVE" "$CHECKSUM" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$ARCHIVE" "$CHECKSUM" \
+              --verify-tag \
+              --title "reichi Sync $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
