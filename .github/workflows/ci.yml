@@ -44,4 +44,22 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
           build
       - name: Build and verify universal app bundle
-        run: Scripts/build-app.sh debug dist
+        run: Scripts/build-app.sh release dist
+      - name: Package downloadable app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/reichi Sync.app" \
+            "dist/reichi-Sync-macOS-universal.zip"
+          cd dist
+          shasum -a 256 reichi-Sync-macOS-universal.zip \
+            > reichi-Sync-macOS-universal.zip.sha256
+      - name: Upload compiled app
+        uses: actions/upload-artifact@v4
+        with:
+          name: reichi-sync-macos-universal
+          path: |
+            dist/reichi-Sync-macOS-universal.zip
+            dist/reichi-Sync-macOS-universal.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
