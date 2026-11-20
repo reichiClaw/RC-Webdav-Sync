@@ -453,6 +453,23 @@ final class CloudreveTests: XCTestCase {
         XCTAssertEqual((try JSONSerialization.jsonObject(with: sessions) as? [Any])?.count, 0, "Sitzung muss serverseitig gelöscht sein")
     }
 
+    func testSubMillisecondTimestampDriftDoesNotAbortUpload() async throws {
+        let api = try await signedInAPI()
+        let store = try makeStore()
+        let size = Int(chunkSize) * 2
+        let file = try randomFile(name: "drift.bin", size: size)
+        var info = try requestInfo(for: file, path: "drift.bin")
+        // Entspricht dem Unterschied, der auf dem Mac entsteht, wenn eine
+        // Arbeitskopie über `utimes` nur mikrosekundengenau geschrieben wird.
+        info.modified += 0.0004
+        let transport = try transport(api: api, store: store, mappingID: "m1")
+
+        let result = try await transport.upload(info, progress: nil)
+
+        XCTAssertEqual(result.status, 201)
+        XCTAssertEqual(try Data(contentsOf: server.serverRoot.appendingPathComponent("drift.bin")), try Data(contentsOf: file))
+    }
+
     // MARK: - Engine-Integration
 
     func testEngineUsesChunkTransportAboveThreshold() async throws {

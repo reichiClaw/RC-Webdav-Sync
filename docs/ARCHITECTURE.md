@@ -83,9 +83,12 @@ Weitere Regeln:
 
 Jede Aktion prüft direkt vor der Ausführung erneut die Vorbedingungen. Ein
 Upload etwa liest Größe/mtime, hasht, sendet mit `If-Match` (starke ETags)
-oder prüft vorher per `PROPFIND`, und vergleicht nach dem Upload erneut
-Größe/mtime der lokalen Datei. Weicht etwas ab → Aktion wird zurückgestellt
-(`deferred`) und im Folgedurchgang neu geplant.
+oder prüft vorher per `PROPFIND`, und vergleicht nach dem Upload den Hash
+der lokalen Datei. Weicht der Inhalt ab → Aktion wird zurückgestellt
+(`deferred`) und im Folgedurchgang neu geplant. Abweichungen der
+Änderungszeit unter einer Millisekunde gelten nicht als Bearbeitung: APFS
+speichert Nanosekunden, während das Setzen eines Zeitstempels über
+`FileManager` auf dem Mac nur Mikrosekunden erhält.
 
 ### Baseline-Aktualisierung
 
