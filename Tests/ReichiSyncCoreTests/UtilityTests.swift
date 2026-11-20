@@ -212,6 +212,35 @@ final class PathSafetyTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "neu")
     }
 
+    func testModificationTimestampRoundTripKeepsNanoseconds() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("quelle.bin")
+        let copy = root.appendingPathComponent("kopie.bin")
+        try Data("abc".utf8).write(to: source)
+        let stamp = POSIXFileMetadata.Timestamp(seconds: 1_700_000_000, nanoseconds: 123_456_789)
+        try POSIXFileMetadata.setModificationTime(atPath: source.path, stamp)
+        let stored = try POSIXFileMetadata.modificationTime(atPath: source.path)
+        guard stored == stamp else {
+            throw XCTSkip("Dieses Dateisystem speichert keine Nanosekunden")
+        }
+
+        try FileManager.default.copyItem(at: source, to: copy)
+        try POSIXFileMetadata.setModificationTime(atPath: copy.path, stamp)
+        XCTAssertEqual(try POSIXFileMetadata.modificationTime(atPath: copy.path), stamp)
+        let sourceDate = (try FileManager.default.attributesOfItem(atPath: source.path)[.modificationDate] as? Date)?.timeIntervalSince1970
+        let copyDate = (try FileManager.default.attributesOfItem(atPath: copy.path)[.modificationDate] as? Date)?.timeIntervalSince1970
+        XCTAssertTrue(POSIXFileMetadata.sameModificationTime(sourceDate ?? -1, copyDate ?? -2))
+    }
+
+    func testSameModificationTimeIgnoresSubMillisecondDrift() {
+        XCTAssertTrue(POSIXFileMetadata.sameModificationTime(1_700_000_000.123456789, 1_700_000_000.1239))
+        XCTAssertTrue(POSIXFileMetadata.sameModificationTime(1_700_000_000, 1_700_000_000))
+        XCTAssertFalse(POSIXFileMetadata.sameModificationTime(1_700_000_000, 1_700_000_001))
+        XCTAssertFalse(POSIXFileMetadata.sameModificationTime(1_700_000_000, 1_700_000_000.002))
+    }
+
     func testScannerInvalidatesHashCacheWhenSizeAndMtimeArePreserved() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

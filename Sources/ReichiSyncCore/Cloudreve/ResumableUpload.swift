@@ -273,7 +273,9 @@ public final class CloudreveUploadTransport: ResumableUploadTransport, @unchecke
                 let currentSize = (attrs[.size] as? NSNumber)?.int64Value ?? -1
                 let currentModified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
                 let currentMetadata = try POSIXFileMetadata.read(atPath: info.fileURL.path)
-                if currentSize != info.size || currentModified != info.modified
+                // Exakte Double-Gleichheit erkennt auf dem Mac rundungsbedingte
+                // Zeitstempel einer unveränderten Arbeitskopie als Bearbeitung.
+                if currentSize != info.size || !POSIXFileMetadata.sameModificationTime(currentModified, info.modified)
                     || currentMetadata?.cacheToken != initialMetadata.cacheToken
                     || currentMetadata?.isSymbolicLink == true {
                     logger.notice("cloudreve", "\(info.path) wurde während des Uploads geändert – Sitzung verworfen")

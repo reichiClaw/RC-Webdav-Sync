@@ -1290,7 +1290,6 @@ public actor SyncEngine {
         var size: Int64
         var modified: Double
         var hash: String
-        var sourceCacheToken: String
         var stagedCacheToken: String
     }
 
@@ -1307,11 +1306,16 @@ public actor SyncEngine {
             temporary = generated
             let fileSystem = self.fileSystem
             return try await performFileOperation {
-                try FileManager.default.copyItem(at: try fileSystem.url(path), to: generated)
-                try FileManager.default.setAttributes(
-                    [.modificationDate: Date(timeIntervalSince1970: attributes.modified)],
-                    ofItemAtPath: generated.path
-                )
+                let sourceURL = try fileSystem.url(path)
+                try FileManager.default.copyItem(at: sourceURL, to: generated)
+                if let timestamp = try POSIXFileMetadata.modificationTime(atPath: sourceURL.path) {
+                    try POSIXFileMetadata.setModificationTime(atPath: generated.path, timestamp)
+                }
+                let stagedModified = (try FileManager.default.attributesOfItem(atPath: generated.path)[.modificationDate] as? Date)?
+                    .timeIntervalSince1970 ?? -1
+                guard POSIXFileMetadata.sameModificationTime(stagedModified, attributes.modified) else {
+                    throw LocalFileError.changedSinceScan(path)
+                }
                 guard let currentAttributes = try fileSystem.attributes(path),
                       currentAttributes.kind == .file,
                       currentAttributes.size == attributes.size,
@@ -1340,7 +1344,6 @@ public actor SyncEngine {
                     size: attributes.size,
                     modified: attributes.modified,
                     hash: hash,
-                    sourceCacheToken: source.cacheToken,
                     stagedCacheToken: stagedMetadata.cacheToken
                 )
             }
@@ -1560,19 +1563,25 @@ public actor SyncEngine {
             remoteSize = verified.size
             remoteModified = verified.modified
         }
-        // Wurde die Datei während des Uploads verändert? Dann bleibt sie ausstehend.
+        // Der hochgeladene Inhalt bleibt nur dann der aktuelle lokale Stand,
+        // wenn die Bytes noch übereinstimmen. macOS kann während des Uploads
+        // erweiterte Attribute schreiben und damit ctime oder die gelesene
+        // mtime minimal verändern, ohne die Datei zu bearbeiten.
         let fileSystem = self.fileSystem
         let expectedSize = version.size
-        let expectedModified = version.modified
         let expectedHash = version.hash
-        let sourceToken = staged.sourceCacheToken
         let sourceUnchanged = (try? await performFileOperation {
-            guard let after = try fileSystem.attributes(localPath),
-                  after.size == expectedSize,
-                  after.modified == expectedModified,
-                  let afterMetadata = try POSIXFileMetadata.read(atPath: fileSystem.url(localPath).path),
-                  afterMetadata.cacheToken == sourceToken else { return false }
-            return try fileSystem.hash(localPath) == expectedHash
+            let sourceURL = try fileSystem.url(localPath)
+            guard let before = try fileSystem.attributes(localPath),
+                  before.kind == .file,
+                  before.size == expectedSize,
+                  let beforeMetadata = try POSIXFileMetadata.read(atPath: sourceURL.path),
+                  !beforeMetadata.isSymbolicLink else { return false }
+            guard try fileSystem.hash(localPath) == expectedHash else { return false }
+            guard let afterMetadata = try POSIXFileMetadata.read(atPath: sourceURL.path),
+                  afterMetadata.cacheToken == beforeMetadata.cacheToken,
+                  !afterMetadata.isSymbolicLink else { return false }
+            return true
         }) == true
         // Die Arbeitskopie wurde nachweislich installiert. Auch wenn das
         // Original währenddessen weiterbearbeitet wurde, ist diese Version nun
